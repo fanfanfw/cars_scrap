@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cars-scrap"
+version = "0.1.0"
+description = "Cars scraping services (mudah.my & carlist) using Botasaurus"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "beautifulsoup4>=4.13.4",
+  "botasaurus>=0.11.0",
+  "flask>=3.1.1",
+  "psycopg2-binary>=2.9.10",
+  "python-dotenv>=1.1.0",
+  "requests>=2.32.3",
+]
+
+[project.scripts]
+scrape-mudahmy-cars = "scrap_mudahmy_cars_botasaurus.run_scraper:main"
+scrape-carlist-cars = "scrap_carlist_cars_botasaurus.run_scraper:main"
+serve-mudahmy-cars = "scrap_mudahmy_cars_botasaurus.app:main"
+serve-carlist-cars = "scrap_carlist_cars_botasaurus.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "cars_scrap_common",
+  "scrap_mudahmy_cars_botasaurus",
+  "scrap_carlist_cars_botasaurus",
+]
