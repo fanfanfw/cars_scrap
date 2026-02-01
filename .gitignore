@@ -18,3 +18,4 @@ botasaurus_*/
 error_logs/
 output/
 profiles/
+uv.lock
