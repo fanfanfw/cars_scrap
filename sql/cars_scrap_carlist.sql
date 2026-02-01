@@ -1,8 +1,8 @@
--- Table: car_scrap_mudahmy
+-- Table: cars_scrap_carlist
 -- Notes:
 -- - `listing_id` is UNIQUE for upserts.
 
-CREATE TABLE IF NOT EXISTS car_scrap_mudahmy (
+CREATE TABLE IF NOT EXISTS cars_scrap_carlist (
   id BIGSERIAL PRIMARY KEY,
   listing_id VARCHAR NOT NULL UNIQUE,
   listing_url TEXT NOT NULL,
@@ -23,22 +23,22 @@ CREATE TABLE IF NOT EXISTS car_scrap_mudahmy (
   last_scraped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE car_scrap_mudahmy
+ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS status VARCHAR NOT NULL DEFAULT 'active';
 
-ALTER TABLE car_scrap_mudahmy
+ALTER TABLE cars_scrap_carlistmy
   ALTER COLUMN status SET DEFAULT 'active';
 
-UPDATE car_scrap_mudahmy
+UPDATE cars_scrap_carlistmy
 SET status = 'active'
 WHERE status IS NULL OR status = 'ok';
 
-ALTER TABLE car_scrap_mudahmy
+ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
 
-ALTER TABLE car_scrap_mudahmy
+ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
-ALTER TABLE car_scrap_mudahmy
+ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 

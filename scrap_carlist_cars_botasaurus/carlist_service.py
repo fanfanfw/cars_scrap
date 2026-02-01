@@ -139,12 +139,12 @@ class CarlistCarsService:
 
         columns = ("listing_id", "listing_url", "status")
         upsert_sql = f"""
-        INSERT INTO car_scrap_carlist ({", ".join(columns)})
+        INSERT INTO cars_scrap_carlistmy ({", ".join(columns)})
         VALUES %s
         ON CONFLICT (listing_id) DO UPDATE SET
           listing_url = EXCLUDED.listing_url,
-          status = COALESCE(EXCLUDED.status, car_scrap_carlist.status),
-          version = car_scrap_carlist.version + 1,
+          status = COALESCE(EXCLUDED.status, cars_scrap_carlistmy.status),
+          version = cars_scrap_carlistmy.version + 1,
           last_scraped_at = NOW()
         """
 
