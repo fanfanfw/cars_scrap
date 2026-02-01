@@ -76,6 +76,31 @@ def wait_for_css(driver, selector: str, *, timeout_seconds: float, poll_interval
     return False
 
 
+def wait_for_xpath(driver, xpath: str, *, timeout_seconds: float, poll_interval_seconds: float) -> bool:
+    deadline = time.time() + max(0.1, timeout_seconds)
+    while time.time() < deadline:
+        try:
+            exists = driver.run_js(
+                """
+                const el = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                return !!el;
+                """,
+                {"xpath": xpath},
+            )
+            if exists:
+                return True
+        except Exception:
+            pass
+        time.sleep(poll_interval_seconds)
+    return False
+
+
 def is_cloudflare_challenge(driver) -> bool:
     checks = (
         "verify you are human",
@@ -131,4 +156,3 @@ def raise_if_cloudflare_challenge(
         + "Run with BOTASAURUS_PROMPT_ON_CLOUDFLARE=true to solve it manually (headful), "
         "or switch to a residential proxy / different IP."
     )
-
