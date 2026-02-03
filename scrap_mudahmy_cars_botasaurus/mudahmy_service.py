@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -162,6 +163,82 @@ class MudahMyCarsService:
         cleaned = re.sub(r"^[,\s]+", "", text.strip())
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned or None
+
+    def _convert_information_ads_to_date(self, info_ads_str: str | None):
+        """
+        Converts mudah.my "posted ..." string to a DATE (not timestamp).
+
+        Mirrors the logic used in `property_scrap`:
+        - "mins ago"/"hours ago"/"today" -> today
+        - "yesterday" -> today-1
+        - "N days/weeks ago" -> today-N (or today-7*N)
+        - "DD Mon" -> inferred year (current year or previous year if month > current month)
+        """
+        if not info_ads_str:
+            return None
+        raw = info_ads_str.strip()
+        if not raw or raw.upper() == "N/A":
+            return None
+
+        info_text = raw.lower().strip()
+        now_dt = datetime.now()
+        today = now_dt.date()
+
+        if "mins ago" in info_text or "min ago" in info_text:
+            return today
+        if "hours ago" in info_text or "hour ago" in info_text:
+            return today
+        if "today" in info_text:
+            return today
+        if "yesterday" in info_text:
+            return (now_dt - timedelta(days=1)).date()
+
+        if "days ago" in info_text:
+            days_match = re.search(r"(\d+)\s+days?\s+ago", info_text)
+            if not days_match:
+                return None
+            days_ago = int(days_match.group(1))
+            return (now_dt - timedelta(days=days_ago)).date()
+
+        if "day ago" in info_text:
+            return (now_dt - timedelta(days=1)).date()
+
+        if "weeks ago" in info_text or "week ago" in info_text:
+            weeks_match = re.search(r"(\d+)\s+weeks?\s+ago", info_text)
+            if not weeks_match:
+                return None
+            weeks_ago = int(weeks_match.group(1))
+            return (now_dt - timedelta(days=weeks_ago * 7)).date()
+
+        date_match = re.search(r"(\d+)\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", info_text)
+        if not date_match:
+            return None
+
+        day = int(date_match.group(1))
+        month_str = date_match.group(2)
+        month_map = {
+            "jan": 1,
+            "feb": 2,
+            "mar": 3,
+            "apr": 4,
+            "may": 5,
+            "jun": 6,
+            "jul": 7,
+            "aug": 8,
+            "sep": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12,
+        }
+        month = month_map.get(month_str)
+        if not month:
+            return None
+
+        year = now_dt.year - 1 if month > now_dt.month else now_dt.year
+        try:
+            return datetime(year, month, day).date()
+        except ValueError:
+            return None
 
     def _extract_condition_and_information_ads(self, driver) -> tuple[str | None, str | None]:
         """
@@ -499,6 +576,7 @@ class MudahMyCarsService:
             "model",
             "variant",
             "information_ads",
+            "information_ads_date",
             "location",
             "price",
             "year",
@@ -522,6 +600,7 @@ class MudahMyCarsService:
           model = COALESCE(EXCLUDED.model, cars_scrap_mudahmy.model),
           variant = COALESCE(EXCLUDED.variant, cars_scrap_mudahmy.variant),
           information_ads = COALESCE(EXCLUDED.information_ads, cars_scrap_mudahmy.information_ads),
+          information_ads_date = COALESCE(EXCLUDED.information_ads_date, cars_scrap_mudahmy.information_ads_date),
           location = COALESCE(EXCLUDED.location, cars_scrap_mudahmy.location),
           price = COALESCE(EXCLUDED.price, cars_scrap_mudahmy.price),
           year = COALESCE(EXCLUDED.year, cars_scrap_mudahmy.year),
@@ -597,6 +676,7 @@ class MudahMyCarsService:
                     )
 
                     condition_value, info_value = self._extract_condition_and_information_ads(driver)
+                    info_date_value = self._convert_information_ads_to_date(info_value)
                     specs = self._extract_car_specs_map_botasaurus(driver)
                     result = {
                         "listing_id": listing_id,
@@ -606,6 +686,7 @@ class MudahMyCarsService:
                         "model": specs.get("model"),
                         "variant": specs.get("variant"),
                         "information_ads": info_value,
+                        "information_ads_date": info_date_value,
                         "location": self._get_text_by_xpath_botasaurus(driver, LOCATION_XPATH),
                         "price": self._parse_price(self._get_text_by_xpath_botasaurus(driver, PRICE_XPATH)),
                         "year": self._parse_int_from_text(
@@ -661,6 +742,7 @@ class MudahMyCarsService:
                         "model": None,
                         "variant": None,
                         "information_ads": None,
+                        "information_ads_date": None,
                         "location": None,
                         "price": None,
                         "year": None,
@@ -686,6 +768,7 @@ class MudahMyCarsService:
                         result.get("model"),
                         result.get("variant"),
                         result.get("information_ads"),
+                        result.get("information_ads_date"),
                         result.get("location"),
                         result.get("price"),
                         result.get("year"),

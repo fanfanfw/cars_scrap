@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS cars_scrap_mudahmy (
   model VARCHAR(100),
   variant VARCHAR(100),
   information_ads TEXT,
+  information_ads_date DATE,
   location VARCHAR(255),
   price INTEGER,
   year INTEGER,
@@ -42,6 +43,9 @@ ALTER TABLE cars_scrap_mudahmy
 
 ALTER TABLE cars_scrap_mudahmy
   ADD COLUMN IF NOT EXISTS information_ads TEXT;
+
+ALTER TABLE cars_scrap_mudahmy
+  ADD COLUMN IF NOT EXISTS information_ads_date DATE;
 
 ALTER TABLE cars_scrap_mudahmy
   ADD COLUMN IF NOT EXISTS location VARCHAR(255);
