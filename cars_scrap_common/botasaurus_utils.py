@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cars_scrap_common.env_utils import env_bool, env_float
+from cars_scrap_common.proxy_utils import load_proxy_for_run
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class BotasaurusRuntimeConfig:
     listing_wait_seconds: float
     detail_wait_seconds: float
     poll_interval_seconds: float
+    proxy_url: str | None
 
 
 def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
@@ -49,6 +51,9 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
     }
     if enable_xvfb:
         browser_kwargs["enable_xvfb_virtual_display"] = True
+    proxy = load_proxy_for_run()
+    if proxy:
+        browser_kwargs["proxy"] = proxy
 
     return BotasaurusRuntimeConfig(
         browser_kwargs=browser_kwargs,
@@ -59,6 +64,7 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
         listing_wait_seconds=listing_wait_seconds,
         detail_wait_seconds=detail_wait_seconds,
         poll_interval_seconds=poll_interval_seconds,
+        proxy_url=proxy,
     )
 
 
