@@ -1,27 +1,61 @@
--- Table: cars_scrap_carlist
+-- Table: cars_scrap_carlistmy
 -- Notes:
 -- - `listing_id` is UNIQUE for upserts.
 
-CREATE TABLE IF NOT EXISTS cars_scrap_carlist (
+CREATE TABLE IF NOT EXISTS cars_scrap_carlistmy (
   id BIGSERIAL PRIMARY KEY,
   listing_id VARCHAR NOT NULL UNIQUE,
   listing_url TEXT NOT NULL,
-  title VARCHAR,
+  condition VARCHAR(50),
+  brand VARCHAR(100),
   price INTEGER,
+  information_ads TEXT,
+  information_ads_date DATE,
   location VARCHAR,
-  make VARCHAR,
   model VARCHAR,
+  variant VARCHAR(100),
   year INTEGER,
   mileage INTEGER,
   transmission VARCHAR,
+  seat_capacity VARCHAR(10),
+  engine_cc VARCHAR(50),
   fuel_type VARCHAR,
-  seller_type VARCHAR,
+  series VARCHAR(100),
+  type VARCHAR(100),
   images TEXT[],
   status VARCHAR NOT NULL DEFAULT 'active',
   version INTEGER NOT NULL DEFAULT 1,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_scraped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- If the table already existed before adding new columns, keep it in sync.
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS condition VARCHAR(50);
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS brand VARCHAR(100);
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS information_ads TEXT;
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS information_ads_date DATE;
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS variant VARCHAR(100);
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS seat_capacity VARCHAR(10);
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS engine_cc VARCHAR(50);
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS series VARCHAR(100);
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS type VARCHAR(100);
 
 ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS status VARCHAR NOT NULL DEFAULT 'active';
@@ -41,4 +75,3 @@ ALTER TABLE cars_scrap_carlistmy
 
 ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-

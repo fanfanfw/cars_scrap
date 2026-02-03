@@ -3,32 +3,235 @@ from __future__ import annotations
 import os
 import re
 import time
+from datetime import date, datetime
 from hashlib import sha1
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from psycopg2.extras import execute_values
 
-from cars_scrap_common.botasaurus_utils import load_botasaurus_config, raise_if_cloudflare_challenge
+from cars_scrap_common.botasaurus_utils import (
+    is_cloudflare_challenge,
+    load_botasaurus_config,
+    raise_if_cloudflare_challenge,
+    wait_for_xpath,
+)
+from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
+from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip
 from scrap_carlist_cars_botasaurus.database import get_connection
 
 load_dotenv(override=True)
+
+LISTING_ID_META_XPATH = "/html/head/meta[47]"
+CONDITION_META_XPATH = "/html/head/meta[46]"
+BRAND_META_XPATH = "/html/head/meta[57]"
+MODEL_META_XPATH = "/html/head/meta[59]"
+VARIANT_META_XPATH = "/html/head/meta[60]"
+PRICE_META_XPATH = "/html/head/meta[55]"
+YEAR_META_XPATH = "/html/head/meta[61]"
+TRANSMISSION_META_XPATH = "/html/head/meta[62]"
+FUEL_TYPE_META_XPATH = "/html/head/meta[54]"
+
+INFORMATION_ADS_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/span"
+LOCATION_CONTAINER_XPATH = "/html/body/main/article/section/section[2]/div/div/div[2]/div[1]/div[1]/div/div/div"
+MILEAGE_XPATH = (
+    "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[3]/div/div/div/span[2]"
+)
+ENGINE_CC_XPATH = (
+    "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[5]/div/div/div/span[2]"
+)
+SEAT_CAPACITY_XPATH = (
+    "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[7]/div/div/div/span[2]"
+)
+IMAGES_CONTAINER_XPATH = "/html/body/main/article/section/section[4]/section[1]/div/div/div/div/div[1]/div/div[1]/div[1]"
 
 
 class CarlistCarsService:
     def __init__(self):
         self.logger = setup_logger("scrape_carlist_cars")
+        self.stop_flag = False
+        self._logged_proxy_ip = False
         self.listing_url = os.getenv("CARLIST_CARS_LISTING_URL", "").strip()
 
     def close(self) -> None:
         return
 
+    def stop_scraping(self) -> None:
+        self.stop_flag = True
+
+    def _maybe_log_proxy_and_ip(self, cfg) -> None:
+        if self._logged_proxy_ip:
+            return
+        self._logged_proxy_ip = True
+
+        if getattr(cfg, "proxy_url", None):
+            self.logger.info("Proxy selected: %s", mask_proxy_url(str(cfg.proxy_url)))
+        else:
+            self.logger.info("Proxy disabled (direct connection).")
+
+        if not env_bool("PROXY_CHECK_IP", False):
+            return
+
+        check_url = (os.getenv("PROXY_CHECK_URL") or "https://ifconfig.me/ip").strip()
+        proxy_url = str(getattr(cfg, "proxy_url", "") or "").strip() or None
+        ip = probe_public_ip(check_url=check_url, proxy_url=proxy_url)
+        if ip:
+            self.logger.info("Outbound IP via %s: %s", "proxy" if proxy_url else "direct", ip)
+        else:
+            self.logger.warning("Failed to probe outbound IP via %s.", "proxy" if proxy_url else "direct")
+
     def _extract_listing_id(self, url: str) -> str:
+        numeric = self._extract_numeric_listing_id(url)
+        if numeric:
+            return numeric
+        return sha1(url.encode("utf-8")).hexdigest()[:16]
+
+    def _extract_numeric_listing_id(self, url: str) -> str | None:
         match = re.search(r"(?:-|/)(\d{5,})(?:[/?#.]|$)", url)
         if match:
             return match.group(1)
-        return sha1(url.encode("utf-8")).hexdigest()[:16]
+        return None
+
+    def _get_attr_by_xpath_botasaurus(self, driver, xpath: str, attr: str) -> str | None:
+        try:
+            val = driver.run_js(
+                """
+                const el = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!el) return null;
+                const v = el.getAttribute(args.attr);
+                return (v || '').trim() || null;
+                """,
+                {"xpath": xpath, "attr": attr},
+            )
+        except Exception:
+            val = None
+        return val or None
+
+    def _get_text_by_xpath_botasaurus(self, driver, xpath: str) -> str | None:
+        try:
+            text = driver.run_js(
+                """
+                const el = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!el) return null;
+                const raw = (el.innerText || el.textContent || '').trim();
+                return raw || null;
+                """,
+                {"xpath": xpath},
+            )
+        except Exception:
+            text = None
+        return text or None
+
+    def _parse_int_from_text(self, text: str | None) -> int | None:
+        if not text:
+            return None
+        digits = re.findall(r"\d+", str(text))
+        if not digits:
+            return None
+        try:
+            return int("".join(digits))
+        except Exception:
+            return None
+
+    def _parse_mileage(self, mileage_str: str | None) -> int:
+        if not mileage_str or mileage_str.strip() == "- km":
+            return 0
+        try:
+            if "-" in mileage_str:
+                right = mileage_str.split("-")[-1].strip()
+            else:
+                right = mileage_str.strip()
+            right = right.replace("km", "").replace("KM", "").replace("Km", "").strip()
+            right = right.replace("K", "000").replace("k", "000")
+            right = right.replace(" ", "")
+            return int(re.sub(r"[^\d]", "", right))
+        except Exception:
+            return 0
+
+    def _parse_information_ads_date(self, information_ads: str | None) -> date | None:
+        """
+        Converts carlist "Updated on: May 14, 2025" to a DATE.
+        Supports:
+        - May 14, 2025
+        - 14 May 2025
+        - 2025-05-14 or 2025/05/14
+        Removes prefixes: Updated on:, Posted on:, Date:
+        """
+        if not information_ads:
+            return None
+
+        month_mapping = {
+            "january": "01",
+            "jan": "01",
+            "february": "02",
+            "feb": "02",
+            "march": "03",
+            "mar": "03",
+            "april": "04",
+            "apr": "04",
+            "may": "05",
+            "june": "06",
+            "jun": "06",
+            "july": "07",
+            "jul": "07",
+            "august": "08",
+            "aug": "08",
+            "september": "09",
+            "sep": "09",
+            "sept": "09",
+            "october": "10",
+            "oct": "10",
+            "november": "11",
+            "nov": "11",
+            "december": "12",
+            "dec": "12",
+        }
+
+        text = str(information_ads).lower().strip()
+        text = re.sub(r"^(updated\s+on:\s*|posted\s+on:\s*|date:\s*)", "", text)
+
+        match1 = re.search(r"([a-z]+)\s+(\d{1,2}),?\s+(\d{4})", text)
+        if match1:
+            month_str, day, year = match1.groups()
+            month_num = month_mapping.get(month_str[:3])
+            if month_num:
+                try:
+                    return datetime(int(year), int(month_num), int(day)).date()
+                except ValueError:
+                    return None
+
+        match2 = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", text)
+        if match2:
+            day, month_str, year = match2.groups()
+            month_num = month_mapping.get(month_str[:3])
+            if month_num:
+                try:
+                    return datetime(int(year), int(month_num), int(day)).date()
+                except ValueError:
+                    return None
+
+        match3 = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+        if match3:
+            year, month, day = match3.groups()
+            try:
+                return datetime(int(year), int(month), int(day)).date()
+            except ValueError:
+                return None
+
+        return None
 
     def _is_on_target_domain(self, url: str) -> bool:
         try:
@@ -54,6 +257,140 @@ class CarlistCarsService:
             prompt_on_cloudflare=cfg.prompt_on_cloudflare,
         )
 
+    def _is_listing_not_found_botasaurus(self, driver) -> bool:
+        try:
+            title = driver.run_js("return (document.title || '').toLowerCase();")
+        except Exception:
+            title = ""
+        try:
+            text = driver.run_js("return ((document.body && document.body.innerText) || '').toLowerCase();")
+        except Exception:
+            try:
+                text = (driver.page_html or "").lower()
+            except Exception:
+                return False
+
+        if (not title) and (not text):
+            return False
+
+        if any(token in (title or "") for token in ("page not found", "404", "not found")):
+            return True
+
+        body_tokens = (
+            "we can’t seem to find the page you’re looking for",
+            "we can't seem to find the page you're looking for",
+            "cant seem to find the page youre looking for",
+            "this ad is no longer available",
+            "ad no longer available",
+            "no longer available",
+        )
+        if any(token in (text or "") for token in body_tokens):
+            return True
+
+        return False
+
+    def _is_access_blocked_botasaurus(self, driver) -> bool:
+        if is_cloudflare_challenge(driver):
+            return True
+        try:
+            text = driver.run_js("return ((document.body && document.body.innerText) || '').toLowerCase();")
+        except Exception:
+            try:
+                text = (driver.page_html or "").lower()
+            except Exception:
+                return False
+        if not text:
+            return False
+        return any(
+            token in text
+            for token in (
+                "access denied",
+                "forbidden",
+                "request blocked",
+                "your request has been blocked",
+                "too many requests",
+                "temporarily unavailable",
+            )
+        )
+
+    def _extract_location_botasaurus(self, driver) -> str | None:
+        try:
+            parts = driver.run_js(
+                """
+                const root = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!root) return [];
+                const texts = Array.from(root.querySelectorAll('span'))
+                  .map((el) => (el.innerText || el.textContent || '').trim())
+                  .filter(Boolean);
+                return texts;
+                """,
+                {"xpath": LOCATION_CONTAINER_XPATH},
+            )
+        except Exception:
+            parts = []
+
+        items = [p for p in (parts or []) if isinstance(p, str) and p.strip()]
+        if len(items) >= 3:
+            return f"{items[1]} - {items[2]}"
+        if len(items) >= 2:
+            return items[1]
+        return None
+
+    def _extract_images_botasaurus(self, driver) -> list[str] | None:
+        try:
+            urls = driver.run_js(
+                """
+                const isValid = (url) => /^https?:\\/\\//i.test(String(url || '').trim());
+                const root = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!root) return [];
+                const out = [];
+                const attrs = ['src', 'data-src', 'data-lazy', 'data-original'];
+                for (const img of Array.from(root.querySelectorAll('img'))) {
+                  for (const attr of attrs) {
+                    const v = img.getAttribute(attr);
+                    if (v && isValid(v)) out.push(v);
+                  }
+                  const srcset = img.getAttribute('srcset');
+                  if (srcset) {
+                    for (const part of srcset.split(',')) {
+                      const url = part.trim().split(' ')[0];
+                      if (url && isValid(url)) out.push(url);
+                    }
+                  }
+                }
+                return Array.from(new Set(out.filter(Boolean)));
+                """,
+                {"xpath": IMAGES_CONTAINER_XPATH},
+            )
+        except Exception:
+            urls = []
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for u in urls or []:
+            if not isinstance(u, str):
+                continue
+            url = u.strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            deduped.append(url)
+        return deduped or None
+
     def _extract_listing_urls_botasaurus(self, driver) -> list[str]:
         try:
             hrefs = driver.run_js(
@@ -72,7 +409,8 @@ class CarlistCarsService:
             if not isinstance(href, str):
                 continue
             if self._is_on_target_domain(href):
-                urls.append(href)
+                if self._extract_numeric_listing_id(href):
+                    urls.append(href)
 
         deduped = list(dict.fromkeys(urls))
         return deduped
@@ -88,6 +426,7 @@ class CarlistCarsService:
         from botasaurus.browser import Driver, browser
 
         cfg = load_botasaurus_config(service_name="carlist")
+        self._maybe_log_proxy_and_ip(cfg)
 
         @browser(**cfg.browser_kwargs)
         def run(driver: Driver, data):
@@ -119,48 +458,344 @@ class CarlistCarsService:
         self.logger.info("Collected %s links.", len(links))
         return links
 
-    def scrape_listing_details(self, links: list[str]) -> list[dict]:
+    def scrape_listing_details(self, links: list[str], *, listing_id_by_url: dict[str, str] | None = None) -> list[dict]:
         batch_size = int(os.getenv("DB_BATCH_SIZE", "100"))
         if batch_size < 1:
             batch_size = 1
 
-        rows: list[tuple] = []
-        results: list[dict] = []
-        for url in links:
-            url = (url or "").strip()
-            if not url:
-                continue
-            listing_id = self._extract_listing_id(url)
-            rows.append((listing_id, url, "active"))
-            results.append({"listing_id": listing_id, "listing_url": url, "status": "active"})
-
-        if not rows:
-            return []
-
-        columns = ("listing_id", "listing_url", "status")
+        columns = (
+            "listing_id",
+            "listing_url",
+            "condition",
+            "brand",
+            "model",
+            "variant",
+            "information_ads",
+            "information_ads_date",
+            "location",
+            "price",
+            "year",
+            "mileage",
+            "transmission",
+            "seat_capacity",
+            "engine_cc",
+            "fuel_type",
+            "series",
+            "type",
+            "images",
+            "status",
+        )
         upsert_sql = f"""
         INSERT INTO cars_scrap_carlistmy ({", ".join(columns)})
         VALUES %s
         ON CONFLICT (listing_id) DO UPDATE SET
           listing_url = EXCLUDED.listing_url,
-          status = COALESCE(EXCLUDED.status, cars_scrap_carlistmy.status),
-          version = cars_scrap_carlistmy.version + 1,
+          condition = COALESCE(EXCLUDED.condition, cars_scrap_carlistmy.condition),
+          brand = COALESCE(EXCLUDED.brand, cars_scrap_carlistmy.brand),
+          model = COALESCE(EXCLUDED.model, cars_scrap_carlistmy.model),
+          variant = COALESCE(EXCLUDED.variant, cars_scrap_carlistmy.variant),
+          information_ads = COALESCE(EXCLUDED.information_ads, cars_scrap_carlistmy.information_ads),
+          information_ads_date = COALESCE(EXCLUDED.information_ads_date, cars_scrap_carlistmy.information_ads_date),
+          location = COALESCE(EXCLUDED.location, cars_scrap_carlistmy.location),
+          price = COALESCE(EXCLUDED.price, cars_scrap_carlistmy.price),
+          year = COALESCE(EXCLUDED.year, cars_scrap_carlistmy.year),
+          mileage = COALESCE(EXCLUDED.mileage, cars_scrap_carlistmy.mileage),
+          transmission = COALESCE(EXCLUDED.transmission, cars_scrap_carlistmy.transmission),
+          seat_capacity = COALESCE(EXCLUDED.seat_capacity, cars_scrap_carlistmy.seat_capacity),
+          engine_cc = COALESCE(EXCLUDED.engine_cc, cars_scrap_carlistmy.engine_cc),
+          fuel_type = COALESCE(EXCLUDED.fuel_type, cars_scrap_carlistmy.fuel_type),
+          series = COALESCE(EXCLUDED.series, cars_scrap_carlistmy.series),
+          type = COALESCE(EXCLUDED.type, cars_scrap_carlistmy.type),
+          images = COALESCE(EXCLUDED.images, cars_scrap_carlistmy.images),
+          status = CASE
+            WHEN cars_scrap_carlistmy.status = 'sold' THEN cars_scrap_carlistmy.status
+            ELSE COALESCE(EXCLUDED.status, cars_scrap_carlistmy.status)
+          END,
+          version = COALESCE(cars_scrap_carlistmy.version, 0) + 1,
           last_scraped_at = NOW()
         """
 
-        conn = None
+        sold_upsert_sql = """
+        INSERT INTO cars_scrap_carlistmy (listing_id, listing_url, status)
+        VALUES %s
+        ON CONFLICT (listing_id) DO UPDATE SET
+          status = 'sold',
+          version = COALESCE(cars_scrap_carlistmy.version, 0) + 1,
+          last_scraped_at = NOW()
+        """
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        rows: list[tuple] = []
+        sold_rows: list[tuple] = []
+
+        def flush_rows() -> None:
+            if not rows:
+                return
+            try:
+                execute_values(cursor, upsert_sql, rows, page_size=100)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            rows.clear()
+
+        def flush_sold_rows() -> None:
+            if not sold_rows:
+                return
+            try:
+                execute_values(cursor, sold_upsert_sql, sold_rows, page_size=100)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            sold_rows.clear()
+
+        from botasaurus.browser import Driver, browser
+
+        cfg = load_botasaurus_config(service_name="carlist")
+        self._maybe_log_proxy_and_ip(cfg)
+
+        @browser(**cfg.browser_kwargs)
+        def run(driver: Driver, data):
+            if cfg.human_mode:
+                try:
+                    driver.enable_human_mode()
+                except Exception:
+                    pass
+
+            results: list[dict] = []
+            for idx, url in enumerate(data["links"], start=1):
+                if self.stop_flag:
+                    break
+
+                url = (url or "").strip()
+                if not url:
+                    continue
+
+                self.logger.info("Detail %s/%s: %s", idx, len(data["links"]), url)
+
+                listing_id = None
+                if listing_id_by_url:
+                    listing_id = listing_id_by_url.get(url)
+                if not listing_id:
+                    listing_id = None
+
+                try:
+                    self._navigate_botasaurus(driver, url, cfg)
+
+                    current_url = str(getattr(driver, "current_url", "") or "")
+                    tracking_mode = bool(listing_id_by_url)
+                    expected_id = (listing_id or self._extract_listing_id(url)).strip()
+                    redirected_off_detail = bool(current_url) and (not self._is_on_target_domain(current_url))
+
+                    if self._is_access_blocked_botasaurus(driver):
+                        raise RuntimeError(f"Blocked while scraping carlist detail: current_url={current_url!r}")
+
+                    if self._is_listing_not_found_botasaurus(driver) or redirected_off_detail:
+                        if tracking_mode and expected_id:
+                            result = {
+                                "listing_id": expected_id,
+                                "listing_url": url,
+                                "condition": None,
+                                "brand": None,
+                                "model": None,
+                                "variant": None,
+                                "information_ads": None,
+                                "information_ads_date": None,
+                                "location": None,
+                                "price": None,
+                                "year": None,
+                                "mileage": None,
+                                "transmission": None,
+                                "seat_capacity": None,
+                                "engine_cc": None,
+                                "fuel_type": None,
+                                "series": None,
+                                "type": None,
+                                "images": None,
+                                "error": None,
+                                "status": "sold",
+                            }
+                            results.append(result)
+                            sold_rows.append((expected_id, result.get("listing_url"), "sold"))
+                            if len(sold_rows) >= batch_size:
+                                flush_sold_rows()
+                            continue
+                        raise RuntimeError("Listing not found/redirected (treating as error, not sold).")
+
+                    wait_for_xpath(
+                        driver,
+                        INFORMATION_ADS_XPATH,
+                        timeout_seconds=cfg.detail_wait_seconds,
+                        poll_interval_seconds=cfg.poll_interval_seconds,
+                    )
+
+                    listing_id_meta = self._get_attr_by_xpath_botasaurus(driver, LISTING_ID_META_XPATH, "content")
+                    listing_id_final = (listing_id_meta or listing_id or self._extract_listing_id(url) or "").strip()
+                    if not listing_id_final:
+                        raise RuntimeError("Missing listing_id on page")
+
+                    condition_value = self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
+                    brand_value = self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
+                    model_value = self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
+                    variant_value = self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
+
+                    info_ads_value = self._get_text_by_xpath_botasaurus(driver, INFORMATION_ADS_XPATH)
+                    info_ads_date_value = self._parse_information_ads_date(info_ads_value)
+
+                    location_value = self._extract_location_botasaurus(driver)
+                    price_value = self._parse_int_from_text(
+                        self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content")
+                    )
+                    year_value = self._parse_int_from_text(self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content"))
+                    mileage_value = self._parse_mileage(self._get_text_by_xpath_botasaurus(driver, MILEAGE_XPATH))
+                    transmission_value = self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
+                    seat_capacity_value = self._get_text_by_xpath_botasaurus(driver, SEAT_CAPACITY_XPATH)
+                    engine_cc_value = self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH)
+                    fuel_type_value = self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
+                    images_value = self._extract_images_botasaurus(driver)
+
+                    def has_value(v) -> bool:
+                        if v is None:
+                            return False
+                        if isinstance(v, str):
+                            return bool(v.strip())
+                        if isinstance(v, (list, tuple, set, dict)):
+                            return bool(v)
+                        if isinstance(v, (int, float)):
+                            return v != 0
+                        return True
+
+                    has_any_data = any(
+                        has_value(v)
+                        for v in (
+                            condition_value,
+                            brand_value,
+                            model_value,
+                            variant_value,
+                            info_ads_value,
+                            info_ads_date_value,
+                            location_value,
+                            price_value,
+                            year_value,
+                            mileage_value,
+                            transmission_value,
+                            seat_capacity_value,
+                            engine_cc_value,
+                            fuel_type_value,
+                            images_value,
+                        )
+                    )
+                    if not has_any_data:
+                        if tracking_mode and listing_id_final:
+                            status = "sold"
+                        else:
+                            raise RuntimeError("No extractable data on detail page (treating as error, not sold).")
+                    else:
+                        status = "active"
+
+                    result = {
+                        "listing_id": listing_id_final,
+                        "listing_url": url,
+                        "condition": condition_value if status == "active" else None,
+                        "brand": brand_value if status == "active" else None,
+                        "model": model_value if status == "active" else None,
+                        "variant": variant_value if status == "active" else None,
+                        "information_ads": info_ads_value if status == "active" else None,
+                        "information_ads_date": info_ads_date_value if status == "active" else None,
+                        "location": location_value if status == "active" else None,
+                        "price": price_value if status == "active" else None,
+                        "year": year_value if status == "active" else None,
+                        "mileage": mileage_value if status == "active" else None,
+                        "transmission": transmission_value if status == "active" else None,
+                        "seat_capacity": seat_capacity_value if status == "active" else None,
+                        "engine_cc": engine_cc_value if status == "active" else None,
+                        "fuel_type": fuel_type_value if status == "active" else None,
+                        "series": None,
+                        "type": None,
+                        "images": images_value if status == "active" else None,
+                        "error": None,
+                        "status": status,
+                    }
+
+                    if status != "active":
+                        results.append(result)
+                        sold_rows.append((listing_id_final, result.get("listing_url"), "sold"))
+                        if len(sold_rows) >= batch_size:
+                            flush_sold_rows()
+                        continue
+
+                except Exception as exc:
+                    self.logger.warning("Error while scraping %s: %s", url, exc)
+                    result = {
+                        "listing_id": None,
+                        "listing_url": url,
+                        "condition": None,
+                        "brand": None,
+                        "model": None,
+                        "variant": None,
+                        "information_ads": None,
+                        "information_ads_date": None,
+                        "location": None,
+                        "price": None,
+                        "year": None,
+                        "mileage": None,
+                        "transmission": None,
+                        "seat_capacity": None,
+                        "engine_cc": None,
+                        "fuel_type": None,
+                        "series": None,
+                        "type": None,
+                        "images": None,
+                        "status": "active",
+                        "error": "error",
+                    }
+
+                results.append(result)
+
+                row_listing_id = result.get("listing_id")
+                if row_listing_id and not result.get("error"):
+                    status = result.get("status")
+                    rows.append(
+                        (
+                            str(row_listing_id),
+                            result.get("listing_url"),
+                            result.get("condition"),
+                            result.get("brand"),
+                            result.get("model"),
+                            result.get("variant"),
+                            result.get("information_ads"),
+                            result.get("information_ads_date"),
+                            result.get("location"),
+                            result.get("price"),
+                            result.get("year"),
+                            result.get("mileage"),
+                            result.get("transmission"),
+                            result.get("seat_capacity"),
+                            result.get("engine_cc"),
+                            result.get("fuel_type"),
+                            result.get("series"),
+                            result.get("type"),
+                            result.get("images"),
+                            str(status) if status else "active",
+                        )
+                    )
+                    if len(rows) >= batch_size:
+                        flush_rows()
+
+            flush_rows()
+            flush_sold_rows()
+            return results
+
         try:
-            conn = get_connection()
-            with conn.cursor() as cursor:
-                for i in range(0, len(rows), batch_size):
-                    chunk = rows[i : i + batch_size]
-                    execute_values(cursor, upsert_sql, chunk, page_size=len(chunk))
-            conn.commit()
+            return run({"links": links}) or []
         finally:
             try:
-                if conn:
-                    conn.close()
+                cursor.close()
             except Exception:
                 pass
-
-        return results
+            try:
+                conn.close()
+            except Exception:
+                pass
