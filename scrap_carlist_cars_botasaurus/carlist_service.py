@@ -8,7 +8,7 @@ from hashlib import sha1
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from psycopg2.extras import execute_values
+from psycopg2.extras import Json, execute_values
 
 from cars_scrap_common.botasaurus_utils import (
     is_cloudflare_challenge,
@@ -48,6 +48,11 @@ IMAGES_CONTAINER_XPATH = "/html/body/main/article/section/section[4]/section[1]/
 
 SOLD_MESSAGE_XPATH = "/html/body/main/article/section/section[1]/div/div/div/h2"
 PAGE_NOT_FOUND_XPATH = "/html/body/main/section[1]/div/div[2]/h1"
+
+CAROUSEL_SECTION_SELECTOR = "section.c-section--key-details"
+TAB_SELLER_NOTES_SELECTOR = "#tab-seller-notes"
+TAB_SPECIFICATIONS_SELECTOR = "#tab-specifications"
+TAB_EQUIPMENTS_SELECTOR = "#tab-equipments"
 
 
 class CarlistCarsService:
@@ -233,6 +238,16 @@ class CarlistCarsService:
         except Exception:
             return 0
 
+    def _spec_key_to_snake(self, label: str) -> str:
+        raw = str(label or "").strip().lower()
+        if not raw:
+            return ""
+        raw = raw.replace("&", " and ")
+        raw = re.sub(r"[()]+", " ", raw)
+        raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+        raw = re.sub(r"_+", "_", raw)
+        return raw
+
     def _parse_information_ads_date(self, information_ads: str | None) -> date | None:
         """
         Converts carlist "Updated on: May 14, 2025" to a DATE.
@@ -304,6 +319,176 @@ class CarlistCarsService:
                 return None
 
         return None
+
+    def _extract_carousel_dict_botasaurus(self, driver) -> dict[str, object] | None:
+        """
+        Extract key/value pairs from the carousel (key details cards).
+        Label class: 'u-text-7  u-color-muted  u-block'
+        Value class: 'u-text-bold  u-block'
+        """
+        try:
+            items = driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const root = document.querySelector(args.selector);
+                if (!root) return [];
+
+                const cards = Array.from(root.querySelectorAll('.c-key-details__item, .c-card'));
+                const out = [];
+                for (const el of cards) {
+                  const labelEl = el.querySelector('span.u-text-7.u-color-muted.u-block');
+                  const valueEl = el.querySelector('span.u-text-bold.u-block');
+                  const label = norm(labelEl && (labelEl.textContent || labelEl.innerText));
+                  const value = norm(valueEl && (valueEl.textContent || valueEl.innerText));
+                  if (!label || !value) continue;
+                  out.push({ label, value });
+                }
+                return out;
+                """,
+                {"selector": CAROUSEL_SECTION_SELECTOR},
+            )
+        except Exception:
+            items = []
+
+        data: dict[str, object] = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "") or "").strip()
+            value = str(item.get("value", "") or "").strip()
+            if not label or not value:
+                continue
+            key = self._spec_key_to_snake(label)
+            if not key:
+                continue
+            if key not in data:
+                data[key] = value
+                continue
+            existing = data[key]
+            if isinstance(existing, list):
+                if value not in existing:
+                    existing.append(value)
+                continue
+            if existing != value:
+                data[key] = [existing, value]
+        return data or None
+
+    def _extract_seller_notes_text_botasaurus(self, driver) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').trim();
+                const tab = document.querySelector(args.selector);
+                if (!tab) return null;
+                const desc = tab.querySelector('[itemprop=\"description\"]') || tab;
+                const text = norm(desc && (desc.innerText || desc.textContent));
+                return text || null;
+                """,
+                {"selector": TAB_SELLER_NOTES_SELECTOR},
+            )
+        except Exception:
+            return None
+
+    def _click_tab_by_href_botasaurus(self, driver, *, href: str) -> bool:
+        """
+        Some tabs render content lazily only after being activated. Click the tab anchor by href.
+        Example href: "#tab-specifications"
+        """
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const href = String(args.href || '').trim();
+                    if (!href) return false;
+                    const links = Array.from(document.querySelectorAll('a.c-tab__item[data-toggle=\"tab\"][href]'));
+                    const a = links.find((el) => String(el.getAttribute('href') || '').trim() === href);
+                    if (!a) return false;
+                    try { a.scrollIntoView({block: 'center'}); } catch (e) {}
+                    a.click();
+                    return true;
+                    """,
+                    {"href": href},
+                )
+            )
+        except Exception:
+            return False
+
+    def _extract_tab_grouped_kv_botasaurus(self, driver, *, tab_selector: str) -> dict[str, object] | None:
+        """
+        Extract grouped key/value pairs from Specifications / Equipments tabs.
+        - Category: <h3 class="u-text-6 u-text-uppercase ...">...</h3>
+        - Row label: <span class="u-width-1/2">Key</span>
+        - Row value: <span class="u-text-bold u-width-1/2 u-align-right">Value</span>
+
+        Output example:
+        {
+          "general": {"doors": "5", "seat_capacity": "5"},
+          "engine_specifications": {"engine_cc": "998"}
+        }
+        """
+        try:
+            items = driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const tab = document.querySelector(args.selector);
+                if (!tab) return [];
+
+                const groups = Array.from(tab.querySelectorAll('.o-grid')).filter((g) => g.querySelector('h3'));
+                const out = [];
+                for (const g of groups) {
+                  const h3 = g.querySelector('h3');
+                  const category = norm(h3 && (h3.textContent || h3.innerText));
+                  if (!category) continue;
+                  const rows = Array.from(g.querySelectorAll('div.u-flex.u-flex--justify-between'));
+                  for (const row of rows) {
+                    // NOTE: class "u-width-1/2" contains "/" which breaks CSS selectors unless escaped.
+                    // Avoid brittle selectors and instead pick the bold span as value, and the other span as label.
+                    const spans = Array.from(row.querySelectorAll('span'));
+                    const valueEl = spans.find((s) => s && s.classList && s.classList.contains('u-text-bold')) || null;
+                    const labelEl = spans.find((s) => s && s !== valueEl) || null;
+                    const label = norm(labelEl && (labelEl.textContent || labelEl.innerText));
+                    const value = norm(valueEl && (valueEl.textContent || valueEl.innerText));
+                    if (!label || !value) continue;
+                    out.push({ category, label, value });
+                  }
+                }
+                return out;
+                """,
+                {"selector": tab_selector},
+            )
+        except Exception:
+            items = []
+
+        grouped: dict[str, object] = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category", "") or "").strip()
+            label = str(item.get("label", "") or "").strip()
+            value = str(item.get("value", "") or "").strip()
+            if not category or not label or not value:
+                continue
+            cat_key = self._spec_key_to_snake(category)
+            key = self._spec_key_to_snake(label)
+            if not cat_key or not key:
+                continue
+            cat_obj = grouped.get(cat_key)
+            if not isinstance(cat_obj, dict):
+                cat_obj = {}
+                grouped[cat_key] = cat_obj
+
+            if key not in cat_obj:
+                cat_obj[key] = value
+                continue
+            existing = cat_obj[key]
+            if isinstance(existing, list):
+                if value not in existing:
+                    existing.append(value)
+                continue
+            if existing != value:
+                cat_obj[key] = [existing, value]
+
+        return grouped or None
 
     def _is_on_target_domain(self, url: str) -> bool:
         try:
@@ -587,6 +772,25 @@ class CarlistCarsService:
           last_scraped_at = NOW()
         """
 
+        details_columns = (
+            "listing_id",
+            "listing_url",
+            "carousel",
+            "seller_notes",
+            "specifications",
+            "equipment",
+        )
+        details_upsert_sql = f"""
+        INSERT INTO cars_scrap_carlistmy_details ({", ".join(details_columns)})
+        VALUES %s
+        ON CONFLICT (listing_id) DO UPDATE SET
+          listing_url = EXCLUDED.listing_url,
+          carousel = COALESCE(EXCLUDED.carousel, cars_scrap_carlistmy_details.carousel),
+          seller_notes = COALESCE(EXCLUDED.seller_notes, cars_scrap_carlistmy_details.seller_notes),
+          specifications = COALESCE(EXCLUDED.specifications, cars_scrap_carlistmy_details.specifications),
+          equipment = COALESCE(EXCLUDED.equipment, cars_scrap_carlistmy_details.equipment)
+        """
+
         sold_upsert_sql = """
         UPDATE cars_scrap_carlistmy
         SET
@@ -600,18 +804,23 @@ class CarlistCarsService:
         conn = get_connection()
         cursor = conn.cursor()
         rows: list[tuple] = []
+        details_rows: list[tuple] = []
         sold_rows: list[tuple] = []
 
         def flush_rows() -> None:
-            if not rows:
+            if (not rows) and (not details_rows):
                 return
             try:
-                execute_values(cursor, upsert_sql, rows, page_size=100)
+                if rows:
+                    execute_values(cursor, upsert_sql, rows, page_size=100)
+                if details_rows:
+                    execute_values(cursor, details_upsert_sql, details_rows, page_size=100)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
             rows.clear()
+            details_rows.clear()
 
         def flush_sold_rows() -> None:
             if not sold_rows:
@@ -686,6 +895,10 @@ class CarlistCarsService:
                                 "fuel_type": None,
                                 "series": None,
                                 "type": None,
+                                "carousel": None,
+                                "seller_notes": None,
+                                "specifications": None,
+                                "equipment": None,
                                 "images": None,
                                 "error": None,
                                 "status": "sold",
@@ -770,6 +983,29 @@ class CarlistCarsService:
                     else:
                         status = "active"
 
+                    carousel_value = None
+                    seller_notes_value = None
+                    specifications_value: dict[str, object] | None = None
+                    equipment_value: dict[str, object] | None = None
+                    if status == "active":
+                        carousel_value = self._extract_carousel_dict_botasaurus(driver)
+
+                        if self._click_tab_by_href_botasaurus(driver, href=TAB_SELLER_NOTES_SELECTOR):
+                            time.sleep(0.2)
+                        seller_notes_value = self._extract_seller_notes_text_botasaurus(driver)
+
+                        if self._click_tab_by_href_botasaurus(driver, href=TAB_SPECIFICATIONS_SELECTOR):
+                            time.sleep(0.2)
+                        specifications_value = self._extract_tab_grouped_kv_botasaurus(
+                            driver, tab_selector=TAB_SPECIFICATIONS_SELECTOR
+                        )
+
+                        if self._click_tab_by_href_botasaurus(driver, href=TAB_EQUIPMENTS_SELECTOR):
+                            time.sleep(0.2)
+                        equipment_value = self._extract_tab_grouped_kv_botasaurus(
+                            driver, tab_selector=TAB_EQUIPMENTS_SELECTOR
+                        )
+
                     result = {
                         "listing_id": listing_id_final,
                         "listing_url": url,
@@ -789,6 +1025,10 @@ class CarlistCarsService:
                         "fuel_type": fuel_type_value if status == "active" else None,
                         "series": None,
                         "type": None,
+                        "carousel": carousel_value if status == "active" else None,
+                        "seller_notes": seller_notes_value if status == "active" else None,
+                        "specifications": specifications_value if status == "active" else None,
+                        "equipment": equipment_value if status == "active" else None,
                         "images": images_value if status == "active" else None,
                         "error": None,
                         "status": status,
@@ -822,6 +1062,10 @@ class CarlistCarsService:
                         "fuel_type": None,
                         "series": None,
                         "type": None,
+                        "carousel": None,
+                        "seller_notes": None,
+                        "specifications": None,
+                        "equipment": None,
                         "images": None,
                         "status": "active",
                         "error": "error",
@@ -856,7 +1100,20 @@ class CarlistCarsService:
                             str(status) if status else "active",
                         )
                     )
-                    if len(rows) >= batch_size:
+
+                    if str(status) == "active":
+                        details_rows.append(
+                            (
+                                str(row_listing_id),
+                                result.get("listing_url"),
+                                Json(result.get("carousel")) if result.get("carousel") else None,
+                                result.get("seller_notes"),
+                                Json(result.get("specifications")) if result.get("specifications") else None,
+                                Json(result.get("equipment")) if result.get("equipment") else None,
+                            )
+                        )
+
+                    if len(rows) >= batch_size or len(details_rows) >= batch_size:
                         flush_rows()
 
             flush_rows()
