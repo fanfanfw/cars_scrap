@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from psycopg2.extras import execute_values
+from psycopg2.extras import Json, execute_values
 
 from cars_scrap_common.botasaurus_utils import (
     is_cloudflare_challenge,
@@ -38,6 +38,10 @@ MILEAGE_XPATH = "/html/body/div[1]/main/div[2]/div[1]/section[1]/div/div/div[3]/
 ENGINE_CC_XPATH = "/html/body/div[1]/main/div[2]/div[1]/section[4]/div/div/div[2]/div/div/div[1]/div[1]/div[2]"
 
 IMAGE_GRID_CONTAINER_XPATH = "/html/body/div[1]/main/div[2]/section/div[2]"
+
+AD_HIGHLIGHTS_SECTION_SELECTOR = "section#ad_view_ad_highlights"
+DESCRIPTION_SECTION_SELECTOR = "section#ad_view_description"
+CAR_SPECIFICATIONS_SECTION_SELECTOR = "section#ad_view_car_specifications"
 
 
 class MudahMyCarsService:
@@ -212,6 +216,16 @@ class MudahMyCarsService:
     def _normalize_label(self, text: str) -> str:
         cleaned = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
         return re.sub(r"\s+", " ", cleaned)
+
+    def _spec_key_to_snake(self, label: str) -> str:
+        raw = str(label or "").strip().lower()
+        if not raw:
+            return ""
+        raw = raw.replace("&", " and ")
+        raw = re.sub(r"[()]+", " ", raw)
+        raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+        raw = re.sub(r"_+", "_", raw)
+        return raw
 
     def convert_mileage(self, mileage_str: str | None) -> int | None:
         """Convert mileage string to integer (km). Example: '<4k' -> 4000."""
@@ -393,6 +407,111 @@ class MudahMyCarsService:
             return self._clean_condition_or_info(left), self._clean_condition_or_info(right)
 
         return self._clean_condition_or_info(raw), None
+
+    def _click_show_more_description_botasaurus(self, driver) -> bool:
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const norm = (s) => (s || '').trim();
+                    const section = document.querySelector(args.selector);
+                    if (!section) return false;
+                    const buttons = Array.from(section.querySelectorAll('button'));
+                    const btn = buttons.find((b) => (norm(b.textContent) || '').toUpperCase().includes('SHOW MORE'));
+                    if (!btn) return false;
+                    try { btn.scrollIntoView({block: 'center'}); } catch (e) {}
+                    btn.click();
+                    return true;
+                    """,
+                    {"selector": DESCRIPTION_SECTION_SELECTOR},
+                )
+            )
+        except Exception:
+            return False
+
+    def _extract_description_text_botasaurus(self, driver) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').trim();
+                const section = document.querySelector(args.selector);
+                if (!section) return null;
+                const content =
+                  section.querySelector('div.mw44.mw45') ||
+                  section.querySelector('[class*=\"mw44\"]') ||
+                  section;
+                const text = norm(content && (content.innerText || content.textContent));
+                return text || null;
+                """,
+                {"selector": DESCRIPTION_SECTION_SELECTOR},
+            )
+        except Exception:
+            return None
+
+    def _extract_ad_highlights_text_botasaurus(self, driver) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').trim();
+                const section = document.querySelector(args.selector);
+                if (!section) return null;
+                const text = norm(section.innerText || section.textContent);
+                return text || null;
+                """,
+                {"selector": AD_HIGHLIGHTS_SECTION_SELECTOR},
+            )
+        except Exception:
+            return None
+
+    def _extract_car_specifications_dict_botasaurus(self, driver) -> dict[str, object]:
+        try:
+            items = driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const section = document.querySelector(args.selector);
+                if (!section) return [];
+                const labels = Array.from(section.querySelectorAll('div.text-mudah-grey'))
+                  .filter((el) => (el.className || '').includes('text-sm') && (el.className || '').includes('flex-1'));
+                const out = [];
+                for (const labelEl of labels) {
+                  const valueEl = labelEl.nextElementSibling;
+                  if (!valueEl) continue;
+                  if (!(valueEl.className || '').includes('text-sm')) continue;
+                  if (!(valueEl.className || '').includes('flex-1')) continue;
+                  const label = norm(labelEl.textContent || labelEl.innerText);
+                  const value = norm(valueEl.textContent || valueEl.innerText);
+                  if (!label || !value) continue;
+                  out.push({ label, value });
+                }
+                return out;
+                """,
+                {"selector": CAR_SPECIFICATIONS_SECTION_SELECTOR},
+            )
+        except Exception:
+            items = []
+
+        specs: dict[str, object] = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "") or "").strip()
+            value = str(item.get("value", "") or "").strip()
+            if not label or not value:
+                continue
+            key = self._spec_key_to_snake(label)
+            if not key:
+                continue
+            if key not in specs:
+                specs[key] = value
+                continue
+            existing = specs[key]
+            if isinstance(existing, list):
+                if value not in existing:
+                    existing.append(value)
+                continue
+            if existing != value:
+                specs[key] = [existing, value]
+        return specs
 
     def _extract_car_specs_map_botasaurus(self, driver) -> dict[str, str]:
         """
@@ -716,6 +835,23 @@ class MudahMyCarsService:
           last_scraped_at = NOW()
         """
 
+        details_columns = (
+            "listing_id",
+            "listing_url",
+            "ad_highlights",
+            "description",
+            "car_specifications",
+        )
+        details_upsert_sql = f"""
+        INSERT INTO cars_scrap_mudahmy_details ({", ".join(details_columns)})
+        VALUES %s
+        ON CONFLICT (listing_id) DO UPDATE SET
+          listing_url = EXCLUDED.listing_url,
+          ad_highlights = COALESCE(EXCLUDED.ad_highlights, cars_scrap_mudahmy_details.ad_highlights),
+          description = COALESCE(EXCLUDED.description, cars_scrap_mudahmy_details.description),
+          car_specifications = COALESCE(EXCLUDED.car_specifications, cars_scrap_mudahmy_details.car_specifications)
+        """
+
         sold_upsert_sql = """
         UPDATE cars_scrap_mudahmy
         SET
@@ -729,18 +865,23 @@ class MudahMyCarsService:
         conn = get_connection()
         cursor = conn.cursor()
         rows: list[tuple] = []
+        details_rows: list[tuple] = []
         sold_rows: list[tuple] = []
 
         def flush_rows() -> None:
-            if not rows:
+            if (not rows) and (not details_rows):
                 return
             try:
-                execute_values(cursor, upsert_sql, rows, page_size=100)
+                if rows:
+                    execute_values(cursor, upsert_sql, rows, page_size=100)
+                if details_rows:
+                    execute_values(cursor, details_upsert_sql, details_rows, page_size=100)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
             rows.clear()
+            details_rows.clear()
 
         def flush_sold_rows() -> None:
             if not sold_rows:
@@ -824,6 +965,9 @@ class MudahMyCarsService:
                                 "fuel_type": None,
                                 "series": None,
                                 "type": None,
+                                "ad_highlights": None,
+                                "description": None,
+                                "car_specifications": None,
                                 "images": None,
                                 "error": None,
                                 "status": "sold",
@@ -856,6 +1000,9 @@ class MudahMyCarsService:
                                 "fuel_type": None,
                                 "series": None,
                                 "type": None,
+                                "ad_highlights": None,
+                                "description": None,
+                                "car_specifications": None,
                                 "images": None,
                                 "error": None,
                                 "status": "sold",
@@ -935,6 +1082,40 @@ class MudahMyCarsService:
                     else:
                         status = "active"
 
+                    ad_highlights_text = None
+                    description_text = None
+                    car_specifications_value: dict[str, object] | None = None
+                    if status == "active":
+                        wait_for_css(
+                            driver,
+                            f"css={AD_HIGHLIGHTS_SECTION_SELECTOR}",
+                            timeout_seconds=2,
+                            poll_interval_seconds=cfg.poll_interval_seconds,
+                        )
+                        wait_for_css(
+                            driver,
+                            f"css={DESCRIPTION_SECTION_SELECTOR}",
+                            timeout_seconds=2,
+                            poll_interval_seconds=cfg.poll_interval_seconds,
+                        )
+                        wait_for_css(
+                            driver,
+                            f"css={CAR_SPECIFICATIONS_SECTION_SELECTOR}",
+                            timeout_seconds=2,
+                            poll_interval_seconds=cfg.poll_interval_seconds,
+                        )
+
+                        ad_highlights_text = self._extract_ad_highlights_text_botasaurus(driver)
+
+                        if self._click_show_more_description_botasaurus(driver):
+                            time.sleep(0.25)
+                        description_text = self._extract_description_text_botasaurus(driver)
+
+                        if self._click_show_more_car_specs_botasaurus(driver):
+                            time.sleep(0.25)
+                        car_specifications_raw = self._extract_car_specifications_dict_botasaurus(driver)
+                        car_specifications_value = car_specifications_raw or None
+
                     result = {
                         "listing_id": listing_id,
                         "listing_url": url,
@@ -956,6 +1137,9 @@ class MudahMyCarsService:
                         "fuel_type": fuel_type_value if status == "active" else None,
                         "series": series_value if status == "active" else None,
                         "type": type_value if status == "active" else None,
+                        "ad_highlights": ad_highlights_text if status == "active" else None,
+                        "description": description_text if status == "active" else None,
+                        "car_specifications": car_specifications_value if status == "active" else None,
                         "images": None,
                         "error": None,
                         "status": status,
@@ -1014,6 +1198,9 @@ class MudahMyCarsService:
                         "fuel_type": None,
                         "series": None,
                         "type": None,
+                        "ad_highlights": None,
+                        "description": None,
+                        "car_specifications": None,
                         "images": None,
                         "status": "active",
                         "error": "error",
@@ -1049,7 +1236,19 @@ class MudahMyCarsService:
                         )
                     )
 
-                    if len(rows) >= batch_size:
+                    if str(status) == "active":
+                        car_specs_obj = result.get("car_specifications")
+                        details_rows.append(
+                            (
+                                int(row_listing_id),
+                                result.get("listing_url"),
+                                result.get("ad_highlights"),
+                                result.get("description"),
+                                Json(car_specs_obj) if car_specs_obj else None,
+                            )
+                        )
+
+                    if len(rows) >= batch_size or len(details_rows) >= batch_size:
                         flush_rows()
 
             flush_rows()
