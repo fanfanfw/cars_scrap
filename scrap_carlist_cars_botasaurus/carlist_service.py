@@ -46,6 +46,9 @@ SEAT_CAPACITY_XPATH = (
 )
 IMAGES_CONTAINER_XPATH = "/html/body/main/article/section/section[4]/section[1]/div/div/div/div/div[1]/div/div[1]/div[1]"
 
+SOLD_MESSAGE_XPATH = "/html/body/main/article/section/section[1]/div/div/div/h2"
+PAGE_NOT_FOUND_XPATH = "/html/body/main/section[1]/div/div[2]/h1"
+
 
 class CarlistCarsService:
     def __init__(self):
@@ -53,6 +56,75 @@ class CarlistCarsService:
         self.stop_flag = False
         self._logged_proxy_ip = False
         self.listing_url = os.getenv("CARLIST_CARS_LISTING_URL", "").strip()
+
+    def _normalize_engine_cc(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        digits = re.findall(r"\d+", text.replace(",", ""))
+        if not digits:
+            return None
+        return "".join(digits)
+
+    def _page_has_tokens_botasaurus(self, driver, tokens: tuple[str, ...]) -> bool:
+        try:
+            title = driver.run_js("return (document.title || '').toLowerCase();")
+        except Exception:
+            title = ""
+        try:
+            text = driver.run_js("return ((document.body && document.body.innerText) || '').toLowerCase();")
+        except Exception:
+            try:
+                text = (driver.page_html or "").lower()
+            except Exception:
+                text = ""
+        haystack = f"{title}\n{text}".lower()
+        return any(token in haystack for token in tokens)
+
+    def _text_by_xpath_botasaurus(self, driver, xpath: str) -> str | None:
+        try:
+            text = driver.run_js(
+                """
+                const el = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!el) return null;
+                const raw = (el.innerText || el.textContent || '').trim();
+                return raw || null;
+                """,
+                {"xpath": xpath},
+            )
+        except Exception:
+            text = None
+        return text or None
+
+    def _is_sold_page_botasaurus(self, driver) -> bool:
+        sold_text = (self._text_by_xpath_botasaurus(driver, SOLD_MESSAGE_XPATH) or "").strip().lower()
+        if sold_text and ("already been sold" in sold_text or "has been sold" in sold_text):
+            return True
+
+        not_found_text = (self._text_by_xpath_botasaurus(driver, PAGE_NOT_FOUND_XPATH) or "").strip().lower()
+        if not_found_text and ("page not found" in not_found_text or "not found" == not_found_text):
+            return True
+
+        return self._page_has_tokens_botasaurus(
+            driver,
+            (
+                "this car has already been sold",
+                "car has already been sold",
+                "already been sold",
+                "page not found",
+                "we can’t seem to find the page you’re looking for",
+                "we can't seem to find the page you're looking for",
+                "cant seem to find the page youre looking for",
+            ),
+        )
 
     def close(self) -> None:
         return
@@ -516,12 +588,13 @@ class CarlistCarsService:
         """
 
         sold_upsert_sql = """
-        INSERT INTO cars_scrap_carlistmy (listing_id, listing_url, status)
-        VALUES %s
-        ON CONFLICT (listing_id) DO UPDATE SET
+        UPDATE cars_scrap_carlistmy
+        SET
+          listing_url = COALESCE(%s, listing_url),
           status = 'sold',
-          version = COALESCE(cars_scrap_carlistmy.version, 0) + 1,
+          version = COALESCE(version, 0) + 1,
           last_scraped_at = NOW()
+        WHERE listing_id = %s
         """
 
         conn = get_connection()
@@ -544,7 +617,7 @@ class CarlistCarsService:
             if not sold_rows:
                 return
             try:
-                execute_values(cursor, sold_upsert_sql, sold_rows, page_size=100)
+                cursor.executemany(sold_upsert_sql, sold_rows)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -592,8 +665,8 @@ class CarlistCarsService:
                     if self._is_access_blocked_botasaurus(driver):
                         raise RuntimeError(f"Blocked while scraping carlist detail: current_url={current_url!r}")
 
-                    if self._is_listing_not_found_botasaurus(driver) or redirected_off_detail:
-                        if tracking_mode and expected_id:
+                    if self._is_listing_not_found_botasaurus(driver) or self._is_sold_page_botasaurus(driver) or redirected_off_detail:
+                        if expected_id:
                             result = {
                                 "listing_id": expected_id,
                                 "listing_url": url,
@@ -618,11 +691,11 @@ class CarlistCarsService:
                                 "status": "sold",
                             }
                             results.append(result)
-                            sold_rows.append((expected_id, result.get("listing_url"), "sold"))
+                            sold_rows.append((result.get("listing_url"), expected_id))
                             if len(sold_rows) >= batch_size:
                                 flush_sold_rows()
                             continue
-                        raise RuntimeError("Listing not found/redirected (treating as error, not sold).")
+                        raise RuntimeError("Listing not found/redirected (missing listing_id).")
 
                     wait_for_xpath(
                         driver,
@@ -652,7 +725,9 @@ class CarlistCarsService:
                     mileage_value = self._parse_mileage(self._get_text_by_xpath_botasaurus(driver, MILEAGE_XPATH))
                     transmission_value = self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
                     seat_capacity_value = self._get_text_by_xpath_botasaurus(driver, SEAT_CAPACITY_XPATH)
-                    engine_cc_value = self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH)
+                    engine_cc_value = self._normalize_engine_cc(
+                        self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH)
+                    )
                     fuel_type_value = self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
                     images_value = self._extract_images_botasaurus(driver)
 
@@ -688,7 +763,7 @@ class CarlistCarsService:
                         )
                     )
                     if not has_any_data:
-                        if tracking_mode and listing_id_final:
+                        if listing_id_final and self._is_sold_page_botasaurus(driver):
                             status = "sold"
                         else:
                             raise RuntimeError("No extractable data on detail page (treating as error, not sold).")
@@ -721,7 +796,7 @@ class CarlistCarsService:
 
                     if status != "active":
                         results.append(result)
-                        sold_rows.append((listing_id_final, result.get("listing_url"), "sold"))
+                        sold_rows.append((result.get("listing_url"), listing_id_final))
                         if len(sold_rows) >= batch_size:
                             flush_sold_rows()
                         continue
