@@ -47,6 +47,17 @@ class MudahMyCarsService:
         self._logged_proxy_ip = False
         self.listing_url = os.getenv("MUDAHMY_CARS_LISTING_URL", "").strip()
 
+    def _normalize_engine_cc(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        digits = re.findall(r"\d+", text.replace(",", ""))
+        if not digits:
+            return None
+        return "".join(digits)
+
     def _maybe_log_proxy_and_ip(self, cfg) -> None:
         if self._logged_proxy_ip:
             return
@@ -706,12 +717,13 @@ class MudahMyCarsService:
         """
 
         sold_upsert_sql = """
-        INSERT INTO cars_scrap_mudahmy (listing_id, listing_url, status)
-        VALUES %s
-        ON CONFLICT (listing_id) DO UPDATE SET
+        UPDATE cars_scrap_mudahmy
+        SET
+          listing_url = COALESCE(%s, listing_url),
           status = 'sold',
-          version = COALESCE(cars_scrap_mudahmy.version, 0) + 1,
+          version = COALESCE(version, 0) + 1,
           last_scraped_at = NOW()
+        WHERE listing_id = %s
         """
 
         conn = get_connection()
@@ -734,7 +746,7 @@ class MudahMyCarsService:
             if not sold_rows:
                 return
             try:
-                execute_values(cursor, sold_upsert_sql, sold_rows, page_size=100)
+                cursor.executemany(sold_upsert_sql, sold_rows)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -792,7 +804,7 @@ class MudahMyCarsService:
                         raise RuntimeError(f"Blocked while scraping mudah.my detail: current_url={current_url!r}")
 
                     if self._is_listing_not_found_botasaurus(driver):
-                        if tracking_mode and listing_id:
+                        if listing_id:
                             result = {
                                 "listing_id": listing_id,
                                 "listing_url": url,
@@ -817,14 +829,14 @@ class MudahMyCarsService:
                                 "status": "sold",
                             }
                             results.append(result)
-                            sold_rows.append((listing_id, result.get("listing_url"), "sold"))
+                            sold_rows.append((result.get("listing_url"), listing_id))
                             if len(sold_rows) >= batch_size:
                                 flush_sold_rows()
                             continue
                         raise RuntimeError("Listing not found (treating as error, not sold).")
 
                     if redirected_off_detail:
-                        if tracking_mode and listing_id:
+                        if listing_id:
                             result = {
                                 "listing_id": listing_id,
                                 "listing_url": url,
@@ -849,7 +861,7 @@ class MudahMyCarsService:
                                 "status": "sold",
                             }
                             results.append(result)
-                            sold_rows.append((listing_id, result.get("listing_url"), "sold"))
+                            sold_rows.append((result.get("listing_url"), listing_id))
                             if len(sold_rows) >= batch_size:
                                 flush_sold_rows()
                             continue
@@ -881,7 +893,7 @@ class MudahMyCarsService:
                     mileage_value = self.convert_mileage(self._get_text_by_xpath_botasaurus(driver, MILEAGE_XPATH))
                     transmission_value = self._get_text_by_xpath_botasaurus(driver, TRANSMISSION_XPATH)
                     seat_capacity_value = specs.get("seat_capacity")
-                    engine_cc_value = specs.get("engine_cc")
+                    engine_cc_value = self._normalize_engine_cc(specs.get("engine_cc"))
                     fuel_type_value = specs.get("fuel_type")
                     series_value = specs.get("series")
                     type_value = specs.get("type")
@@ -916,7 +928,7 @@ class MudahMyCarsService:
                         )
                     )
                     if not has_any_data:
-                        if tracking_mode and listing_id:
+                        if listing_id and self._is_listing_not_found_botasaurus(driver):
                             status = "sold"
                         else:
                             raise RuntimeError("No extractable data on detail page (treating as error, not sold).")
@@ -952,7 +964,7 @@ class MudahMyCarsService:
                     if status != "active":
                         results.append(result)
                         if listing_id:
-                            sold_rows.append((listing_id, result.get("listing_url"), "sold"))
+                            sold_rows.append((result.get("listing_url"), listing_id))
                             if len(sold_rows) >= batch_size:
                                 flush_sold_rows()
                         continue
@@ -961,7 +973,7 @@ class MudahMyCarsService:
                         if self._click_show_more_car_specs_botasaurus(driver):
                             time.sleep(0.25)
                             specs2 = self._extract_car_specs_map_botasaurus(driver)
-                            result["engine_cc"] = (
+                            result["engine_cc"] = self._normalize_engine_cc(
                                 specs2.get("engine_cc")
                                 or self._extract_car_spec_value_by_label_botasaurus(
                                     driver, label_candidates=["engine cc", "engine", "engine capacity", "cc"]
