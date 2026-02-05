@@ -778,10 +778,24 @@ class MudahMyCarsService:
         self.logger.info("Collected %s links.", len(links))
         return links
 
-    def scrape_listing_details(self, links: list[str], *, listing_id_by_url: dict[str, str] | None = None) -> list[dict]:
+    def scrape_listing_details(
+        self,
+        links: list[str],
+        *,
+        listing_id_by_url: dict[str, str] | None = None,
+        allow_revive_sold: bool = False,
+        require_brand_model: bool = False,
+    ) -> list[dict]:
         batch_size = int(os.getenv("DB_BATCH_SIZE", "100"))
         if batch_size < 1:
             batch_size = 1
+
+        def has_text(value: object) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            return True
 
         columns = (
             "listing_id",
@@ -805,6 +819,15 @@ class MudahMyCarsService:
             "images",
             "status",
         )
+
+        status_update_sql = (
+            "status = COALESCE(EXCLUDED.status, cars_scrap_mudahmy.status)"
+            if allow_revive_sold
+            else """status = CASE
+            WHEN cars_scrap_mudahmy.status = 'sold' THEN cars_scrap_mudahmy.status
+            ELSE COALESCE(EXCLUDED.status, cars_scrap_mudahmy.status)
+          END"""
+        )
         upsert_sql = f"""
         INSERT INTO cars_scrap_mudahmy ({", ".join(columns)})
         VALUES %s
@@ -827,10 +850,7 @@ class MudahMyCarsService:
           series = COALESCE(EXCLUDED.series, cars_scrap_mudahmy.series),
           type = COALESCE(EXCLUDED.type, cars_scrap_mudahmy.type),
           images = COALESCE(EXCLUDED.images, cars_scrap_mudahmy.images),
-          status = CASE
-            WHEN cars_scrap_mudahmy.status = 'sold' THEN cars_scrap_mudahmy.status
-            ELSE COALESCE(EXCLUDED.status, cars_scrap_mudahmy.status)
-          END,
+          {status_update_sql},
           version = COALESCE(cars_scrap_mudahmy.version, 0) + 1,
           last_scraped_at = NOW()
         """
@@ -973,9 +993,10 @@ class MudahMyCarsService:
                                 "status": "sold",
                             }
                             results.append(result)
-                            sold_rows.append((result.get("listing_url"), listing_id))
-                            if len(sold_rows) >= batch_size:
-                                flush_sold_rows()
+                            if tracking_mode:
+                                sold_rows.append((result.get("listing_url"), listing_id))
+                                if len(sold_rows) >= batch_size:
+                                    flush_sold_rows()
                             continue
                         raise RuntimeError("Listing not found (treating as error, not sold).")
 
@@ -1008,9 +1029,10 @@ class MudahMyCarsService:
                                 "status": "sold",
                             }
                             results.append(result)
-                            sold_rows.append((result.get("listing_url"), listing_id))
-                            if len(sold_rows) >= batch_size:
-                                flush_sold_rows()
+                            if tracking_mode:
+                                sold_rows.append((result.get("listing_url"), listing_id))
+                                if len(sold_rows) >= batch_size:
+                                    flush_sold_rows()
                             continue
                         raise RuntimeError(f"Unexpected redirect off detail page: current_url={current_url!r}")
 
@@ -1147,7 +1169,7 @@ class MudahMyCarsService:
 
                     if status != "active":
                         results.append(result)
-                        if listing_id:
+                        if tracking_mode and listing_id:
                             sold_rows.append((result.get("listing_url"), listing_id))
                             if len(sold_rows) >= batch_size:
                                 flush_sold_rows()
@@ -1210,7 +1232,12 @@ class MudahMyCarsService:
 
                 row_listing_id = result.get("listing_id")
                 if row_listing_id and not result.get("error"):
-                    status = result.get("status")
+                    status = str(result.get("status") or "active")
+                    if require_brand_model and status == "active":
+                        if not has_text(result.get("brand")) or not has_text(result.get("model")):
+                            result["skipped_upsert"] = True
+                            result["skip_reason"] = "missing_brand_or_model"
+                            continue
                     rows.append(
                         (
                             int(row_listing_id),
@@ -1232,11 +1259,11 @@ class MudahMyCarsService:
                             result.get("series"),
                             result.get("type"),
                             result.get("images"),
-                            str(status) if status else "active",
+                            status,
                         )
                     )
 
-                    if str(status) == "active":
+                    if status == "active":
                         car_specs_obj = result.get("car_specifications")
                         details_rows.append(
                             (

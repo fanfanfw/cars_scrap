@@ -715,10 +715,24 @@ class CarlistCarsService:
         self.logger.info("Collected %s links.", len(links))
         return links
 
-    def scrape_listing_details(self, links: list[str], *, listing_id_by_url: dict[str, str] | None = None) -> list[dict]:
+    def scrape_listing_details(
+        self,
+        links: list[str],
+        *,
+        listing_id_by_url: dict[str, str] | None = None,
+        allow_revive_sold: bool = False,
+        require_brand_model: bool = False,
+    ) -> list[dict]:
         batch_size = int(os.getenv("DB_BATCH_SIZE", "100"))
         if batch_size < 1:
             batch_size = 1
+
+        def has_text(value: object) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            return True
 
         columns = (
             "listing_id",
@@ -742,6 +756,15 @@ class CarlistCarsService:
             "images",
             "status",
         )
+
+        status_update_sql = (
+            "status = COALESCE(EXCLUDED.status, cars_scrap_carlistmy.status)"
+            if allow_revive_sold
+            else """status = CASE
+            WHEN cars_scrap_carlistmy.status = 'sold' THEN cars_scrap_carlistmy.status
+            ELSE COALESCE(EXCLUDED.status, cars_scrap_carlistmy.status)
+          END"""
+        )
         upsert_sql = f"""
         INSERT INTO cars_scrap_carlistmy ({", ".join(columns)})
         VALUES %s
@@ -764,10 +787,7 @@ class CarlistCarsService:
           series = COALESCE(EXCLUDED.series, cars_scrap_carlistmy.series),
           type = COALESCE(EXCLUDED.type, cars_scrap_carlistmy.type),
           images = COALESCE(EXCLUDED.images, cars_scrap_carlistmy.images),
-          status = CASE
-            WHEN cars_scrap_carlistmy.status = 'sold' THEN cars_scrap_carlistmy.status
-            ELSE COALESCE(EXCLUDED.status, cars_scrap_carlistmy.status)
-          END,
+          {status_update_sql},
           version = COALESCE(cars_scrap_carlistmy.version, 0) + 1,
           last_scraped_at = NOW()
         """
@@ -904,9 +924,10 @@ class CarlistCarsService:
                                 "status": "sold",
                             }
                             results.append(result)
-                            sold_rows.append((result.get("listing_url"), expected_id))
-                            if len(sold_rows) >= batch_size:
-                                flush_sold_rows()
+                            if tracking_mode:
+                                sold_rows.append((result.get("listing_url"), expected_id))
+                                if len(sold_rows) >= batch_size:
+                                    flush_sold_rows()
                             continue
                         raise RuntimeError("Listing not found/redirected (missing listing_id).")
 
@@ -1036,9 +1057,10 @@ class CarlistCarsService:
 
                     if status != "active":
                         results.append(result)
-                        sold_rows.append((result.get("listing_url"), listing_id_final))
-                        if len(sold_rows) >= batch_size:
-                            flush_sold_rows()
+                        if tracking_mode:
+                            sold_rows.append((result.get("listing_url"), listing_id_final))
+                            if len(sold_rows) >= batch_size:
+                                flush_sold_rows()
                         continue
 
                 except Exception as exc:
@@ -1075,7 +1097,12 @@ class CarlistCarsService:
 
                 row_listing_id = result.get("listing_id")
                 if row_listing_id and not result.get("error"):
-                    status = result.get("status")
+                    status = str(result.get("status") or "active")
+                    if require_brand_model and status == "active":
+                        if not has_text(result.get("brand")) or not has_text(result.get("model")):
+                            result["skipped_upsert"] = True
+                            result["skip_reason"] = "missing_brand_or_model"
+                            continue
                     rows.append(
                         (
                             str(row_listing_id),
@@ -1097,11 +1124,11 @@ class CarlistCarsService:
                             result.get("series"),
                             result.get("type"),
                             result.get("images"),
-                            str(status) if status else "active",
+                            status,
                         )
                     )
 
-                    if str(status) == "active":
+                    if status == "active":
                         details_rows.append(
                             (
                                 str(row_listing_id),

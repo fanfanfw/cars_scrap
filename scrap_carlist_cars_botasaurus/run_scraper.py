@@ -49,6 +49,52 @@ def main() -> None:
 
     scraper = CarlistCarsService()
     try:
+        def summarize_results(results: list[dict] | None) -> dict:
+            items = results or []
+            scraped = len(items)
+            errors = 0
+            sold_detected = 0
+            skipped = 0
+            upserted = 0
+            skip_reasons: dict[str, int] = {}
+
+            for r in items:
+                row = r or {}
+                if row.get("error"):
+                    errors += 1
+                    continue
+
+                status = str(row.get("status") or "").strip().lower()
+                listing_id = row.get("listing_id")
+
+                if status == "sold":
+                    sold_detected += 1
+                    continue
+
+                if row.get("skipped_upsert"):
+                    skipped += 1
+                    reason = str(row.get("skip_reason") or "unknown")
+                    skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    continue
+
+                if not listing_id:
+                    skipped += 1
+                    reason = "missing_listing_id"
+                    skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    continue
+
+                if status == "active":
+                    upserted += 1
+
+            return {
+                "scraped": scraped,
+                "upserted": upserted,
+                "skipped": skipped,
+                "errors": errors,
+                "sold_detected": sold_detected,
+                "skip_reasons": skip_reasons,
+            }
+
         if args.track_older_than:
             if args.details:
                 raise ValueError("--details cannot be used with --track-older-than (tracking always scrapes details).")
@@ -121,6 +167,7 @@ def main() -> None:
                 return
 
             results = scraper.scrape_listing_details(links, listing_id_by_url=listing_id_by_url)
+            metrics = summarize_results(results)
             sold = sum(1 for r in results if (r or {}).get("status") == "sold")
             errored = sum(1 for r in results if (r or {}).get("error"))
             print(
@@ -129,8 +176,11 @@ def main() -> None:
                         **summary,
                         "scraped": len(results),
                         "sold_marked": sold,
+                        "upserted": metrics["upserted"],
+                        "skipped": metrics["skipped"],
                         "errors": errored,
-                        "stored_to_db": True,
+                        "skip_reasons": metrics["skip_reasons"],
+                        "stored_to_db": bool(sold or metrics["upserted"]),
                     },
                     indent=2,
                     default=str,
@@ -145,8 +195,9 @@ def main() -> None:
             if not url:
                 raise ValueError("--debug-detail-url is empty")
 
-            details = scraper.scrape_listing_details([url])
+            details = scraper.scrape_listing_details([url], allow_revive_sold=True, require_brand_model=True)
             scraped = details[0] if details else None
+            metrics = summarize_results(details)
             listing_id = (scraped or {}).get("listing_id")
 
             db_row = None
@@ -177,7 +228,9 @@ def main() -> None:
                 json.dumps(
                     {
                         "debug_detail_url": url,
-                        "stored_to_db": bool(db_row),
+                        "stored_to_db": bool(metrics["upserted"]),
+                        "db_row_found": bool(db_row),
+                        "metrics": metrics,
                         "scraped_result": scraped,
                         "db_row": db_row,
                     },
@@ -189,8 +242,9 @@ def main() -> None:
 
         links = scraper.scrape_all_from_main(start_url=args.start_url, max_pages=args.max_pages)
         if args.details:
-            details = scraper.scrape_listing_details(links)
-            print(json.dumps({"count": len(details), "stored_to_db": True}, indent=2))
+            details = scraper.scrape_listing_details(links, allow_revive_sold=True, require_brand_model=True)
+            metrics = summarize_results(details)
+            print(json.dumps({"count": len(details), **metrics, "stored_to_db": bool(metrics["upserted"])}, indent=2))
         else:
             print(json.dumps({"count": len(links), "links": links}, indent=2))
     finally:
