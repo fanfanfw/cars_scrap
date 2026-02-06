@@ -29,6 +29,11 @@ def main() -> None:
         help="Limit number of tracked listings to process (0 = no limit).",
     )
     parser.add_argument(
+        "--track-last-scraped-older-than",
+        default=None,
+        help="Only re-scrape listings where last_scraped_at <= today - duration (example: 7d, 1w, 3m).",
+    )
+    parser.add_argument(
         "--track-dry-run",
         action="store_true",
         help="Only print how many listings match tracking criteria (no scraping).",
@@ -107,6 +112,9 @@ def main() -> None:
 
             now = datetime.now().date()
             cutoff = cutoff_date(now=now, older_than=str(args.track_older_than))
+            cutoff_last_scraped = None
+            if args.track_last_scraped_older_than:
+                cutoff_last_scraped = cutoff_date(now=now, older_than=str(args.track_last_scraped_older_than))
 
             conn = get_connection()
             cursor = conn.cursor()
@@ -115,16 +123,24 @@ def main() -> None:
                 if limit < 0:
                     raise ValueError("--track-limit must be >= 0")
 
-                sql = """
+                where = [
+                    "status = 'active'",
+                    "information_ads_date IS NOT NULL",
+                    "information_ads_date <= %s",
+                    "listing_url IS NOT NULL",
+                ]
+                params: list[object] = [cutoff]
+                if cutoff_last_scraped:
+                    where.insert(-1, "last_scraped_at::date <= %s")
+                    params.append(cutoff_last_scraped)
+
+                where_joiner = "\n                  AND "
+                sql = f"""
                 SELECT listing_id, listing_url
                 FROM cars_scrap_carlistmy
-                WHERE status = 'active'
-                  AND information_ads_date IS NOT NULL
-                  AND information_ads_date <= %s
-                  AND listing_url IS NOT NULL
+                WHERE {where_joiner.join(where)}
                 ORDER BY information_ads_date ASC
                 """
-                params: list[object] = [cutoff]
                 if limit:
                     sql += " LIMIT %s"
                     params.append(limit)
@@ -156,6 +172,8 @@ def main() -> None:
                 "mode": "track",
                 "older_than": args.track_older_than,
                 "cutoff_date": str(cutoff),
+                "last_scraped_older_than": args.track_last_scraped_older_than,
+                "last_scraped_cutoff_date": str(cutoff_last_scraped) if cutoff_last_scraped else None,
                 "count": len(links),
                 "sample": links[:20],
             }
