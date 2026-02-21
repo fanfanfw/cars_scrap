@@ -60,6 +60,7 @@ class CarlistCarsService:
         self.logger = setup_logger("scrape_carlist_cars")
         self.stop_flag = False
         self._logged_proxy_ip = False
+        self._logged_listing_id_meta_mismatch = False
         self.listing_url = os.getenv("CARLIST_CARS_LISTING_URL", "").strip()
 
     def _normalize_engine_cc(self, value: str | None) -> str | None:
@@ -830,6 +831,35 @@ class CarlistCarsService:
         def flush_rows() -> None:
             if (not rows) and (not details_rows):
                 return
+
+            if rows:
+                # Avoid Postgres "CardinalityViolation" when the same listing_id appears
+                # multiple times within a single INSERT ... ON CONFLICT statement.
+                deduped: dict[str, tuple] = {}
+                dup_count = 0
+                for row in rows:
+                    key = str(row[0] or "")
+                    if key in deduped:
+                        dup_count += 1
+                    deduped[key] = row
+                if dup_count:
+                    self.logger.warning("Deduped %s duplicate cars rows by listing_id before upsert.", dup_count)
+                rows[:] = list(deduped.values())
+
+            if details_rows:
+                deduped_details: dict[str, tuple] = {}
+                dup_details_count = 0
+                for row in details_rows:
+                    key = str(row[0] or "")
+                    if key in deduped_details:
+                        dup_details_count += 1
+                    deduped_details[key] = row
+                if dup_details_count:
+                    self.logger.warning(
+                        "Deduped %s duplicate car details rows by listing_id before upsert.", dup_details_count
+                    )
+                details_rows[:] = list(deduped_details.values())
+
             try:
                 if rows:
                     execute_values(cursor, upsert_sql, rows, page_size=100)
@@ -939,7 +969,33 @@ class CarlistCarsService:
                     )
 
                     listing_id_meta = self._get_attr_by_xpath_botasaurus(driver, LISTING_ID_META_XPATH, "content")
-                    listing_id_final = (listing_id_meta or listing_id or self._extract_listing_id(url) or "").strip()
+                    listing_id_from_url = (listing_id or self._extract_numeric_listing_id(url) or "").strip()
+
+                    listing_id_meta_numeric = None
+                    if listing_id_meta:
+                        match = re.search(r"\d{5,}", str(listing_id_meta))
+                        if match:
+                            listing_id_meta_numeric = match.group(0)
+
+                    # Meta XPaths are brittle; only trust meta listing_id if it matches the URL/mapped id.
+                    if listing_id_meta_numeric and listing_id_from_url and listing_id_meta_numeric != listing_id_from_url:
+                        if not self._logged_listing_id_meta_mismatch:
+                            self._logged_listing_id_meta_mismatch = True
+                            self.logger.warning(
+                                "Ignoring mismatched listing_id from meta (meta=%r url=%r) for %s",
+                                listing_id_meta_numeric,
+                                listing_id_from_url,
+                                url,
+                            )
+                        listing_id_meta_numeric = None
+
+                    listing_id_final = (
+                        listing_id_from_url
+                        or listing_id_meta_numeric
+                        or (self._extract_numeric_listing_id(current_url) or "").strip()
+                        or self._extract_listing_id(url)
+                        or ""
+                    ).strip()
                     if not listing_id_final:
                         raise RuntimeError("Missing listing_id on page")
 
