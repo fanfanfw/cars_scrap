@@ -853,6 +853,157 @@ class CarlistCarsService:
         self._close_contact_seller_modal_botasaurus(driver)
         return None
 
+    def _normalize_contact_seller(self, value: str | None) -> str | None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            return None
+        if len(re.sub(r"\D+", "", text)) < 8:
+            return None
+        return text
+
+    def _extract_contact_seller_candidates_botasaurus(
+        self, driver, *, listing_id: str, modal_only: bool = False
+    ) -> list[dict] | None:
+        listing_id = str(listing_id or "").strip()
+        if not listing_id:
+            return None
+        try:
+            items = driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const listingId = String(args.listingId || '').trim();
+                if (!listingId) return [];
+                const root = args.modalOnly ? (document.querySelector('#modal-contact-seller') || document) : document;
+                const nodes = Array.from(root.querySelectorAll('a[href], button, [role="button"]'));
+                const out = [];
+                for (const el of nodes) {
+                  const dataListingId = String(el.getAttribute('data-listing-id') || '').trim();
+                  const dataTmlSi = String(el.getAttribute('data-tml-si') || '').trim();
+                  if (dataListingId && dataListingId !== listingId) continue;
+                  if (!dataListingId && dataTmlSi && dataTmlSi !== listingId) continue;
+                  const href = el.href || el.getAttribute('href') || '';
+                  const text = norm(el.textContent || el.innerText);
+                  const cls = String(el.className || '');
+                  const dataTarget = el.getAttribute('data-target') || '';
+                  const dataToggle = el.getAttribute('data-toggle') || '';
+                  const dataPhone = el.getAttribute('data-phone') || '';
+                  const dataPhones = el.getAttribute('data-phones') || '';
+                  const dataGaEvent = String(el.getAttribute('data-ga-event') || '');
+                  const looksPhone =
+                    /contact/i.test(text) ||
+                    /call now/i.test(text) ||
+                    /phone/i.test(cls) ||
+                    /jump-phone/i.test(cls) ||
+                    /^tel:/i.test(href) ||
+                    !!dataPhone ||
+                    !!dataPhones ||
+                    /ctr_call/i.test(dataGaEvent);
+                  if (!looksPhone) continue;
+                  out.push({
+                    href,
+                    text,
+                    class_name: cls,
+                    data_phone: dataPhone || dataPhones || null,
+                    data_listing_id: dataListingId || null,
+                    data_tml_si: dataTmlSi || null,
+                    data_target: dataTarget || null,
+                    data_toggle: dataToggle || null,
+                    data_ga_event: dataGaEvent || null,
+                  });
+                }
+                return out;
+                """,
+                {"listingId": listing_id, "modalOnly": bool(modal_only)},
+            )
+        except Exception:
+            items = []
+        return items or None
+
+    def _extract_contact_seller_from_candidates(self, candidates: list[dict] | None) -> str | None:
+        for item in candidates or []:
+            if not isinstance(item, dict):
+                continue
+            text_value = self._normalize_contact_seller(item.get("text"))
+            if text_value:
+                return text_value
+
+            phone_value = self._normalize_contact_seller(item.get("data_phone"))
+            if phone_value:
+                return phone_value
+
+            href = str(item.get("href") or "").strip()
+            if href.lower().startswith("tel:"):
+                href_value = self._normalize_contact_seller(href.split(":", 1)[-1])
+                if href_value:
+                    return href_value
+        return None
+
+    def _click_contact_button_botasaurus(self, driver, *, listing_id: str) -> bool:
+        listing_id = str(listing_id or "").strip()
+        if not listing_id:
+            return False
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const listingId = String(args.listingId || '').trim();
+                    const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
+                    const candidates = nodes.map((el) => {
+                      const dataListingId = String(el.getAttribute('data-listing-id') || '').trim();
+                      const dataTmlSi = String(el.getAttribute('data-tml-si') || '').trim();
+                      if (dataListingId && dataListingId !== listingId) return null;
+                      if (!dataListingId && dataTmlSi && dataTmlSi !== listingId) return null;
+                      const text = norm(el.textContent || el.innerText);
+                      const cls = String(el.className || '').toLowerCase();
+                      const href = String(el.href || el.getAttribute('href') || '').trim().toLowerCase();
+                      const dataPhone = String(el.getAttribute('data-phone') || el.getAttribute('data-phones') || '').trim();
+                      const dataGaEvent = String(el.getAttribute('data-ga-event') || '').trim().toLowerCase();
+                      let score = 0;
+                      if (cls.includes('jump-phone')) score += 100;
+                      if (dataGaEvent.includes('ctr_call')) score += 80;
+                      if (dataPhone) score += 60;
+                      if (href.startsWith('tel:')) score += 50;
+                      if (text.includes('contact')) score += 40;
+                      if (text.includes('call now')) score += 30;
+                      if (cls.includes('phone')) score += 20;
+                      if (score <= 0) return null;
+                      return { el, score, isAnchor: el.tagName === 'A' ? 1 : 0 };
+                    }).filter(Boolean);
+                    if (!candidates.length) return false;
+                    candidates.sort((a, b) => (b.score - a.score) || (b.isAnchor - a.isAnchor));
+                    for (const item of candidates) {
+                      const el = item.el;
+                      try { el.scrollIntoView({block: 'center'}); } catch (e) {}
+                      try {
+                        el.click();
+                        return true;
+                      } catch (e) {}
+                    }
+                    return false;
+                    """,
+                    {"listingId": listing_id},
+                )
+            )
+        except Exception:
+            return False
+
+    def _extract_contact_seller_botasaurus(self, driver, *, listing_id: str, modal_wait_seconds: float = 3.0) -> str | None:
+        if not self._click_contact_button_botasaurus(driver, listing_id=listing_id):
+            return None
+
+        deadline = time.time() + max(0.0, modal_wait_seconds)
+        while time.time() < deadline:
+            time.sleep(0.25)
+            contact = self._extract_contact_seller_from_candidates(
+                self._extract_contact_seller_candidates_botasaurus(driver, listing_id=listing_id, modal_only=True)
+            )
+            if contact:
+                self._close_contact_seller_modal_botasaurus(driver)
+                return contact
+        self._close_contact_seller_modal_botasaurus(driver)
+        return None
+
     def _extract_listing_urls_botasaurus(self, driver) -> list[str]:
         try:
             hrefs = driver.run_js(
@@ -960,6 +1111,7 @@ class CarlistCarsService:
             "type",
             "images",
             "whatsapp_number",
+            "contact_seller",
             "status",
         )
 
@@ -994,6 +1146,7 @@ class CarlistCarsService:
           type = COALESCE(EXCLUDED.type, cars_scrap_carlistmy.type),
           images = COALESCE(EXCLUDED.images, cars_scrap_carlistmy.images),
           whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, cars_scrap_carlistmy.whatsapp_number),
+          contact_seller = COALESCE(EXCLUDED.contact_seller, cars_scrap_carlistmy.contact_seller),
           {status_update_sql},
           version = COALESCE(cars_scrap_carlistmy.version, 0) + 1,
           last_scraped_at = NOW()
@@ -1157,6 +1310,7 @@ class CarlistCarsService:
                                 "equipment": None,
                                 "images": None,
                                 "whatsapp_number": None,
+                                "contact_seller": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1228,6 +1382,9 @@ class CarlistCarsService:
                     fuel_type_value = self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
                     images_value = self._extract_images_botasaurus(driver)
                     whatsapp_numbers_value = self._extract_whatsapp_numbers_botasaurus(
+                        driver, listing_id=listing_id_final
+                    )
+                    contact_seller_value = self._extract_contact_seller_botasaurus(
                         driver, listing_id=listing_id_final
                     )
 
@@ -1318,6 +1475,7 @@ class CarlistCarsService:
                         "equipment": equipment_value if status == "active" else None,
                         "images": images_value if status == "active" else None,
                         "whatsapp_number": whatsapp_numbers_value if status == "active" else None,
+                        "contact_seller": contact_seller_value if status == "active" else None,
                         "error": None,
                         "status": status,
                     }
@@ -1357,6 +1515,7 @@ class CarlistCarsService:
                         "equipment": None,
                         "images": None,
                         "whatsapp_number": None,
+                        "contact_seller": None,
                         "status": "active",
                         "error": "error",
                     }
@@ -1393,6 +1552,7 @@ class CarlistCarsService:
                             result.get("type"),
                             result.get("images"),
                             result.get("whatsapp_number"),
+                            result.get("contact_seller"),
                             status,
                         )
                     )
