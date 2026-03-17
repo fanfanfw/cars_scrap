@@ -5,7 +5,7 @@ import re
 import time
 from datetime import date, datetime
 from hashlib import sha1
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from psycopg2.extras import Json, execute_values
@@ -53,6 +53,7 @@ CAROUSEL_SECTION_SELECTOR = "section.c-section--key-details"
 TAB_SELLER_NOTES_SELECTOR = "#tab-seller-notes"
 TAB_SPECIFICATIONS_SELECTOR = "#tab-specifications"
 TAB_EQUIPMENTS_SELECTOR = "#tab-equipments"
+WHATSAPP_PHONE_RE = re.compile(r"(?:wa\.me/|phone=|tel:)(\+?\d+)", re.IGNORECASE)
 
 
 class CarlistCarsService:
@@ -649,6 +650,209 @@ class CarlistCarsService:
             deduped.append(url)
         return deduped or None
 
+    def _normalize_whatsapp_number(self, value: str | None) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        digits = re.sub(r"\D+", "", text)
+        if not digits:
+            return None
+        if digits.startswith("0") and len(digits) >= 9:
+            return f"60{digits[1:]}"
+        return digits
+
+    def _extract_whatsapp_numbers_from_candidates(self, candidates: list[dict] | None) -> list[str] | None:
+        seen: set[str] = set()
+        numbers: list[str] = []
+        for item in candidates or []:
+            if not isinstance(item, dict):
+                continue
+
+            direct = self._normalize_whatsapp_number(item.get("data_whatsapp_number"))
+            if direct and direct not in seen:
+                seen.add(direct)
+                numbers.append(direct)
+
+            direct_phone = self._normalize_whatsapp_number(item.get("data_phone"))
+            if direct_phone and direct_phone not in seen:
+                seen.add(direct_phone)
+                numbers.append(direct_phone)
+
+            href = str(item.get("href") or "").strip()
+            if not href:
+                continue
+
+            parsed_phone = None
+            try:
+                parsed = urlparse(href)
+                query_phone = parse_qs(parsed.query).get("phone")
+                if query_phone:
+                    parsed_phone = query_phone[0]
+            except Exception:
+                parsed_phone = None
+
+            phone = self._normalize_whatsapp_number(parsed_phone)
+            if not phone:
+                match = WHATSAPP_PHONE_RE.search(href)
+                phone = self._normalize_whatsapp_number(match.group(1) if match else None)
+            if phone and phone not in seen:
+                seen.add(phone)
+                numbers.append(phone)
+        return numbers or None
+
+    def _extract_whatsapp_candidates_botasaurus(self, driver, *, listing_id: str, modal_only: bool = False) -> list[dict] | None:
+        listing_id = str(listing_id or "").strip()
+        if not listing_id:
+            return None
+        try:
+            items = driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const listingId = String(args.listingId || '').trim();
+                if (!listingId) return [];
+                const root = args.modalOnly ? (document.querySelector('#modal-contact-seller') || document) : document;
+                const nodes = Array.from(root.querySelectorAll('a[href], button, [role="button"]'));
+                const out = [];
+                for (const el of nodes) {
+                  const dataListingId = String(el.getAttribute('data-listing-id') || '').trim();
+                  const dataTmlSi = String(el.getAttribute('data-tml-si') || '').trim();
+                  const href = el.href || el.getAttribute('href') || '';
+                  const dataWhatsappNumber = el.getAttribute('data-whatsapp-number') || '';
+                  const dataPhone = el.getAttribute('data-phone') || '';
+                  const dataPhones = el.getAttribute('data-phones') || '';
+                  const text = norm(el.textContent || el.innerText);
+                  const cls = String(el.className || '');
+                  const dataTarget = el.getAttribute('data-target') || '';
+                  const dataToggle = el.getAttribute('data-toggle') || '';
+                  const dataGaEvent = String(el.getAttribute('data-ga-event') || '');
+                  const isModalPhoneLink = !!args.modalOnly && /^tel:/i.test(href);
+                  const looksWhatsapp =
+                    /whatsapp/i.test(text) ||
+                    /whatsapp/i.test(cls) ||
+                    /api\\.whatsapp\\.com/i.test(href) ||
+                    /wa\\.me/i.test(href) ||
+                    !!dataWhatsappNumber ||
+                    /whatsapp/i.test(dataGaEvent) ||
+                    isModalPhoneLink;
+                  if (!looksWhatsapp) continue;
+                  if (dataListingId && dataListingId !== listingId) continue;
+                  if (!dataListingId && dataTmlSi && dataTmlSi !== listingId) continue;
+                  out.push({
+                    href,
+                    text,
+                    class_name: cls,
+                    data_whatsapp_number: dataWhatsappNumber || null,
+                    data_phone: dataPhone || dataPhones || null,
+                    data_listing_id: dataListingId || null,
+                    data_tml_si: dataTmlSi || null,
+                    data_target: dataTarget || null,
+                    data_toggle: dataToggle || null,
+                    data_ga_event: dataGaEvent || null,
+                  });
+                }
+                return out;
+                """,
+                {"listingId": listing_id, "modalOnly": bool(modal_only)},
+            )
+        except Exception:
+            items = []
+        return items or None
+
+    def _click_whatsapp_button_botasaurus(self, driver, *, listing_id: str) -> bool:
+        listing_id = str(listing_id or "").strip()
+        if not listing_id:
+            return False
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const listingId = String(args.listingId || '').trim();
+                    const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
+                    const candidates = nodes.map((el) => {
+                      const dataListingId = String(el.getAttribute('data-listing-id') || '').trim();
+                      const dataTmlSi = String(el.getAttribute('data-tml-si') || '').trim();
+                      if (dataListingId && dataListingId !== listingId) return null;
+                      if (!dataListingId && dataTmlSi && dataTmlSi !== listingId) return null;
+                      const text = norm(el.textContent || el.innerText);
+                      const cls = String(el.className || '').toLowerCase();
+                      const href = String(el.href || el.getAttribute('href') || '').trim().toLowerCase();
+                      const dataTarget = String(el.getAttribute('data-target') || '').trim();
+                      const dataWhatsappNumber = String(el.getAttribute('data-whatsapp-number') || '').trim();
+                      const dataGaEvent = String(el.getAttribute('data-ga-event') || '').trim().toLowerCase();
+                      let score = 0;
+                      if (cls.includes('jump-whatsapp')) score += 100;
+                      if (cls.includes('whatsapp_name')) score += 90;
+                      if (dataWhatsappNumber) score += 80;
+                      if (href.includes('api.whatsapp.com') || href.includes('wa.me')) score += 70;
+                      if (text.includes('whatsapp')) score += 60;
+                      if (cls.includes('whatsapp')) score += 50;
+                      if (dataGaEvent.includes('whatsapp')) score += 40;
+                      if (dataTarget === '#modal-contact-seller') score += 5;
+                      if (score <= 0) return null;
+                      return { el, score, isAnchor: el.tagName === 'A' ? 1 : 0 };
+                    }).filter(Boolean);
+                    if (!candidates.length) return false;
+                    candidates.sort((a, b) => (b.score - a.score) || (b.isAnchor - a.isAnchor));
+                    for (const item of candidates) {
+                      const el = item.el;
+                      try { el.scrollIntoView({block: 'center'}); } catch (e) {}
+                      try {
+                        el.click();
+                        return true;
+                      } catch (e) {}
+                    }
+                    return false;
+                    """,
+                    {"listingId": listing_id},
+                )
+            )
+        except Exception:
+            return False
+
+    def _close_contact_seller_modal_botasaurus(self, driver) -> bool:
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const modal = document.querySelector('#modal-contact-seller');
+                    if (!modal) return false;
+                    const btn =
+                      modal.querySelector('.js-modal-destroy') ||
+                      modal.querySelector('[data-dismiss="modal"]') ||
+                      modal.querySelector('button');
+                    if (!btn) return false;
+                    try { btn.scrollIntoView({block: 'center'}); } catch (e) {}
+                    try { btn.click(); } catch (e) { return false; }
+                    return true;
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _extract_whatsapp_numbers_botasaurus(self, driver, *, listing_id: str, modal_wait_seconds: float = 4.0) -> list[str] | None:
+        numbers = self._extract_whatsapp_numbers_from_candidates(
+            self._extract_whatsapp_candidates_botasaurus(driver, listing_id=listing_id, modal_only=False)
+        )
+        if numbers:
+            return numbers
+
+        if not self._click_whatsapp_button_botasaurus(driver, listing_id=listing_id):
+            return None
+
+        deadline = time.time() + max(0.0, modal_wait_seconds)
+        while time.time() < deadline:
+            time.sleep(0.25)
+            numbers = self._extract_whatsapp_numbers_from_candidates(
+                self._extract_whatsapp_candidates_botasaurus(driver, listing_id=listing_id, modal_only=True)
+            )
+            if numbers:
+                self._close_contact_seller_modal_botasaurus(driver)
+                return numbers
+        self._close_contact_seller_modal_botasaurus(driver)
+        return None
+
     def _extract_listing_urls_botasaurus(self, driver) -> list[str]:
         try:
             hrefs = driver.run_js(
@@ -755,6 +959,7 @@ class CarlistCarsService:
             "series",
             "type",
             "images",
+            "whatsapp_number",
             "status",
         )
 
@@ -788,6 +993,7 @@ class CarlistCarsService:
           series = COALESCE(EXCLUDED.series, cars_scrap_carlistmy.series),
           type = COALESCE(EXCLUDED.type, cars_scrap_carlistmy.type),
           images = COALESCE(EXCLUDED.images, cars_scrap_carlistmy.images),
+          whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, cars_scrap_carlistmy.whatsapp_number),
           {status_update_sql},
           version = COALESCE(cars_scrap_carlistmy.version, 0) + 1,
           last_scraped_at = NOW()
@@ -950,6 +1156,7 @@ class CarlistCarsService:
                                 "specifications": None,
                                 "equipment": None,
                                 "images": None,
+                                "whatsapp_number": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1020,6 +1227,9 @@ class CarlistCarsService:
                     )
                     fuel_type_value = self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
                     images_value = self._extract_images_botasaurus(driver)
+                    whatsapp_numbers_value = self._extract_whatsapp_numbers_botasaurus(
+                        driver, listing_id=listing_id_final
+                    )
 
                     def has_value(v) -> bool:
                         if v is None:
@@ -1107,6 +1317,7 @@ class CarlistCarsService:
                         "specifications": specifications_value if status == "active" else None,
                         "equipment": equipment_value if status == "active" else None,
                         "images": images_value if status == "active" else None,
+                        "whatsapp_number": whatsapp_numbers_value if status == "active" else None,
                         "error": None,
                         "status": status,
                     }
@@ -1145,6 +1356,7 @@ class CarlistCarsService:
                         "specifications": None,
                         "equipment": None,
                         "images": None,
+                        "whatsapp_number": None,
                         "status": "active",
                         "error": "error",
                     }
@@ -1180,6 +1392,7 @@ class CarlistCarsService:
                             result.get("series"),
                             result.get("type"),
                             result.get("images"),
+                            result.get("whatsapp_number"),
                             status,
                         )
                     )

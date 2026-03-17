@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS cars_scrap_carlistmy (
   series VARCHAR(100),
   type VARCHAR(100),
   images TEXT[],
+  whatsapp_number TEXT[],
   status VARCHAR NOT NULL DEFAULT 'active',
   version INTEGER NOT NULL DEFAULT 1,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -56,6 +57,9 @@ ALTER TABLE cars_scrap_carlistmy
 
 ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS type VARCHAR(100);
+
+ALTER TABLE cars_scrap_carlistmy
+  ADD COLUMN IF NOT EXISTS whatsapp_number TEXT[];
 
 ALTER TABLE cars_scrap_carlistmy
   ADD COLUMN IF NOT EXISTS status VARCHAR NOT NULL DEFAULT 'active';
