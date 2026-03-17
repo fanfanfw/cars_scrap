@@ -782,6 +782,80 @@ class MudahMyCarsService:
                 return numbers
         return None
 
+    def _looks_like_contact_seller_number(self, value: str | None) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if any(ch.isalpha() for ch in text):
+            return False
+        digits = re.sub(r"\D+", "", text)
+        if len(digits) < 7:
+            return False
+        return bool(re.fullmatch(r"[0-9][0-9\s+\-()]+", text))
+
+    def _extract_contact_seller_from_buttons_botasaurus(self, driver) -> str | None:
+        try:
+            texts = driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                return Array.from(document.querySelectorAll('button, [role="button"]'))
+                  .map((el) => norm(el.textContent || el.innerText))
+                  .filter(Boolean);
+                """
+            )
+        except Exception:
+            texts = []
+
+        for text in texts or []:
+            if not isinstance(text, str):
+                continue
+            value = text.strip()
+            if self._looks_like_contact_seller_number(value):
+                return value
+        return None
+
+    def _click_view_number_button_botasaurus(self, driver) -> bool:
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    const buttons = controls.filter((el) => {
+                      const text = norm(el.textContent || el.innerText);
+                      return text === 'view number' || text.includes('view number');
+                    });
+                    if (!buttons.length) return false;
+                    for (const button of buttons) {
+                      try { button.scrollIntoView({block: 'center'}); } catch (e) {}
+                      try {
+                        button.click();
+                        return true;
+                      } catch (e) {}
+                    }
+                    return false;
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _extract_contact_seller_botasaurus(self, driver, *, reveal_wait_seconds: float = 1.5) -> str | None:
+        number = self._extract_contact_seller_from_buttons_botasaurus(driver)
+        if number:
+            return number
+
+        if not self._click_view_number_button_botasaurus(driver):
+            return None
+
+        deadline = time.time() + max(0.0, reveal_wait_seconds)
+        while time.time() < deadline:
+            time.sleep(0.25)
+            number = self._extract_contact_seller_from_buttons_botasaurus(driver)
+            if number:
+                return number
+        return None
+
     def _extract_images_from_dom_botasaurus(self, driver) -> list[str] | None:
         try:
             urls = driver.run_js(
@@ -925,6 +999,7 @@ class MudahMyCarsService:
             "type",
             "images",
             "whatsapp_number",
+            "contact_seller",
             "status",
         )
 
@@ -959,6 +1034,7 @@ class MudahMyCarsService:
           type = COALESCE(EXCLUDED.type, cars_scrap_mudahmy.type),
           images = COALESCE(EXCLUDED.images, cars_scrap_mudahmy.images),
           whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, cars_scrap_mudahmy.whatsapp_number),
+          contact_seller = COALESCE(EXCLUDED.contact_seller, cars_scrap_mudahmy.contact_seller),
           {status_update_sql},
           version = COALESCE(cars_scrap_mudahmy.version, 0) + 1,
           last_scraped_at = NOW()
@@ -1099,6 +1175,7 @@ class MudahMyCarsService:
                                 "car_specifications": None,
                                 "images": None,
                                 "whatsapp_number": None,
+                                "contact_seller": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1136,6 +1213,7 @@ class MudahMyCarsService:
                                 "car_specifications": None,
                                 "images": None,
                                 "whatsapp_number": None,
+                                "contact_seller": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1275,6 +1353,7 @@ class MudahMyCarsService:
                         "car_specifications": car_specifications_value if status == "active" else None,
                         "images": None,
                         "whatsapp_number": None,
+                        "contact_seller": None,
                         "error": None,
                         "status": status,
                     }
@@ -1300,6 +1379,7 @@ class MudahMyCarsService:
                             )
 
                     result["whatsapp_number"] = self._extract_whatsapp_numbers_botasaurus(driver)
+                    result["contact_seller"] = self._extract_contact_seller_botasaurus(driver)
                     wait_for_css(
                         driver,
                         "css=img[src*='cdn.rnudah.com']",
@@ -1338,6 +1418,7 @@ class MudahMyCarsService:
                         "car_specifications": None,
                         "images": None,
                         "whatsapp_number": None,
+                        "contact_seller": None,
                         "status": "active",
                         "error": "error",
                     }
@@ -1374,6 +1455,7 @@ class MudahMyCarsService:
                             result.get("type"),
                             result.get("images"),
                             result.get("whatsapp_number"),
+                            result.get("contact_seller"),
                             status,
                         )
                     )
