@@ -24,6 +24,7 @@ from scrap_mudahmy_cars_botasaurus.database import get_connection
 load_dotenv(override=True)
 
 LISTING_DETAIL_RE = re.compile(r"-\d+\.htm(?:$|[?#])", re.IGNORECASE)
+WHATSAPP_NUMBER_RE = re.compile(r"wa\.me/(\d+)", re.IGNORECASE)
 
 TOP_CONTAINER_XPATH = "/html/body/div[1]/main/div[2]/div[1]/section[1]/div/div"
 # NOTE: Avoid absolute section indexes (they shift when banners appear).
@@ -675,6 +676,112 @@ class MudahMyCarsService:
         except Exception:
             return False
 
+    def _extract_whatsapp_numbers_from_hrefs(self, hrefs: list[str] | None) -> list[str] | None:
+        seen: set[str] = set()
+        numbers: list[str] = []
+        for href in hrefs or []:
+            if not href:
+                continue
+            match = WHATSAPP_NUMBER_RE.search(str(href))
+            if not match:
+                continue
+            number = match.group(1).strip()
+            if not number or number in seen:
+                continue
+            seen.add(number)
+            numbers.append(number)
+        return numbers or None
+
+    def _extract_whatsapp_links_from_dom_botasaurus(self, driver) -> list[str] | None:
+        try:
+            hrefs = driver.run_js(
+                """
+                const out = [];
+                for (const anchor of Array.from(document.querySelectorAll("a[href*='wa.me/']"))) {
+                  const href = anchor.href || anchor.getAttribute('href') || '';
+                  if (href) out.push(href);
+                }
+                return Array.from(new Set(out));
+                """
+            )
+        except Exception:
+            hrefs = []
+        return hrefs or None
+
+    def _click_whatsapp_button_botasaurus(self, driver) -> bool:
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    const buttons = controls.filter((el) => {
+                      const text = norm(el.textContent || el.innerText);
+                      return text === 'whatsapp' || text.includes('whatsapp');
+                    });
+                    if (!buttons.length) return false;
+                    for (const button of buttons) {
+                      try { button.scrollIntoView({block: 'center'}); } catch (e) {}
+                      try {
+                        button.click();
+                        return true;
+                      } catch (e) {}
+                    }
+                    return false;
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _close_whatsapp_modal_botasaurus(self, driver) -> bool:
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (el) => {
+                      if (!el) return false;
+                      const style = window.getComputedStyle(el);
+                      if (!style) return false;
+                      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                        return false;
+                      }
+                      const rect = el.getBoundingClientRect();
+                      return rect.width > 0 && rect.height > 0;
+                    };
+                    const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    const closeButton = buttons.find((el) => {
+                      const text = norm(el.textContent || el.innerText);
+                      return text === 'close' || text.includes('close');
+                    });
+                    if (!closeButton || !isVisible(closeButton)) return false;
+                    try { closeButton.scrollIntoView({block: 'center'}); } catch (e) {}
+                    closeButton.click();
+                    return true;
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _extract_whatsapp_numbers_botasaurus(self, driver, *, modal_wait_seconds: float = 1.5) -> list[str] | None:
+        numbers = self._extract_whatsapp_numbers_from_hrefs(self._extract_whatsapp_links_from_dom_botasaurus(driver))
+        if numbers:
+            return numbers
+
+        if not self._click_whatsapp_button_botasaurus(driver):
+            return None
+
+        deadline = time.time() + max(0.0, modal_wait_seconds)
+        while time.time() < deadline:
+            time.sleep(0.25)
+            numbers = self._extract_whatsapp_numbers_from_hrefs(self._extract_whatsapp_links_from_dom_botasaurus(driver))
+            if numbers:
+                self._close_whatsapp_modal_botasaurus(driver)
+                return numbers
+        return None
+
     def _extract_images_from_dom_botasaurus(self, driver) -> list[str] | None:
         try:
             urls = driver.run_js(
@@ -817,6 +924,7 @@ class MudahMyCarsService:
             "series",
             "type",
             "images",
+            "whatsapp_number",
             "status",
         )
 
@@ -850,6 +958,7 @@ class MudahMyCarsService:
           series = COALESCE(EXCLUDED.series, cars_scrap_mudahmy.series),
           type = COALESCE(EXCLUDED.type, cars_scrap_mudahmy.type),
           images = COALESCE(EXCLUDED.images, cars_scrap_mudahmy.images),
+          whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, cars_scrap_mudahmy.whatsapp_number),
           {status_update_sql},
           version = COALESCE(cars_scrap_mudahmy.version, 0) + 1,
           last_scraped_at = NOW()
@@ -989,6 +1098,7 @@ class MudahMyCarsService:
                                 "description": None,
                                 "car_specifications": None,
                                 "images": None,
+                                "whatsapp_number": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1025,6 +1135,7 @@ class MudahMyCarsService:
                                 "description": None,
                                 "car_specifications": None,
                                 "images": None,
+                                "whatsapp_number": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1163,6 +1274,7 @@ class MudahMyCarsService:
                         "description": description_text if status == "active" else None,
                         "car_specifications": car_specifications_value if status == "active" else None,
                         "images": None,
+                        "whatsapp_number": None,
                         "error": None,
                         "status": status,
                     }
@@ -1187,6 +1299,7 @@ class MudahMyCarsService:
                                 or self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH)
                             )
 
+                    result["whatsapp_number"] = self._extract_whatsapp_numbers_botasaurus(driver)
                     wait_for_css(
                         driver,
                         "css=img[src*='cdn.rnudah.com']",
@@ -1224,6 +1337,7 @@ class MudahMyCarsService:
                         "description": None,
                         "car_specifications": None,
                         "images": None,
+                        "whatsapp_number": None,
                         "status": "active",
                         "error": "error",
                     }
@@ -1259,6 +1373,7 @@ class MudahMyCarsService:
                             result.get("series"),
                             result.get("type"),
                             result.get("images"),
+                            result.get("whatsapp_number"),
                             status,
                         )
                     )
