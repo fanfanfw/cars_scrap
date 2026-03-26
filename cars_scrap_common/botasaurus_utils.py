@@ -14,6 +14,7 @@ class BotasaurusRuntimeConfig:
     browser_kwargs: dict[str, Any]
     bypass_cloudflare: bool
     human_mode: bool
+    close_on_crash: bool
     prompt_on_cloudflare: bool
     save_html_on_empty: bool
     listing_wait_seconds: float
@@ -36,6 +37,7 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
     bypass_cloudflare = env_bool("BOTASAURUS_BYPASS_CLOUDFLARE", True)
 
     human_mode = env_bool("BOTASAURUS_HUMAN_MODE", True)
+    close_on_crash = env_bool("BOTASAURUS_CLOSE_ON_CRASH", True)
     prompt_on_cloudflare = env_bool("BOTASAURUS_PROMPT_ON_CLOUDFLARE", False)
     save_html_on_empty = env_bool("BOTASAURUS_SAVE_HTML_ON_EMPTY", False)
 
@@ -48,6 +50,7 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
         "output": None,
         "profile": profile,
         "tiny_profile": tiny_profile,
+        "close_on_crash": close_on_crash,
     }
     if enable_xvfb:
         browser_kwargs["enable_xvfb_virtual_display"] = True
@@ -59,6 +62,7 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
         browser_kwargs=browser_kwargs,
         bypass_cloudflare=bypass_cloudflare,
         human_mode=human_mode,
+        close_on_crash=close_on_crash,
         prompt_on_cloudflare=prompt_on_cloudflare,
         save_html_on_empty=save_html_on_empty,
         listing_wait_seconds=listing_wait_seconds,

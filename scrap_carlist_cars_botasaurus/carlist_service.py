@@ -1463,8 +1463,18 @@ class CarlistCarsService:
                     if self._is_access_blocked_botasaurus(driver):
                         raise RuntimeError(f"Blocked while scraping carlist detail: current_url={current_url!r}")
 
-                    if self._is_listing_not_found_botasaurus(driver) or self._is_sold_page_botasaurus(driver) or redirected_off_detail:
+                    is_not_found_page = self._is_listing_not_found_botasaurus(driver)
+                    is_sold_page = self._is_sold_page_botasaurus(driver)
+
+                    if is_not_found_page or is_sold_page or redirected_off_detail:
                         if expected_id:
+                            should_mark_sold = bool(is_sold_page) or (tracking_mode and (is_not_found_page or redirected_off_detail))
+                            if not should_mark_sold:
+                                raise RuntimeError(
+                                    "Detail page unavailable but not confidently sold. "
+                                    f"current_url={current_url!r} redirected_off_detail={redirected_off_detail} "
+                                    f"is_not_found_page={is_not_found_page} is_sold_page={is_sold_page}"
+                                )
                             result = {
                                 "listing_id": expected_id,
                                 "listing_url": url,
