@@ -166,6 +166,51 @@ class CarlistCarsService:
             return numeric
         return sha1(url.encode("utf-8")).hexdigest()[:16]
 
+    def _attempt_cloudflare_auto_solve_botasaurus(self, driver, *, target_url: str) -> None:
+        """
+        Let Botasaurus try solving the active Cloudflare widget in the same browser tab.
+
+        This is specifically useful for the carlist interstitial "Verify you are human"
+        page, where a solver running in another browser session would not carry over the
+        same clearance/cookies.
+        """
+        if not env_bool("CARLIST_AUTO_ATTEMPT_CLOUDFLARE", True):
+            return
+        if not is_cloudflare_challenge(driver):
+            return
+
+        try:
+            max_attempts = max(1, int((os.getenv("CARLIST_CLOUDFLARE_MAX_ATTEMPTS") or "2").strip()))
+        except Exception:
+            max_attempts = 2
+        try:
+            post_wait_seconds = max(
+                0.0, float((os.getenv("CARLIST_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS") or "4").strip())
+            )
+        except Exception:
+            post_wait_seconds = 4.0
+
+        for attempt in range(1, max_attempts + 1):
+            current_url = str(getattr(driver, "current_url", "") or "")
+            self.logger.warning(
+                "Cloudflare challenge detected on carlist. Auto-solve attempt %s/%s. target_url=%r current_url=%r",
+                attempt,
+                max_attempts,
+                target_url,
+                current_url,
+            )
+            try:
+                driver.detect_and_bypass_cloudflare()
+            except Exception as exc:
+                self.logger.warning("Botasaurus auto-solve attempt %s failed: %s", attempt, exc)
+
+            if post_wait_seconds:
+                time.sleep(post_wait_seconds)
+
+            if not is_cloudflare_challenge(driver):
+                self.logger.info("Cloudflare challenge cleared after auto-solve attempt %s.", attempt)
+                return
+
     def _extract_numeric_listing_id(self, url: str) -> str | None:
         match = re.search(r"(?:-|/)(\d{5,})(?:[/?#.]|$)", url)
         if match:
@@ -508,6 +553,7 @@ class CarlistCarsService:
         except Exception:
             pass
         driver.google_get(url, bypass_cloudflare=cfg.bypass_cloudflare)
+        self._attempt_cloudflare_auto_solve_botasaurus(driver, target_url=url)
         raise_if_cloudflare_challenge(
             driver,
             target_url=url,
