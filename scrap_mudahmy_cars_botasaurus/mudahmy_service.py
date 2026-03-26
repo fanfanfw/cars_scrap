@@ -856,6 +856,101 @@ class MudahMyCarsService:
                 return number
         return None
 
+    def _extract_seller_name_botasaurus(self, driver) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const currentHref = String(window.location.href || '');
+                const buttons = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
+                const contactTriggers = buttons.filter((el) => {
+                  const text = norm(el.textContent || el.innerText).toLowerCase();
+                  return (
+                    text === 'whatsapp' ||
+                    text.includes('whatsapp') ||
+                    text === 'view number' ||
+                    text.includes('view number') ||
+                    text === 'chat' ||
+                    text.includes('chat')
+                  );
+                });
+
+                const roots = [];
+                const pushRoot = (node) => {
+                  if (!node) return;
+                  if (roots.includes(node)) return;
+                  roots.push(node);
+                };
+
+                for (const trigger of contactTriggers) {
+                  let node = trigger;
+                  for (let i = 0; i < 5 && node; i++) {
+                    node = node.parentElement;
+                    pushRoot(node);
+                  }
+                }
+                pushRoot(document);
+
+                const scoreAnchor = (anchor) => {
+                  if (!anchor) return -1;
+                  const href = String(anchor.href || anchor.getAttribute('href') || '').trim();
+                  const text = norm(anchor.textContent || anchor.innerText);
+                  if (!href || !text) return -1;
+                  if (!/^https?:\\/\\/www\\.mudah\\.my\\//i.test(href)) return -1;
+                  if (/wa\\.me/i.test(href)) return -1;
+                  if (/\\/vi\\/\\d+\\.htm/i.test(href) || /-\\d+\\.htm(?:$|[?#])/i.test(href)) return -1;
+                  if (href === currentHref || href === currentHref + '#') return -1;
+                  const lowerText = text.toLowerCase();
+                  if (
+                    lowerText.includes('show more') ||
+                    lowerText.includes('show contact number') ||
+                    lowerText.includes('whatsapp') ||
+                    lowerText.includes('chat') ||
+                    lowerText.includes('view number')
+                  ) {
+                    return -1;
+                  }
+
+                  const className = String(anchor.className || '');
+                  const containerText = norm(
+                    (anchor.closest('section, div, aside, article') || anchor.parentElement || anchor).innerText || ''
+                  ).toLowerCase();
+
+                  let score = 0;
+                  if (/font-bold/.test(className)) score += 50;
+                  if (/break-all/.test(className)) score += 20;
+                  if (/text-base/.test(className)) score += 20;
+                  if (/text-\\[#1e88e5\\]/i.test(className)) score += 20;
+                  if (/\\/u\\//i.test(href)) score += 40;
+                  if (containerText.includes('verified dealer')) score += 25;
+                  if (containerText.includes('roc / ssm')) score += 20;
+                  if (containerText.includes('contact seller')) score += 15;
+                  if (text.length >= 4) score += 10;
+                  if (!/\\d{3,}/.test(text)) score += 5;
+                  return score;
+                };
+
+                for (const root of roots) {
+                  const anchors = Array.from(root.querySelectorAll ? root.querySelectorAll('a[href]') : []);
+                  let best = null;
+                  let bestScore = -1;
+                  for (const anchor of anchors) {
+                    const score = scoreAnchor(anchor);
+                    if (score > bestScore) {
+                      bestScore = score;
+                      best = anchor;
+                    }
+                  }
+                  if (best && bestScore >= 50) {
+                    return norm(best.textContent || best.innerText) || null;
+                  }
+                }
+                return null;
+                """
+            )
+        except Exception:
+            return None
+
     def _extract_images_from_dom_botasaurus(self, driver) -> list[str] | None:
         try:
             urls = driver.run_js(
@@ -1000,6 +1095,7 @@ class MudahMyCarsService:
             "images",
             "whatsapp_number",
             "contact_seller",
+            "seller_name",
             "status",
         )
 
@@ -1035,6 +1131,7 @@ class MudahMyCarsService:
           images = COALESCE(EXCLUDED.images, cars_scrap_mudahmy.images),
           whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, cars_scrap_mudahmy.whatsapp_number),
           contact_seller = COALESCE(EXCLUDED.contact_seller, cars_scrap_mudahmy.contact_seller),
+          seller_name = COALESCE(EXCLUDED.seller_name, cars_scrap_mudahmy.seller_name),
           {status_update_sql},
           version = COALESCE(cars_scrap_mudahmy.version, 0) + 1,
           last_scraped_at = NOW()
@@ -1176,6 +1273,7 @@ class MudahMyCarsService:
                                 "images": None,
                                 "whatsapp_number": None,
                                 "contact_seller": None,
+                                "seller_name": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1214,6 +1312,7 @@ class MudahMyCarsService:
                                 "images": None,
                                 "whatsapp_number": None,
                                 "contact_seller": None,
+                                "seller_name": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1354,6 +1453,7 @@ class MudahMyCarsService:
                         "images": None,
                         "whatsapp_number": None,
                         "contact_seller": None,
+                        "seller_name": None,
                         "error": None,
                         "status": status,
                     }
@@ -1380,6 +1480,7 @@ class MudahMyCarsService:
 
                     result["whatsapp_number"] = self._extract_whatsapp_numbers_botasaurus(driver)
                     result["contact_seller"] = self._extract_contact_seller_botasaurus(driver)
+                    result["seller_name"] = self._extract_seller_name_botasaurus(driver)
                     wait_for_css(
                         driver,
                         "css=img[src*='cdn.rnudah.com']",
@@ -1419,6 +1520,7 @@ class MudahMyCarsService:
                         "images": None,
                         "whatsapp_number": None,
                         "contact_seller": None,
+                        "seller_name": None,
                         "status": "active",
                         "error": "error",
                     }
@@ -1456,6 +1558,7 @@ class MudahMyCarsService:
                             result.get("images"),
                             result.get("whatsapp_number"),
                             result.get("contact_seller"),
+                            result.get("seller_name"),
                             status,
                         )
                     )
