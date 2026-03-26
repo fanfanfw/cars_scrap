@@ -1004,6 +1004,138 @@ class CarlistCarsService:
         self._close_contact_seller_modal_botasaurus(driver)
         return None
 
+    def _extract_inline_seller_name_botasaurus(self, driver, *, listing_id: str) -> str | None:
+        listing_id = str(listing_id or "").strip()
+        if not listing_id:
+            return None
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const listingId = String(args.listingId || '').trim();
+                if (!listingId) return null;
+
+                const scoreHeading = (el) => {
+                  if (!el) return -1;
+                  const text = norm(el.textContent || el.innerText);
+                  if (!text) return -1;
+                  const lower = text.toLowerCase();
+                  if (lower === 'contact' || lower === 'whatsapp' || lower === 'save') return -1;
+                  if (lower === 'transmission' || lower === 'mileage' || lower === 'color' || lower === 'condition') {
+                    return -1;
+                  }
+                  if (/^rm\\s*[\\d,]+/i.test(text)) return -1;
+                  if (/^[\\d\\s+\\-()]+$/.test(text)) return -1;
+                  let score = 0;
+                  if (el.tagName === 'H6') score += 100;
+                  if ((el.className || '').includes('u-margin-bottom-xxs')) score += 30;
+                  if (text.length >= 4) score += 10;
+                  if (!/\\d{3,}/.test(text)) score += 5;
+                  return score;
+                };
+
+                const roots = [];
+                const pushRoot = (node) => {
+                  if (!node) return;
+                  if (roots.includes(node)) return;
+                  roots.push(node);
+                };
+
+                const ctas = Array.from(document.querySelectorAll('a[href], button, [role="button"]')).filter((el) => {
+                  const dataListingId = String(el.getAttribute('data-listing-id') || '').trim();
+                  const dataTmlSi = String(el.getAttribute('data-tml-si') || '').trim();
+                  if (dataListingId && dataListingId !== listingId) return false;
+                  if (!dataListingId && dataTmlSi && dataTmlSi !== listingId) return false;
+                  const text = norm(el.textContent || el.innerText).toLowerCase();
+                  const cls = String(el.className || '').toLowerCase();
+                  return (
+                    text.includes('contact') ||
+                    text.includes('whatsapp') ||
+                    cls.includes('jump-phone') ||
+                    cls.includes('jump-whatsapp')
+                  );
+                });
+
+                for (const cta of ctas) {
+                  let node = cta;
+                  for (let i = 0; i < 6 && node; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const hasCandidateHeading = !!node.querySelector('h6.u-margin-bottom-xxs, h6');
+                    const hasContactButtons = Array.from(node.querySelectorAll('a[href], button, [role="button"]')).some((el) => {
+                      const text = norm(el.textContent || el.innerText).toLowerCase();
+                      const cls = String(el.className || '').toLowerCase();
+                      return (
+                        text.includes('contact') ||
+                        text.includes('whatsapp') ||
+                        cls.includes('jump-phone') ||
+                        cls.includes('jump-whatsapp')
+                      );
+                    });
+                    if (hasCandidateHeading && hasContactButtons) {
+                      pushRoot(node);
+                    }
+                  }
+                }
+
+                for (const root of roots) {
+                  const headings = Array.from(root.querySelectorAll('h6.u-margin-bottom-xxs, h6'))
+                    .filter((el) => scoreHeading(el) > 0)
+                    .sort((a, b) => scoreHeading(b) - scoreHeading(a));
+                  if (headings.length) {
+                    return norm(headings[0].textContent || headings[0].innerText) || null;
+                  }
+                }
+                return null;
+                """,
+                {"listingId": listing_id},
+            )
+        except Exception:
+            return None
+
+    def _extract_modal_seller_name_botasaurus(self, driver) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const modal = document.querySelector('#modal-contact-seller');
+                if (!modal) return null;
+                const headings = Array.from(modal.querySelectorAll('h6.u-margin-bottom-xxs, h6'));
+                for (const heading of headings) {
+                  const text = norm(heading.textContent || heading.innerText);
+                  if (!text) continue;
+                  const lower = text.toLowerCase();
+                  if (lower === 'contact' || lower === 'whatsapp' || lower === 'save') continue;
+                  if (/^[\\d\\s+\\-()]+$/.test(text)) continue;
+                  return text;
+                }
+                return null;
+                """
+            )
+        except Exception:
+            return None
+
+    def _extract_seller_name_botasaurus(self, driver, *, listing_id: str, modal_wait_seconds: float = 3.0) -> str | None:
+        name = self._extract_inline_seller_name_botasaurus(driver, listing_id=listing_id)
+        if name:
+            return name
+
+        opened = self._click_whatsapp_button_botasaurus(driver, listing_id=listing_id)
+        if not opened:
+            opened = self._click_contact_button_botasaurus(driver, listing_id=listing_id)
+        if not opened:
+            return None
+
+        deadline = time.time() + max(0.0, modal_wait_seconds)
+        while time.time() < deadline:
+            time.sleep(0.25)
+            name = self._extract_modal_seller_name_botasaurus(driver)
+            if name:
+                self._close_contact_seller_modal_botasaurus(driver)
+                return name
+        self._close_contact_seller_modal_botasaurus(driver)
+        return None
+
     def _extract_listing_urls_botasaurus(self, driver) -> list[str]:
         try:
             hrefs = driver.run_js(
@@ -1112,6 +1244,7 @@ class CarlistCarsService:
             "images",
             "whatsapp_number",
             "contact_seller",
+            "seller_name",
             "status",
         )
 
@@ -1147,6 +1280,7 @@ class CarlistCarsService:
           images = COALESCE(EXCLUDED.images, cars_scrap_carlistmy.images),
           whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, cars_scrap_carlistmy.whatsapp_number),
           contact_seller = COALESCE(EXCLUDED.contact_seller, cars_scrap_carlistmy.contact_seller),
+          seller_name = COALESCE(EXCLUDED.seller_name, cars_scrap_carlistmy.seller_name),
           {status_update_sql},
           version = COALESCE(cars_scrap_carlistmy.version, 0) + 1,
           last_scraped_at = NOW()
@@ -1311,6 +1445,7 @@ class CarlistCarsService:
                                 "images": None,
                                 "whatsapp_number": None,
                                 "contact_seller": None,
+                                "seller_name": None,
                                 "error": None,
                                 "status": "sold",
                             }
@@ -1385,6 +1520,9 @@ class CarlistCarsService:
                         driver, listing_id=listing_id_final
                     )
                     contact_seller_value = self._extract_contact_seller_botasaurus(
+                        driver, listing_id=listing_id_final
+                    )
+                    seller_name_value = self._extract_seller_name_botasaurus(
                         driver, listing_id=listing_id_final
                     )
 
@@ -1476,6 +1614,7 @@ class CarlistCarsService:
                         "images": images_value if status == "active" else None,
                         "whatsapp_number": whatsapp_numbers_value if status == "active" else None,
                         "contact_seller": contact_seller_value if status == "active" else None,
+                        "seller_name": seller_name_value if status == "active" else None,
                         "error": None,
                         "status": status,
                     }
@@ -1516,6 +1655,7 @@ class CarlistCarsService:
                         "images": None,
                         "whatsapp_number": None,
                         "contact_seller": None,
+                        "seller_name": None,
                         "status": "active",
                         "error": "error",
                     }
@@ -1553,6 +1693,7 @@ class CarlistCarsService:
                             result.get("images"),
                             result.get("whatsapp_number"),
                             result.get("contact_seller"),
+                            result.get("seller_name"),
                             status,
                         )
                     )
