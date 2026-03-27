@@ -62,46 +62,67 @@ def main() -> None:
         def summarize_results(results: list[dict] | None) -> dict:
             items = results or []
             scraped = len(items)
-            errors = 0
-            sold_detected = 0
-            skipped = 0
-            upserted = 0
+            error_urls: list[str] = []
+            sold_urls: list[str] = []
+            skipped_urls: list[str] = []
+            upserted_urls: list[str] = []
             skip_reasons: dict[str, int] = {}
+
+            def listing_ref(row: dict) -> str:
+                url = str(row.get("listing_url") or "").strip()
+                if url:
+                    return url
+                listing_id = str(row.get("listing_id") or "").strip()
+                return listing_id
 
             for r in items:
                 row = r or {}
                 if row.get("error"):
-                    errors += 1
+                    ref = listing_ref(row)
+                    if ref:
+                        error_urls.append(ref)
                     continue
 
                 status = str(row.get("status") or "").strip().lower()
                 listing_id = row.get("listing_id")
 
                 if status == "sold":
-                    sold_detected += 1
+                    ref = listing_ref(row)
+                    if ref:
+                        sold_urls.append(ref)
                     continue
 
                 if row.get("skipped_upsert"):
-                    skipped += 1
+                    ref = listing_ref(row)
+                    if ref:
+                        skipped_urls.append(ref)
                     reason = str(row.get("skip_reason") or "unknown")
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                     continue
 
                 if not listing_id:
-                    skipped += 1
+                    ref = listing_ref(row)
+                    if ref:
+                        skipped_urls.append(ref)
                     reason = "missing_listing_id"
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                     continue
 
                 if status == "active":
-                    upserted += 1
+                    ref = listing_ref(row)
+                    if ref:
+                        upserted_urls.append(ref)
 
             return {
                 "scraped": scraped,
-                "upserted": upserted,
-                "skipped": skipped,
-                "errors": errors,
-                "sold_detected": sold_detected,
+                "upserted": upserted_urls,
+                "upserted_count": len(upserted_urls),
+                "skipped": skipped_urls,
+                "skipped_count": len(skipped_urls),
+                "errors": error_urls,
+                "errors_count": len(error_urls),
+                "sold_marked": sold_urls,
+                "sold_marked_count": len(sold_urls),
                 "skip_reasons": skip_reasons,
             }
 
@@ -180,7 +201,6 @@ def main() -> None:
                 "last_scraped_older_than": args.track_last_scraped_older_than,
                 "last_scraped_cutoff_date": str(cutoff_last_scraped) if cutoff_last_scraped else None,
                 "count": len(links),
-                "sample": links[:20],
             }
             if args.track_count_only:
                 print(f"total_data: {len(links)} listing")
@@ -191,19 +211,21 @@ def main() -> None:
 
             results = scraper.scrape_listing_details(links, listing_id_by_url=listing_id_by_url)
             metrics = summarize_results(results)
-            sold = sum(1 for r in results if (r or {}).get("status") == "sold")
-            errored = sum(1 for r in results if (r or {}).get("error"))
             print(
                 json.dumps(
                     {
                         **summary,
                         "scraped": len(results),
-                        "sold_marked": sold,
+                        "sold_marked": metrics["sold_marked"],
+                        "sold_marked_count": metrics["sold_marked_count"],
                         "upserted": metrics["upserted"],
+                        "upserted_count": metrics["upserted_count"],
                         "skipped": metrics["skipped"],
-                        "errors": errored,
+                        "skipped_count": metrics["skipped_count"],
+                        "errors": metrics["errors"],
+                        "errors_count": metrics["errors_count"],
                         "skip_reasons": metrics["skip_reasons"],
-                        "stored_to_db": bool(sold or metrics["upserted"]),
+                        "stored_to_db": bool(metrics["sold_marked_count"] or metrics["upserted_count"]),
                     },
                     indent=2,
                     default=str,
