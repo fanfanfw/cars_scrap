@@ -142,6 +142,11 @@ class CarlistCarsService:
                 "request header or cookie too large",
                 "this page isn't working",
                 "this page isnt working",
+                "this site can't be reached",
+                "this site cant be reached",
+                "err_tunnel_connection_failed",
+                "tunnel_connection_failed",
+                "err_proxy_connection_failed",
             ),
         )
 
@@ -212,7 +217,7 @@ class CarlistCarsService:
 
     def _is_retryable_http_400_error(self, exc: Exception) -> bool:
         text = str(exc or "").strip().lower()
-        return "http error page while scraping carlist detail" in text
+        return "retryable error page while scraping carlist" in text
 
     def _build_retry_cfg_for_http_400(self, *, base_profile: str, retry_index: int, listing_key: str):
         previous_profile = os.getenv("BOTASAURUS_PROFILE")
@@ -259,7 +264,7 @@ class CarlistCarsService:
                 listing_key=listing_key,
             )
             self.logger.warning(
-                "Retrying carlist detail after HTTP 400 with new session. retry=%s/%s profile=%s proxy=%s url=%s",
+                "Retrying carlist detail after browser error page. retry=%s/%s profile=%s proxy=%s url=%s",
                 retry_index,
                 max_retries,
                 cfg.browser_kwargs.get("profile"),
@@ -286,9 +291,67 @@ class CarlistCarsService:
                 return run({"url": url, "listing_id": listing_id})
             except Exception as exc:
                 if self._is_retryable_http_400_error(exc) and retry_index < max_retries:
-                    self.logger.warning("HTTP 400 retry %s still failed for %s: %s", retry_index, url, exc)
+                    self.logger.warning("Browser error retry %s still failed for %s: %s", retry_index, url, exc)
                     continue
                 self.logger.warning("Retry session failed for %s: %s", url, exc)
+                return None
+
+        return None
+
+    def _retry_listing_http_400_with_new_session(
+        self,
+        *,
+        url: str,
+        max_pages: int,
+        base_profile: str,
+    ) -> list[str] | None:
+        if not env_bool("CARLIST_HTTP_400_RETRY_ENABLED", True):
+            return None
+        try:
+            max_retries = max(1, int((os.getenv("CARLIST_HTTP_400_MAX_RETRIES") or "2").strip()))
+        except Exception:
+            max_retries = 2
+
+        from botasaurus.browser import Driver, browser
+
+        for retry_index in range(1, max_retries + 1):
+            cfg = self._build_retry_cfg_for_http_400(
+                base_profile=base_profile,
+                retry_index=retry_index,
+                listing_key="listing",
+            )
+            self.logger.warning(
+                "Retrying carlist listing after browser error page. retry=%s/%s profile=%s proxy=%s url=%s",
+                retry_index,
+                max_retries,
+                cfg.browser_kwargs.get("profile"),
+                mask_proxy_url(str(cfg.proxy_url)) if getattr(cfg, "proxy_url", None) else "direct",
+                url,
+            )
+
+            @browser(**cfg.browser_kwargs)
+            def run(driver: Driver, data):
+                if cfg.human_mode:
+                    try:
+                        driver.enable_human_mode()
+                    except Exception:
+                        pass
+
+                self.logger.info("Navigating (botasaurus retry): %s", data["url"])
+                self._navigate_botasaurus(driver, data["url"], cfg)
+                time.sleep(max(0.0, cfg.listing_wait_seconds))
+                if self._is_http_error_page_botasaurus(driver):
+                    current_url = str(getattr(driver, "current_url", "") or "")
+                    raise RuntimeError(f"Retryable error page while scraping carlist listing: current_url={current_url!r}")
+                return self._extract_listing_urls_botasaurus(driver)
+
+            try:
+                return run({"url": url, "max_pages": max_pages})
+            except Exception as exc:
+                if self._is_retryable_http_400_error(exc) and retry_index < max_retries:
+                    self.logger.warning("Listing retry %s still failed for %s: %s", retry_index, url, exc)
+                    continue
+                self.logger.warning("Listing retry session failed for %s: %s", url, exc)
                 return None
 
         return None
@@ -756,7 +819,7 @@ class CarlistCarsService:
         is_http_error_page = self._is_http_error_page_botasaurus(driver)
 
         if is_http_error_page:
-            raise RuntimeError(f"HTTP error page while scraping carlist detail: current_url={current_url!r}")
+            raise RuntimeError(f"Retryable error page while scraping carlist detail: current_url={current_url!r}")
 
         if self._is_access_blocked_botasaurus(driver):
             raise RuntimeError(f"Blocked while scraping carlist detail: current_url={current_url!r}")
@@ -1565,6 +1628,9 @@ class CarlistCarsService:
             self._navigate_botasaurus(driver, data["url"], cfg)
 
             time.sleep(max(0.0, cfg.listing_wait_seconds))
+            if self._is_http_error_page_botasaurus(driver):
+                current_url = str(getattr(driver, "current_url", "") or "")
+                raise RuntimeError(f"Retryable error page while scraping carlist listing: current_url={current_url!r}")
             urls = self._extract_listing_urls_botasaurus(driver)
             if not urls and cfg.save_html_on_empty:
                 try:
@@ -1579,7 +1645,18 @@ class CarlistCarsService:
                     self.logger.warning("Failed to save debug HTML: %s", exc)
             return urls
 
-        links = run({"url": url, "max_pages": max_pages}) or []
+        try:
+            links = run({"url": url, "max_pages": max_pages}) or []
+        except Exception as exc:
+            if self._is_retryable_http_400_error(exc):
+                base_profile = str(cfg.browser_kwargs.get("profile") or "carlist")
+                links = self._retry_listing_http_400_with_new_session(
+                    url=url,
+                    max_pages=max_pages,
+                    base_profile=base_profile,
+                ) or []
+            else:
+                raise
         self.logger.info("Collected %s links.", len(links))
         return links
 
