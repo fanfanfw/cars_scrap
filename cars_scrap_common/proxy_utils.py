@@ -139,6 +139,12 @@ def load_proxy_for_run() -> str | None:
     return _CACHED_PROXY
 
 
+def reset_cached_proxy() -> None:
+    global _CACHED_PROXY, _CACHED_PROXY_SET
+    _CACHED_PROXY = None
+    _CACHED_PROXY_SET = False
+
+
 _CACHED_PROXY: str | None = None
 _CACHED_PROXY_SET = False
 
@@ -186,4 +192,3 @@ def probe_public_ip(*, check_url: str, proxy_url: str | None, timeout_seconds: f
         return text.splitlines()[0].strip() if text else None
     except Exception:
         return None
-

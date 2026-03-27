@@ -18,7 +18,7 @@ from cars_scrap_common.botasaurus_utils import (
 )
 from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
-from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip
+from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
 from scrap_carlist_cars_botasaurus.database import get_connection
 
 load_dotenv(override=True)
@@ -133,6 +133,18 @@ class CarlistCarsService:
             ),
         )
 
+    def _is_http_error_page_botasaurus(self, driver) -> bool:
+        return self._page_has_tokens_botasaurus(
+            driver,
+            (
+                "http error 400",
+                "400 bad request",
+                "request header or cookie too large",
+                "this page isn't working",
+                "this page isnt working",
+            ),
+        )
+
     def close(self) -> None:
         return
 
@@ -165,6 +177,121 @@ class CarlistCarsService:
         if numeric:
             return numeric
         return sha1(url.encode("utf-8")).hexdigest()[:16]
+
+    def _build_error_result(self, url: str) -> dict:
+        return {
+            "listing_id": None,
+            "listing_url": url,
+            "condition": None,
+            "brand": None,
+            "model": None,
+            "variant": None,
+            "information_ads": None,
+            "information_ads_date": None,
+            "location": None,
+            "price": None,
+            "year": None,
+            "mileage": None,
+            "transmission": None,
+            "seat_capacity": None,
+            "engine_cc": None,
+            "fuel_type": None,
+            "series": None,
+            "type": None,
+            "carousel": None,
+            "seller_notes": None,
+            "specifications": None,
+            "equipment": None,
+            "images": None,
+            "whatsapp_number": None,
+            "contact_seller": None,
+            "seller_name": None,
+            "status": "active",
+            "error": "error",
+        }
+
+    def _is_retryable_http_400_error(self, exc: Exception) -> bool:
+        text = str(exc or "").strip().lower()
+        return "http error page while scraping carlist detail" in text
+
+    def _build_retry_cfg_for_http_400(self, *, base_profile: str, retry_index: int, listing_key: str):
+        previous_profile = os.getenv("BOTASAURUS_PROFILE")
+        suffix = str(retry_index).strip() or "1"
+        unique = str(time.time_ns())[-8:]
+        retry_profile = f"{base_profile}_http400_r{suffix}_{listing_key}_{unique}"
+
+        try:
+            os.environ["BOTASAURUS_PROFILE"] = retry_profile
+            reset_cached_proxy()
+            cfg = load_botasaurus_config(service_name="carlist")
+        finally:
+            if previous_profile is None:
+                os.environ.pop("BOTASAURUS_PROFILE", None)
+            else:
+                os.environ["BOTASAURUS_PROFILE"] = previous_profile
+            reset_cached_proxy()
+
+        return cfg
+
+    def _retry_http_400_with_new_session(
+        self,
+        *,
+        url: str,
+        listing_id: str | None,
+        tracking_mode: bool,
+        base_profile: str,
+    ) -> dict | None:
+        if not env_bool("CARLIST_HTTP_400_RETRY_ENABLED", True):
+            return None
+        try:
+            max_retries = max(1, int((os.getenv("CARLIST_HTTP_400_MAX_RETRIES") or "2").strip()))
+        except Exception:
+            max_retries = 2
+
+        from botasaurus.browser import Driver, browser
+
+        listing_key = (listing_id or self._extract_numeric_listing_id(url) or self._extract_listing_id(url) or "unknown").strip()
+
+        for retry_index in range(1, max_retries + 1):
+            cfg = self._build_retry_cfg_for_http_400(
+                base_profile=base_profile,
+                retry_index=retry_index,
+                listing_key=listing_key,
+            )
+            self.logger.warning(
+                "Retrying carlist detail after HTTP 400 with new session. retry=%s/%s profile=%s proxy=%s url=%s",
+                retry_index,
+                max_retries,
+                cfg.browser_kwargs.get("profile"),
+                mask_proxy_url(str(cfg.proxy_url)) if getattr(cfg, "proxy_url", None) else "direct",
+                url,
+            )
+
+            @browser(**cfg.browser_kwargs)
+            def run(driver: Driver, data):
+                if cfg.human_mode:
+                    try:
+                        driver.enable_human_mode()
+                    except Exception:
+                        pass
+                return self._scrape_single_detail_botasaurus(
+                    driver,
+                    url=data["url"],
+                    cfg=cfg,
+                    listing_id=data.get("listing_id"),
+                    tracking_mode=tracking_mode,
+                )
+
+            try:
+                return run({"url": url, "listing_id": listing_id})
+            except Exception as exc:
+                if self._is_retryable_http_400_error(exc) and retry_index < max_retries:
+                    self.logger.warning("HTTP 400 retry %s still failed for %s: %s", retry_index, url, exc)
+                    continue
+                self.logger.warning("Retry session failed for %s: %s", url, exc)
+                return None
+
+        return None
 
     def _attempt_cloudflare_auto_solve_botasaurus(self, driver, *, target_url: str) -> None:
         """
@@ -597,6 +724,8 @@ class CarlistCarsService:
     def _is_access_blocked_botasaurus(self, driver) -> bool:
         if is_cloudflare_challenge(driver):
             return True
+        if self._is_http_error_page_botasaurus(driver):
+            return True
         try:
             text = driver.run_js("return ((document.body && document.body.innerText) || '').toLowerCase();")
         except Exception:
@@ -617,6 +746,211 @@ class CarlistCarsService:
                 "temporarily unavailable",
             )
         )
+
+    def _scrape_single_detail_botasaurus(self, driver, *, url: str, cfg, listing_id: str | None, tracking_mode: bool) -> dict:
+        self._navigate_botasaurus(driver, url, cfg)
+
+        current_url = str(getattr(driver, "current_url", "") or "")
+        expected_id = (listing_id or self._extract_listing_id(url)).strip()
+        redirected_off_detail = bool(current_url) and (not self._is_on_target_domain(current_url))
+        is_http_error_page = self._is_http_error_page_botasaurus(driver)
+
+        if is_http_error_page:
+            raise RuntimeError(f"HTTP error page while scraping carlist detail: current_url={current_url!r}")
+
+        if self._is_access_blocked_botasaurus(driver):
+            raise RuntimeError(f"Blocked while scraping carlist detail: current_url={current_url!r}")
+
+        is_not_found_page = self._is_listing_not_found_botasaurus(driver)
+        is_sold_page = self._is_sold_page_botasaurus(driver)
+
+        if is_not_found_page or is_sold_page or redirected_off_detail:
+            if expected_id:
+                should_mark_sold = bool(is_sold_page) or (tracking_mode and (is_not_found_page or redirected_off_detail))
+                if not should_mark_sold:
+                    raise RuntimeError(
+                        "Detail page unavailable but not confidently sold. "
+                        f"current_url={current_url!r} redirected_off_detail={redirected_off_detail} "
+                        f"is_not_found_page={is_not_found_page} is_sold_page={is_sold_page}"
+                    )
+                return {
+                    "listing_id": expected_id,
+                    "listing_url": url,
+                    "condition": None,
+                    "brand": None,
+                    "model": None,
+                    "variant": None,
+                    "information_ads": None,
+                    "information_ads_date": None,
+                    "location": None,
+                    "price": None,
+                    "year": None,
+                    "mileage": None,
+                    "transmission": None,
+                    "seat_capacity": None,
+                    "engine_cc": None,
+                    "fuel_type": None,
+                    "series": None,
+                    "type": None,
+                    "carousel": None,
+                    "seller_notes": None,
+                    "specifications": None,
+                    "equipment": None,
+                    "images": None,
+                    "whatsapp_number": None,
+                    "contact_seller": None,
+                    "seller_name": None,
+                    "error": None,
+                    "status": "sold",
+                }
+            raise RuntimeError("Listing not found/redirected (missing listing_id).")
+
+        wait_for_xpath(
+            driver,
+            INFORMATION_ADS_XPATH,
+            timeout_seconds=cfg.detail_wait_seconds,
+            poll_interval_seconds=cfg.poll_interval_seconds,
+        )
+
+        listing_id_meta = self._get_attr_by_xpath_botasaurus(driver, LISTING_ID_META_XPATH, "content")
+        listing_id_from_url = (listing_id or self._extract_numeric_listing_id(url) or "").strip()
+
+        listing_id_meta_numeric = None
+        if listing_id_meta:
+            match = re.search(r"\d{5,}", str(listing_id_meta))
+            if match:
+                listing_id_meta_numeric = match.group(0)
+
+        if listing_id_meta_numeric and listing_id_from_url and listing_id_meta_numeric != listing_id_from_url:
+            if not self._logged_listing_id_meta_mismatch:
+                self._logged_listing_id_meta_mismatch = True
+                self.logger.warning(
+                    "Ignoring mismatched listing_id from meta (meta=%r url=%r) for %s",
+                    listing_id_meta_numeric,
+                    listing_id_from_url,
+                    url,
+                )
+            listing_id_meta_numeric = None
+
+        listing_id_final = (
+            listing_id_from_url
+            or listing_id_meta_numeric
+            or (self._extract_numeric_listing_id(current_url) or "").strip()
+            or self._extract_listing_id(url)
+            or ""
+        ).strip()
+        if not listing_id_final:
+            raise RuntimeError("Missing listing_id on page")
+
+        condition_value = self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
+        brand_value = self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
+        model_value = self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
+        variant_value = self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
+
+        info_ads_value = self._get_text_by_xpath_botasaurus(driver, INFORMATION_ADS_XPATH)
+        info_ads_date_value = self._parse_information_ads_date(info_ads_value)
+
+        location_value = self._extract_location_botasaurus(driver)
+        price_value = self._parse_int_from_text(self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content"))
+        year_value = self._parse_int_from_text(self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content"))
+        mileage_value = self._parse_mileage(self._get_text_by_xpath_botasaurus(driver, MILEAGE_XPATH))
+        transmission_value = self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
+        seat_capacity_value = self._get_text_by_xpath_botasaurus(driver, SEAT_CAPACITY_XPATH)
+        engine_cc_value = self._normalize_engine_cc(self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH))
+        fuel_type_value = self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
+        images_value = self._extract_images_botasaurus(driver)
+        whatsapp_numbers_value = self._extract_whatsapp_numbers_botasaurus(driver, listing_id=listing_id_final)
+        contact_seller_value = self._extract_contact_seller_botasaurus(driver, listing_id=listing_id_final)
+        seller_name_value = self._extract_seller_name_botasaurus(driver, listing_id=listing_id_final)
+
+        def has_value(v) -> bool:
+            if v is None:
+                return False
+            if isinstance(v, str):
+                return bool(v.strip())
+            if isinstance(v, (list, tuple, set, dict)):
+                return bool(v)
+            if isinstance(v, (int, float)):
+                return v != 0
+            return True
+
+        has_any_data = any(
+            has_value(v)
+            for v in (
+                condition_value,
+                brand_value,
+                model_value,
+                variant_value,
+                info_ads_value,
+                info_ads_date_value,
+                location_value,
+                price_value,
+                year_value,
+                mileage_value,
+                transmission_value,
+                seat_capacity_value,
+                engine_cc_value,
+                fuel_type_value,
+                images_value,
+            )
+        )
+        if not has_any_data:
+            if listing_id_final and self._is_sold_page_botasaurus(driver):
+                status = "sold"
+            else:
+                raise RuntimeError("No extractable data on detail page (treating as error, not sold).")
+        else:
+            status = "active"
+
+        carousel_value = None
+        seller_notes_value = None
+        specifications_value: dict[str, object] | None = None
+        equipment_value: dict[str, object] | None = None
+        if status == "active":
+            carousel_value = self._extract_carousel_dict_botasaurus(driver)
+
+            if self._click_tab_by_href_botasaurus(driver, href=TAB_SELLER_NOTES_SELECTOR):
+                time.sleep(0.2)
+            seller_notes_value = self._extract_seller_notes_text_botasaurus(driver)
+
+            if self._click_tab_by_href_botasaurus(driver, href=TAB_SPECIFICATIONS_SELECTOR):
+                time.sleep(0.2)
+            specifications_value = self._extract_tab_grouped_kv_botasaurus(driver, tab_selector=TAB_SPECIFICATIONS_SELECTOR)
+
+            if self._click_tab_by_href_botasaurus(driver, href=TAB_EQUIPMENTS_SELECTOR):
+                time.sleep(0.2)
+            equipment_value = self._extract_tab_grouped_kv_botasaurus(driver, tab_selector=TAB_EQUIPMENTS_SELECTOR)
+
+        return {
+            "listing_id": listing_id_final,
+            "listing_url": url,
+            "condition": condition_value if status == "active" else None,
+            "brand": brand_value if status == "active" else None,
+            "model": model_value if status == "active" else None,
+            "variant": variant_value if status == "active" else None,
+            "information_ads": info_ads_value if status == "active" else None,
+            "information_ads_date": info_ads_date_value if status == "active" else None,
+            "location": location_value if status == "active" else None,
+            "price": price_value if status == "active" else None,
+            "year": year_value if status == "active" else None,
+            "mileage": mileage_value if status == "active" else None,
+            "transmission": transmission_value if status == "active" else None,
+            "seat_capacity": seat_capacity_value if status == "active" else None,
+            "engine_cc": engine_cc_value if status == "active" else None,
+            "fuel_type": fuel_type_value if status == "active" else None,
+            "series": None,
+            "type": None,
+            "carousel": carousel_value if status == "active" else None,
+            "seller_notes": seller_notes_value if status == "active" else None,
+            "specifications": specifications_value if status == "active" else None,
+            "equipment": equipment_value if status == "active" else None,
+            "images": images_value if status == "active" else None,
+            "whatsapp_number": whatsapp_numbers_value if status == "active" else None,
+            "contact_seller": contact_seller_value if status == "active" else None,
+            "seller_name": seller_name_value if status == "active" else None,
+            "error": None,
+            "status": status,
+        }
 
     def _extract_location_botasaurus(self, driver) -> str | None:
         try:
@@ -1452,275 +1786,46 @@ class CarlistCarsService:
                 if not listing_id:
                     listing_id = None
 
+                result = None
                 try:
-                    self._navigate_botasaurus(driver, url, cfg)
-
-                    current_url = str(getattr(driver, "current_url", "") or "")
                     tracking_mode = bool(listing_id_by_url)
-                    expected_id = (listing_id or self._extract_listing_id(url)).strip()
-                    redirected_off_detail = bool(current_url) and (not self._is_on_target_domain(current_url))
-
-                    if self._is_access_blocked_botasaurus(driver):
-                        raise RuntimeError(f"Blocked while scraping carlist detail: current_url={current_url!r}")
-
-                    is_not_found_page = self._is_listing_not_found_botasaurus(driver)
-                    is_sold_page = self._is_sold_page_botasaurus(driver)
-
-                    if is_not_found_page or is_sold_page or redirected_off_detail:
-                        if expected_id:
-                            should_mark_sold = bool(is_sold_page) or (tracking_mode and (is_not_found_page or redirected_off_detail))
-                            if not should_mark_sold:
-                                raise RuntimeError(
-                                    "Detail page unavailable but not confidently sold. "
-                                    f"current_url={current_url!r} redirected_off_detail={redirected_off_detail} "
-                                    f"is_not_found_page={is_not_found_page} is_sold_page={is_sold_page}"
-                                )
-                            result = {
-                                "listing_id": expected_id,
-                                "listing_url": url,
-                                "condition": None,
-                                "brand": None,
-                                "model": None,
-                                "variant": None,
-                                "information_ads": None,
-                                "information_ads_date": None,
-                                "location": None,
-                                "price": None,
-                                "year": None,
-                                "mileage": None,
-                                "transmission": None,
-                                "seat_capacity": None,
-                                "engine_cc": None,
-                                "fuel_type": None,
-                                "series": None,
-                                "type": None,
-                                "carousel": None,
-                                "seller_notes": None,
-                                "specifications": None,
-                                "equipment": None,
-                                "images": None,
-                                "whatsapp_number": None,
-                                "contact_seller": None,
-                                "seller_name": None,
-                                "error": None,
-                                "status": "sold",
-                            }
-                            results.append(result)
-                            if tracking_mode:
-                                sold_rows.append((result.get("listing_url"), expected_id))
-                                if len(sold_rows) >= batch_size:
-                                    flush_sold_rows()
-                            continue
-                        raise RuntimeError("Listing not found/redirected (missing listing_id).")
-
-                    wait_for_xpath(
+                    result = self._scrape_single_detail_botasaurus(
                         driver,
-                        INFORMATION_ADS_XPATH,
-                        timeout_seconds=cfg.detail_wait_seconds,
-                        poll_interval_seconds=cfg.poll_interval_seconds,
+                        url=url,
+                        cfg=cfg,
+                        listing_id=listing_id,
+                        tracking_mode=tracking_mode,
                     )
-
-                    listing_id_meta = self._get_attr_by_xpath_botasaurus(driver, LISTING_ID_META_XPATH, "content")
-                    listing_id_from_url = (listing_id or self._extract_numeric_listing_id(url) or "").strip()
-
-                    listing_id_meta_numeric = None
-                    if listing_id_meta:
-                        match = re.search(r"\d{5,}", str(listing_id_meta))
-                        if match:
-                            listing_id_meta_numeric = match.group(0)
-
-                    # Meta XPaths are brittle; only trust meta listing_id if it matches the URL/mapped id.
-                    if listing_id_meta_numeric and listing_id_from_url and listing_id_meta_numeric != listing_id_from_url:
-                        if not self._logged_listing_id_meta_mismatch:
-                            self._logged_listing_id_meta_mismatch = True
-                            self.logger.warning(
-                                "Ignoring mismatched listing_id from meta (meta=%r url=%r) for %s",
-                                listing_id_meta_numeric,
-                                listing_id_from_url,
-                                url,
-                            )
-                        listing_id_meta_numeric = None
-
-                    listing_id_final = (
-                        listing_id_from_url
-                        or listing_id_meta_numeric
-                        or (self._extract_numeric_listing_id(current_url) or "").strip()
-                        or self._extract_listing_id(url)
-                        or ""
-                    ).strip()
-                    if not listing_id_final:
-                        raise RuntimeError("Missing listing_id on page")
-
-                    condition_value = self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
-                    brand_value = self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
-                    model_value = self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
-                    variant_value = self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
-
-                    info_ads_value = self._get_text_by_xpath_botasaurus(driver, INFORMATION_ADS_XPATH)
-                    info_ads_date_value = self._parse_information_ads_date(info_ads_value)
-
-                    location_value = self._extract_location_botasaurus(driver)
-                    price_value = self._parse_int_from_text(
-                        self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content")
-                    )
-                    year_value = self._parse_int_from_text(self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content"))
-                    mileage_value = self._parse_mileage(self._get_text_by_xpath_botasaurus(driver, MILEAGE_XPATH))
-                    transmission_value = self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
-                    seat_capacity_value = self._get_text_by_xpath_botasaurus(driver, SEAT_CAPACITY_XPATH)
-                    engine_cc_value = self._normalize_engine_cc(
-                        self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH)
-                    )
-                    fuel_type_value = self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
-                    images_value = self._extract_images_botasaurus(driver)
-                    whatsapp_numbers_value = self._extract_whatsapp_numbers_botasaurus(
-                        driver, listing_id=listing_id_final
-                    )
-                    contact_seller_value = self._extract_contact_seller_botasaurus(
-                        driver, listing_id=listing_id_final
-                    )
-                    seller_name_value = self._extract_seller_name_botasaurus(
-                        driver, listing_id=listing_id_final
-                    )
-
-                    def has_value(v) -> bool:
-                        if v is None:
-                            return False
-                        if isinstance(v, str):
-                            return bool(v.strip())
-                        if isinstance(v, (list, tuple, set, dict)):
-                            return bool(v)
-                        if isinstance(v, (int, float)):
-                            return v != 0
-                        return True
-
-                    has_any_data = any(
-                        has_value(v)
-                        for v in (
-                            condition_value,
-                            brand_value,
-                            model_value,
-                            variant_value,
-                            info_ads_value,
-                            info_ads_date_value,
-                            location_value,
-                            price_value,
-                            year_value,
-                            mileage_value,
-                            transmission_value,
-                            seat_capacity_value,
-                            engine_cc_value,
-                            fuel_type_value,
-                            images_value,
-                        )
-                    )
-                    if not has_any_data:
-                        if listing_id_final and self._is_sold_page_botasaurus(driver):
-                            status = "sold"
-                        else:
-                            raise RuntimeError("No extractable data on detail page (treating as error, not sold).")
-                    else:
-                        status = "active"
-
-                    carousel_value = None
-                    seller_notes_value = None
-                    specifications_value: dict[str, object] | None = None
-                    equipment_value: dict[str, object] | None = None
-                    if status == "active":
-                        carousel_value = self._extract_carousel_dict_botasaurus(driver)
-
-                        if self._click_tab_by_href_botasaurus(driver, href=TAB_SELLER_NOTES_SELECTOR):
-                            time.sleep(0.2)
-                        seller_notes_value = self._extract_seller_notes_text_botasaurus(driver)
-
-                        if self._click_tab_by_href_botasaurus(driver, href=TAB_SPECIFICATIONS_SELECTOR):
-                            time.sleep(0.2)
-                        specifications_value = self._extract_tab_grouped_kv_botasaurus(
-                            driver, tab_selector=TAB_SPECIFICATIONS_SELECTOR
-                        )
-
-                        if self._click_tab_by_href_botasaurus(driver, href=TAB_EQUIPMENTS_SELECTOR):
-                            time.sleep(0.2)
-                        equipment_value = self._extract_tab_grouped_kv_botasaurus(
-                            driver, tab_selector=TAB_EQUIPMENTS_SELECTOR
-                        )
-
-                    result = {
-                        "listing_id": listing_id_final,
-                        "listing_url": url,
-                        "condition": condition_value if status == "active" else None,
-                        "brand": brand_value if status == "active" else None,
-                        "model": model_value if status == "active" else None,
-                        "variant": variant_value if status == "active" else None,
-                        "information_ads": info_ads_value if status == "active" else None,
-                        "information_ads_date": info_ads_date_value if status == "active" else None,
-                        "location": location_value if status == "active" else None,
-                        "price": price_value if status == "active" else None,
-                        "year": year_value if status == "active" else None,
-                        "mileage": mileage_value if status == "active" else None,
-                        "transmission": transmission_value if status == "active" else None,
-                        "seat_capacity": seat_capacity_value if status == "active" else None,
-                        "engine_cc": engine_cc_value if status == "active" else None,
-                        "fuel_type": fuel_type_value if status == "active" else None,
-                        "series": None,
-                        "type": None,
-                        "carousel": carousel_value if status == "active" else None,
-                        "seller_notes": seller_notes_value if status == "active" else None,
-                        "specifications": specifications_value if status == "active" else None,
-                        "equipment": equipment_value if status == "active" else None,
-                        "images": images_value if status == "active" else None,
-                        "whatsapp_number": whatsapp_numbers_value if status == "active" else None,
-                        "contact_seller": contact_seller_value if status == "active" else None,
-                        "seller_name": seller_name_value if status == "active" else None,
-                        "error": None,
-                        "status": status,
-                    }
-
-                    if status != "active":
-                        results.append(result)
-                        if tracking_mode:
-                            sold_rows.append((result.get("listing_url"), listing_id_final))
-                            if len(sold_rows) >= batch_size:
-                                flush_sold_rows()
-                        continue
-
                 except Exception as exc:
-                    self.logger.warning("Error while scraping %s: %s", url, exc)
-                    result = {
-                        "listing_id": None,
-                        "listing_url": url,
-                        "condition": None,
-                        "brand": None,
-                        "model": None,
-                        "variant": None,
-                        "information_ads": None,
-                        "information_ads_date": None,
-                        "location": None,
-                        "price": None,
-                        "year": None,
-                        "mileage": None,
-                        "transmission": None,
-                        "seat_capacity": None,
-                        "engine_cc": None,
-                        "fuel_type": None,
-                        "series": None,
-                        "type": None,
-                        "carousel": None,
-                        "seller_notes": None,
-                        "specifications": None,
-                        "equipment": None,
-                        "images": None,
-                        "whatsapp_number": None,
-                        "contact_seller": None,
-                        "seller_name": None,
-                        "status": "active",
-                        "error": "error",
-                    }
+                    tracking_mode = bool(listing_id_by_url)
+                    if self._is_retryable_http_400_error(exc):
+                        base_profile = str(cfg.browser_kwargs.get("profile") or "carlist")
+                        retried = self._retry_http_400_with_new_session(
+                            url=url,
+                            listing_id=listing_id,
+                            tracking_mode=tracking_mode,
+                            base_profile=base_profile,
+                        )
+                        if retried is not None:
+                            result = retried
+                        else:
+                            self.logger.warning("Error while scraping %s: %s", url, exc)
+                            result = self._build_error_result(url)
+                    else:
+                        self.logger.warning("Error while scraping %s: %s", url, exc)
+                        result = self._build_error_result(url)
 
                 results.append(result)
 
                 row_listing_id = result.get("listing_id")
                 if row_listing_id and not result.get("error"):
                     status = str(result.get("status") or "active")
+                    if status != "active":
+                        if tracking_mode:
+                            sold_rows.append((result.get("listing_url"), str(row_listing_id)))
+                            if len(sold_rows) >= batch_size:
+                                flush_sold_rows()
+                        continue
                     if require_brand_model and status == "active":
                         if not has_text(result.get("brand")) or not has_text(result.get("model")):
                             result["skipped_upsert"] = True
