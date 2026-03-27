@@ -288,7 +288,13 @@ class CarlistCarsService:
                 )
 
             try:
-                return run({"url": url, "listing_id": listing_id})
+                result = run({"url": url, "listing_id": listing_id})
+                if result is not None:
+                    return result
+                if retry_index < max_retries:
+                    self.logger.warning("Retry session %s returned no result for %s; trying next proxy/profile.", retry_index, url)
+                    continue
+                return None
             except Exception as exc:
                 if self._is_retryable_http_400_error(exc) and retry_index < max_retries:
                     self.logger.warning("Browser error retry %s still failed for %s: %s", retry_index, url, exc)
@@ -346,7 +352,13 @@ class CarlistCarsService:
                 return self._extract_listing_urls_botasaurus(driver)
 
             try:
-                return run({"url": url, "max_pages": max_pages})
+                links = run({"url": url, "max_pages": max_pages})
+                if links is not None:
+                    return links
+                if retry_index < max_retries:
+                    self.logger.warning("Listing retry session %s returned no result for %s; trying next proxy/profile.", retry_index, url)
+                    continue
+                return None
             except Exception as exc:
                 if self._is_retryable_http_400_error(exc) and retry_index < max_retries:
                     self.logger.warning("Listing retry %s still failed for %s: %s", retry_index, url, exc)
