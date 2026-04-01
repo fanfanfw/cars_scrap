@@ -39,7 +39,11 @@ def scrape_carlist_cars_details():
     try:
         if not links:
             links = scraper.scrape_all_from_main(start_url=start_url, max_pages=max_pages)
-        details = scraper.scrape_listing_details(links)
+        details = scraper.scrape_listing_details_with_run_retries(
+            links,
+            allow_revive_sold=True,
+            require_brand_model=True,
+        )
         return jsonify({"count": len(details), "sample": details[:50], "stored_to_db": True}), 200
     finally:
         scraper.close()
@@ -54,4 +58,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

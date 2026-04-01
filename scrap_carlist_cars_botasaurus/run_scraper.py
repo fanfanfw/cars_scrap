@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import time
 from datetime import datetime
 
 from dotenv import load_dotenv
 
-from cars_scrap_common.proxy_utils import reset_cached_proxy
 from cars_scrap_common.duration_utils import cutoff_date
 from scrap_carlist_cars_botasaurus.carlist_service import CarlistCarsService
 
@@ -124,126 +121,6 @@ def main() -> None:
                 "skip_reasons": skip_reasons,
             }
 
-        def build_error_placeholder(url: str, listing_id: str | None = None) -> dict:
-            return {
-                "listing_id": listing_id,
-                "listing_url": url,
-                "condition": None,
-                "brand": None,
-                "model": None,
-                "variant": None,
-                "information_ads": None,
-                "information_ads_date": None,
-                "location": None,
-                "price": None,
-                "year": None,
-                "mileage": None,
-                "transmission": None,
-                "seat_capacity": None,
-                "engine_cc": None,
-                "fuel_type": None,
-                "series": None,
-                "type": None,
-                "carousel": None,
-                "seller_notes": None,
-                "specifications": None,
-                "equipment": None,
-                "images": None,
-                "whatsapp_number": None,
-                "contact_seller": None,
-                "seller_name": None,
-                "status": "active",
-                "error": "error",
-            }
-
-        def scrape_details_with_run_retries(
-            urls: list[str],
-            *,
-            listing_id_by_url: dict[str, str] | None = None,
-            allow_revive_sold: bool = False,
-            require_brand_model: bool = False,
-        ) -> list[dict]:
-            original_urls = [str(url or "").strip() for url in urls if str(url or "").strip()]
-            if not original_urls:
-                return []
-
-            try:
-                max_attempts = max(1, int((os.getenv("CARLIST_RUN_MAX_ATTEMPTS") or "1").strip()))
-            except Exception:
-                max_attempts = 1
-            try:
-                retry_wait_seconds = max(0.0, float((os.getenv("CARLIST_RUN_RETRY_WAIT_SECONDS") or "5").strip()))
-            except Exception:
-                retry_wait_seconds = 5.0
-
-            initial_profile = (os.getenv("BOTASAURUS_PROFILE") or "").strip()
-            results_by_url: dict[str, dict] = {}
-            pending_urls = list(original_urls)
-
-            for attempt in range(1, max_attempts + 1):
-                if not pending_urls:
-                    break
-
-                previous_profile = os.getenv("BOTASAURUS_PROFILE")
-                retry_profile = None
-                if attempt > 1:
-                    base_profile = initial_profile or "carlist"
-                    retry_profile = f"{base_profile}_run_r{attempt}_{str(time.time_ns())[-8:]}"
-                    os.environ["BOTASAURUS_PROFILE"] = retry_profile
-                    scraper._logged_proxy_ip = False
-                    scraper.logger.warning(
-                        "Retrying carlist run for %s error listing(s). attempt=%s/%s profile=%s",
-                        len(pending_urls),
-                        attempt,
-                        max_attempts,
-                        retry_profile,
-                    )
-
-                try:
-                    reset_cached_proxy()
-                    subset_map = None
-                    if listing_id_by_url:
-                        subset_map = {url: listing_id_by_url[url] for url in pending_urls if url in listing_id_by_url}
-
-                    attempt_results = scraper.scrape_listing_details(
-                        pending_urls,
-                        listing_id_by_url=subset_map,
-                        allow_revive_sold=allow_revive_sold,
-                        require_brand_model=require_brand_model,
-                    )
-                finally:
-                    reset_cached_proxy()
-                    if previous_profile is None:
-                        os.environ.pop("BOTASAURUS_PROFILE", None)
-                    else:
-                        os.environ["BOTASAURUS_PROFILE"] = previous_profile
-
-                indexed_results: dict[str, dict] = {}
-                for row in attempt_results or []:
-                    item = row or {}
-                    url = str(item.get("listing_url") or "").strip()
-                    if url:
-                        indexed_results[url] = item
-
-                next_pending: list[str] = []
-                for url in pending_urls:
-                    row = indexed_results.get(url)
-                    if row is None:
-                        row = build_error_placeholder(url, listing_id_by_url.get(url) if listing_id_by_url else None)
-                    results_by_url[url] = row
-                    if row.get("error"):
-                        next_pending.append(url)
-
-                pending_urls = next_pending
-                if pending_urls and attempt < max_attempts and retry_wait_seconds:
-                    time.sleep(retry_wait_seconds)
-
-            for url in original_urls:
-                if url not in results_by_url:
-                    results_by_url[url] = build_error_placeholder(url, listing_id_by_url.get(url) if listing_id_by_url else None)
-
-            return [results_by_url[url] for url in original_urls]
-
         if args.track_older_than:
             if args.details:
                 raise ValueError("--details cannot be used with --track-older-than (tracking always scrapes details).")
@@ -327,7 +204,7 @@ def main() -> None:
                 print(json.dumps(summary, indent=2, default=str))
                 return
 
-            results = scrape_details_with_run_retries(links, listing_id_by_url=listing_id_by_url)
+            results = scraper.scrape_listing_details_with_run_retries(links, listing_id_by_url=listing_id_by_url)
             metrics = summarize_results(results)
             print(
                 json.dumps(
@@ -358,7 +235,7 @@ def main() -> None:
             if not url:
                 raise ValueError("--debug-detail-url is empty")
 
-            details = scrape_details_with_run_retries(
+            details = scraper.scrape_listing_details_with_run_retries(
                 [url],
                 allow_revive_sold=True,
                 require_brand_model=True,
@@ -409,7 +286,7 @@ def main() -> None:
 
         links = scraper.scrape_all_from_main(start_url=args.start_url, max_pages=args.max_pages)
         if args.details:
-            details = scrape_details_with_run_retries(
+            details = scraper.scrape_listing_details_with_run_retries(
                 links,
                 allow_revive_sold=True,
                 require_brand_model=True,

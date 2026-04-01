@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -64,6 +65,24 @@ class CarlistCarsService:
         self._logged_listing_id_meta_mismatch = False
         self.listing_url = os.getenv("CARLIST_CARS_LISTING_URL", "").strip()
 
+    def _env_int(self, key: str, default: int, *, minimum: int | None = None) -> int:
+        try:
+            value = int((os.getenv(key) or str(default)).strip())
+        except Exception:
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
+
+    def _env_float(self, key: str, default: float, *, minimum: float | None = None) -> float:
+        try:
+            value = float((os.getenv(key) or str(default)).strip())
+        except Exception:
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
+
     def _normalize_engine_cc(self, value: str | None) -> str | None:
         if not value:
             return None
@@ -89,6 +108,23 @@ class CarlistCarsService:
                 text = ""
         haystack = f"{title}\n{text}".lower()
         return any(token in haystack for token in tokens)
+
+    def _get_page_title_botasaurus(self, driver) -> str:
+        try:
+            title = driver.run_js("return (document.title || '').trim();")
+        except Exception:
+            title = ""
+        return str(title or "").strip()
+
+    def _get_page_text_botasaurus(self, driver) -> str:
+        try:
+            text = driver.run_js("return ((document.body && document.body.innerText) || '').trim();")
+        except Exception:
+            try:
+                text = str(driver.page_html or "")
+            except Exception:
+                text = ""
+        return str(text or "").strip()
 
     def _text_by_xpath_botasaurus(self, driver, xpath: str) -> str | None:
         try:
@@ -150,6 +186,58 @@ class CarlistCarsService:
             ),
         )
 
+    def _is_soft_block_page_botasaurus(self, driver) -> bool:
+        return self._page_has_tokens_botasaurus(
+            driver,
+            (
+                "verify you are human",
+                "press and hold",
+                "checking if the site connection is secure",
+                "complete the security check",
+                "enable javascript and cookies to continue",
+                "access denied",
+                "your request has been blocked",
+                "request blocked",
+                "temporarily unavailable",
+                "unusual traffic",
+                "captcha",
+            ),
+        )
+
+    def _save_debug_capture_botasaurus(self, driver, *, slug: str, reason: str, url: str) -> None:
+        try:
+            from botasaurus import bt
+
+            out_dir = "botasaurus_test/output/carlist_debug"
+            os.makedirs(out_dir, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_slug = re.sub(r"[^a-z0-9_.-]+", "_", str(slug or "page").lower()).strip("_") or "page"
+            base_path = os.path.join(out_dir, f"{timestamp}_{safe_slug}")
+
+            html = ""
+            try:
+                html = str(driver.page_html or "")
+            except Exception:
+                html = ""
+            if html:
+                bt.write_html(html, base_path)
+
+            snapshot = {
+                "captured_at": datetime.now().isoformat(),
+                "reason": reason,
+                "target_url": url,
+                "current_url": str(getattr(driver, "current_url", "") or ""),
+                "title": self._get_page_title_botasaurus(driver),
+                "text_excerpt": self._get_page_text_botasaurus(driver)[:4000],
+            }
+            with open(f"{base_path}.json", "w", encoding="utf-8") as fh:
+                json.dump(snapshot, fh, indent=2, ensure_ascii=False)
+
+            self.logger.warning("Saved carlist debug capture: %s.html and %s.json", base_path, base_path)
+        except Exception as exc:
+            self.logger.warning("Failed to save carlist debug capture for %s: %s", url, exc)
+
     def close(self) -> None:
         return
 
@@ -183,9 +271,17 @@ class CarlistCarsService:
             return numeric
         return sha1(url.encode("utf-8")).hexdigest()[:16]
 
-    def _build_error_result(self, url: str) -> dict:
+    def _build_error_result(
+        self,
+        url: str,
+        *,
+        listing_id: str | None = None,
+        error: str = "error",
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> dict:
         return {
-            "listing_id": None,
+            "listing_id": listing_id,
             "listing_url": url,
             "condition": None,
             "brand": None,
@@ -212,12 +308,21 @@ class CarlistCarsService:
             "contact_seller": None,
             "seller_name": None,
             "status": "active",
-            "error": "error",
+            "error": error,
+            "error_type": error_type,
+            "error_message": error_message,
         }
 
     def _is_retryable_http_400_error(self, exc: Exception) -> bool:
         text = str(exc or "").strip().lower()
-        return "retryable error page while scraping carlist" in text
+        return any(
+            token in text
+            for token in (
+                "retryable error page while scraping carlist",
+                "retryable soft block page while scraping carlist",
+                "blocked while scraping carlist",
+            )
+        )
 
     def _build_retry_cfg_for_http_400(self, *, base_profile: str, retry_index: int, listing_key: str):
         previous_profile = os.getenv("BOTASAURUS_PROFILE")
@@ -238,6 +343,120 @@ class CarlistCarsService:
 
         return cfg
 
+    def _classify_retryable_browser_error(self, exc: Exception | None) -> str:
+        text = str(exc or "").strip().lower()
+        if "soft block" in text:
+            return "soft_block"
+        if "blocked while scraping carlist" in text:
+            return "blocked"
+        return "browser_error"
+
+    def _scrape_detail_with_same_session_retries(
+        self,
+        driver,
+        *,
+        url: str,
+        cfg,
+        listing_id: str | None,
+        tracking_mode: bool,
+    ) -> dict:
+        sticky_retries = self._env_int("CARLIST_STICKY_BROWSER_RETRIES", 1, minimum=0)
+        retry_wait_seconds = self._env_float("CARLIST_STICKY_BROWSER_RETRY_WAIT_SECONDS", 2.5, minimum=0.0)
+        max_attempts = sticky_retries + 1
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                self.logger.warning(
+                    "Retrying carlist detail in same session. retry=%s/%s url=%s",
+                    attempt - 1,
+                    sticky_retries,
+                    url,
+                )
+                if retry_wait_seconds:
+                    time.sleep(retry_wait_seconds)
+            try:
+                return self._scrape_single_detail_botasaurus(
+                    driver,
+                    url=url,
+                    cfg=cfg,
+                    listing_id=listing_id,
+                    tracking_mode=tracking_mode,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if self._is_retryable_http_400_error(exc) and attempt < max_attempts:
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Failed to scrape detail for {url}")
+
+    def _load_listing_urls_with_same_session_retries(self, driver, *, url: str, cfg) -> list[str]:
+        sticky_retries = self._env_int("CARLIST_STICKY_BROWSER_RETRIES", 1, minimum=0)
+        retry_wait_seconds = self._env_float("CARLIST_STICKY_BROWSER_RETRY_WAIT_SECONDS", 2.5, minimum=0.0)
+        max_attempts = sticky_retries + 1
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                self.logger.warning(
+                    "Retrying carlist listing in same session. retry=%s/%s url=%s",
+                    attempt - 1,
+                    sticky_retries,
+                    url,
+                )
+                if retry_wait_seconds:
+                    time.sleep(retry_wait_seconds)
+
+            self._navigate_botasaurus(driver, url, cfg)
+            time.sleep(max(0.0, cfg.listing_wait_seconds))
+
+            current_url = str(getattr(driver, "current_url", "") or "")
+            if self._is_http_error_page_botasaurus(driver):
+                last_exc = RuntimeError(
+                    f"Retryable error page while scraping carlist listing: current_url={current_url!r}"
+                )
+                if attempt < max_attempts:
+                    continue
+                raise last_exc
+
+            if self._is_soft_block_page_botasaurus(driver):
+                self._save_debug_capture_botasaurus(
+                    driver,
+                    slug="carlist_listing_soft_block",
+                    reason="soft_block",
+                    url=url,
+                )
+                last_exc = RuntimeError(
+                    f"Retryable soft block page while scraping carlist listing: current_url={current_url!r}"
+                )
+                if attempt < max_attempts:
+                    continue
+                raise last_exc
+
+            urls = self._extract_listing_urls_botasaurus(driver)
+            if urls:
+                return urls
+
+            self._save_debug_capture_botasaurus(
+                driver,
+                slug="carlist_listing_empty",
+                reason="no_listing_links",
+                url=url,
+            )
+            last_exc = RuntimeError(
+                f"Retryable soft block page while scraping carlist listing: current_url={current_url!r} reason='no_listing_links'"
+            )
+            if attempt < max_attempts:
+                continue
+            raise last_exc
+
+        if last_exc is not None:
+            raise last_exc
+        return []
+
     def _retry_http_400_with_new_session(
         self,
         *,
@@ -248,10 +467,7 @@ class CarlistCarsService:
     ) -> dict | None:
         if not env_bool("CARLIST_HTTP_400_RETRY_ENABLED", True):
             return None
-        try:
-            max_retries = max(1, int((os.getenv("CARLIST_HTTP_400_MAX_RETRIES") or "2").strip()))
-        except Exception:
-            max_retries = 2
+        max_retries = self._env_int("CARLIST_HTTP_400_MAX_RETRIES", 2, minimum=1)
 
         from botasaurus.browser import Driver, browser
 
@@ -313,10 +529,7 @@ class CarlistCarsService:
     ) -> list[str] | None:
         if not env_bool("CARLIST_HTTP_400_RETRY_ENABLED", True):
             return None
-        try:
-            max_retries = max(1, int((os.getenv("CARLIST_HTTP_400_MAX_RETRIES") or "2").strip()))
-        except Exception:
-            max_retries = 2
+        max_retries = self._env_int("CARLIST_HTTP_400_MAX_RETRIES", 2, minimum=1)
 
         from botasaurus.browser import Driver, browser
 
@@ -344,12 +557,7 @@ class CarlistCarsService:
                         pass
 
                 self.logger.info("Navigating (botasaurus retry): %s", data["url"])
-                self._navigate_botasaurus(driver, data["url"], cfg)
-                time.sleep(max(0.0, cfg.listing_wait_seconds))
-                if self._is_http_error_page_botasaurus(driver):
-                    current_url = str(getattr(driver, "current_url", "") or "")
-                    raise RuntimeError(f"Retryable error page while scraping carlist listing: current_url={current_url!r}")
-                return self._extract_listing_urls_botasaurus(driver)
+                return self._load_listing_urls_with_same_session_retries(driver, url=data["url"], cfg=cfg)
 
             try:
                 links = run({"url": url, "max_pages": max_pages})
@@ -1637,25 +1845,7 @@ class CarlistCarsService:
                     pass
 
             self.logger.info("Navigating (botasaurus): %s", data["url"])
-            self._navigate_botasaurus(driver, data["url"], cfg)
-
-            time.sleep(max(0.0, cfg.listing_wait_seconds))
-            if self._is_http_error_page_botasaurus(driver):
-                current_url = str(getattr(driver, "current_url", "") or "")
-                raise RuntimeError(f"Retryable error page while scraping carlist listing: current_url={current_url!r}")
-            urls = self._extract_listing_urls_botasaurus(driver)
-            if not urls and cfg.save_html_on_empty:
-                try:
-                    from botasaurus import bt
-
-                    os.makedirs("botasaurus_test/output", exist_ok=True)
-                    bt.write_html(driver.page_html, "botasaurus_test/output/carlist_cars")
-                    self.logger.warning(
-                        "No listing links found; saved HTML to botasaurus_test/output/carlist_cars.html"
-                    )
-                except Exception as exc:
-                    self.logger.warning("Failed to save debug HTML: %s", exc)
-            return urls
+            return self._load_listing_urls_with_same_session_retries(driver, url=data["url"], cfg=cfg)
 
         try:
             links = run({"url": url, "max_pages": max_pages}) or []
@@ -1850,6 +2040,15 @@ class CarlistCarsService:
         cfg = load_botasaurus_config(service_name="carlist")
         self._maybe_log_proxy_and_ip(cfg)
 
+        circuit_breaker_enabled = env_bool("CARLIST_DETAIL_CIRCUIT_BREAKER_ENABLED", True)
+        circuit_breaker_min_samples = self._env_int("CARLIST_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES", 5, minimum=1)
+        circuit_breaker_error_rate = self._env_float("CARLIST_DETAIL_CIRCUIT_BREAKER_ERROR_RATE", 0.7, minimum=0.0)
+        circuit_breaker_consecutive_errors = self._env_int(
+            "CARLIST_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS",
+            4,
+            minimum=1,
+        )
+
         @browser(**cfg.browser_kwargs)
         def run(driver: Driver, data):
             if cfg.human_mode:
@@ -1859,6 +2058,9 @@ class CarlistCarsService:
                     pass
 
             results: list[dict] = []
+            processed_count = 0
+            retryable_browser_error_count = 0
+            consecutive_retryable_browser_errors = 0
             for idx, url in enumerate(data["links"], start=1):
                 if self.stop_flag:
                     break
@@ -1878,7 +2080,7 @@ class CarlistCarsService:
                 result = None
                 try:
                     tracking_mode = bool(listing_id_by_url)
-                    result = self._scrape_single_detail_botasaurus(
+                    result = self._scrape_detail_with_same_session_retries(
                         driver,
                         url=url,
                         cfg=cfg,
@@ -1899,12 +2101,48 @@ class CarlistCarsService:
                             result = retried
                         else:
                             self.logger.warning("Error while scraping %s: %s", url, exc)
-                            result = self._build_error_result(url)
+                            result = self._build_error_result(
+                                url,
+                                listing_id=listing_id,
+                                error_type=self._classify_retryable_browser_error(exc),
+                                error_message=str(exc),
+                            )
                     else:
                         self.logger.warning("Error while scraping %s: %s", url, exc)
-                        result = self._build_error_result(url)
+                        result = self._build_error_result(
+                            url,
+                            listing_id=listing_id,
+                            error_type="scrape_error",
+                            error_message=str(exc),
+                        )
 
                 results.append(result)
+                processed_count += 1
+
+                if result.get("error"):
+                    error_type = str(result.get("error_type") or "").strip().lower()
+                    if error_type in {"browser_error", "blocked", "soft_block"}:
+                        retryable_browser_error_count += 1
+                        consecutive_retryable_browser_errors += 1
+                    else:
+                        consecutive_retryable_browser_errors = 0
+                else:
+                    consecutive_retryable_browser_errors = 0
+
+                if circuit_breaker_enabled and processed_count >= circuit_breaker_min_samples:
+                    browser_error_rate = retryable_browser_error_count / processed_count if processed_count else 0.0
+                    if (
+                        browser_error_rate >= circuit_breaker_error_rate
+                        or consecutive_retryable_browser_errors >= circuit_breaker_consecutive_errors
+                    ):
+                        self.logger.warning(
+                            "Carlist detail circuit breaker tripped. processed=%s retryable_browser_errors=%s error_rate=%.2f consecutive=%s",
+                            processed_count,
+                            retryable_browser_error_count,
+                            browser_error_rate,
+                            consecutive_retryable_browser_errors,
+                        )
+                        break
 
                 row_listing_id = result.get("listing_id")
                 if row_listing_id and not result.get("error"):
@@ -1978,3 +2216,95 @@ class CarlistCarsService:
                 conn.close()
             except Exception:
                 pass
+
+    def scrape_listing_details_with_run_retries(
+        self,
+        links: list[str],
+        *,
+        listing_id_by_url: dict[str, str] | None = None,
+        allow_revive_sold: bool = False,
+        require_brand_model: bool = False,
+    ) -> list[dict]:
+        original_urls = [str(url or "").strip() for url in links if str(url or "").strip()]
+        if not original_urls:
+            return []
+
+        max_attempts = self._env_int("CARLIST_RUN_MAX_ATTEMPTS", 2, minimum=1)
+        retry_wait_seconds = self._env_float("CARLIST_RUN_RETRY_WAIT_SECONDS", 5.0, minimum=0.0)
+
+        initial_profile = (os.getenv("BOTASAURUS_PROFILE") or "").strip()
+        results_by_url: dict[str, dict] = {}
+        pending_urls = list(original_urls)
+
+        for attempt in range(1, max_attempts + 1):
+            if not pending_urls:
+                break
+
+            previous_profile = os.getenv("BOTASAURUS_PROFILE")
+            if attempt > 1:
+                base_profile = initial_profile or "carlist"
+                retry_profile = f"{base_profile}_run_r{attempt}_{str(time.time_ns())[-8:]}"
+                os.environ["BOTASAURUS_PROFILE"] = retry_profile
+                self._logged_proxy_ip = False
+                self.logger.warning(
+                    "Retrying carlist run for %s error listing(s). attempt=%s/%s profile=%s",
+                    len(pending_urls),
+                    attempt,
+                    max_attempts,
+                    retry_profile,
+                )
+
+            try:
+                reset_cached_proxy()
+                subset_map = None
+                if listing_id_by_url:
+                    subset_map = {url: listing_id_by_url[url] for url in pending_urls if url in listing_id_by_url}
+
+                attempt_results = self.scrape_listing_details(
+                    pending_urls,
+                    listing_id_by_url=subset_map,
+                    allow_revive_sold=allow_revive_sold,
+                    require_brand_model=require_brand_model,
+                )
+            finally:
+                reset_cached_proxy()
+                if previous_profile is None:
+                    os.environ.pop("BOTASAURUS_PROFILE", None)
+                else:
+                    os.environ["BOTASAURUS_PROFILE"] = previous_profile
+
+            indexed_results: dict[str, dict] = {}
+            for row in attempt_results or []:
+                item = row or {}
+                url = str(item.get("listing_url") or "").strip()
+                if url:
+                    indexed_results[url] = item
+
+            next_pending: list[str] = []
+            for url in pending_urls:
+                row = indexed_results.get(url)
+                if row is None:
+                    row = self._build_error_result(
+                        url,
+                        listing_id=listing_id_by_url.get(url) if listing_id_by_url else None,
+                        error_type="missing_result",
+                        error_message="missing_result_from_run",
+                    )
+                results_by_url[url] = row
+                if row.get("error"):
+                    next_pending.append(url)
+
+            pending_urls = next_pending
+            if pending_urls and attempt < max_attempts and retry_wait_seconds:
+                time.sleep(retry_wait_seconds)
+
+        for url in original_urls:
+            if url not in results_by_url:
+                results_by_url[url] = self._build_error_result(
+                    url,
+                    listing_id=listing_id_by_url.get(url) if listing_id_by_url else None,
+                    error_type="missing_result",
+                    error_message="missing_result_after_all_attempts",
+                )
+
+        return [results_by_url[url] for url in original_urls]

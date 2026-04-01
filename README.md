@@ -211,6 +211,24 @@ Catatan:
 - `CARLIST_CLOUDFLARE_MAX_ATTEMPTS`
 - `CARLIST_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
 
+### Retry dan proteksi tambahan khusus carlist
+
+- `CARLIST_STICKY_BROWSER_RETRIES`: retry di browser session yang sama sebelum ganti proxy/profile
+- `CARLIST_STICKY_BROWSER_RETRY_WAIT_SECONDS`
+- `CARLIST_HTTP_400_RETRY_ENABLED`
+- `CARLIST_HTTP_400_MAX_RETRIES`: retry dengan session/profile baru setelah sticky retry habis
+- `CARLIST_RUN_MAX_ATTEMPTS`: retry satu batch detail dengan profile baru jika banyak URL gagal
+- `CARLIST_RUN_RETRY_WAIT_SECONDS`
+- `CARLIST_DETAIL_CIRCUIT_BREAKER_ENABLED`
+- `CARLIST_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
+- `CARLIST_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
+- `CARLIST_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
+
+Catatan:
+
+- default `CARLIST_RUN_MAX_ATTEMPTS` sekarang `2`
+- saat halaman listing carlist kosong atau terlihat seperti soft-block, scraper akan menyimpan artefak debug ke `botasaurus_test/output/carlist_debug/`
+
 ## Menjalankan scraper via CLI
 
 ### A. Ambil listing links saja
