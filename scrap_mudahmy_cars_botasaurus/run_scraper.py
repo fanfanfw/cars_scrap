@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -15,6 +16,11 @@ load_dotenv(override=True)
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scrape car listings from mudah.my (Botasaurus)")
     parser.add_argument("--start-url", default=None, help="Override listing URL (optional)")
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Override BOTASAURUS_PROFILE only for this mudahmy process (example: mudahmy_scrape, mudahmy_track).",
+    )
     parser.add_argument("--max-pages", type=int, default=1, help="Max pages to visit (default: 1)")
     parser.add_argument("--details", action="store_true", help="Upsert minimal details into Postgres")
     parser.add_argument(
@@ -56,6 +62,9 @@ def main() -> None:
         help="Scrape 1 listing URL, upsert into Postgres, then print the inserted DB row as JSON",
     )
     args = parser.parse_args()
+
+    if args.profile:
+        os.environ["BOTASAURUS_PROFILE"] = str(args.profile).strip()
 
     scraper = MudahMyCarsService()
     try:

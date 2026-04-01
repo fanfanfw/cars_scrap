@@ -229,6 +229,49 @@ Catatan:
 - default `CARLIST_RUN_MAX_ATTEMPTS` sekarang `2`
 - saat halaman listing carlist kosong atau terlihat seperti soft-block, scraper akan menyimpan artefak debug ke `botasaurus_test/output/carlist_debug/`
 
+### Cleanup profile Botasaurus per job
+
+Jika profile base seperti `carlist_scrape`, `carlist_track`, `mudahmy_scrape`, atau `mudahmy_track` terlalu lama dipakai, cookie bisa menumpuk dan memicu error seperti `400 Request Header Or Cookie Too Large`.
+
+Script cleanup yang tersedia:
+
+```bash
+./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape --dry-run
+./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape
+```
+
+Catatan:
+
+- walau nama file script masih `cleanup_carlist_profiles.sh`, sekarang script ini bisa dipakai untuk prefix profile apa pun
+- script akan menghapus semua direktori profile dengan prefix yang sama, misalnya `carlist_scrape*` atau `mudahmy_track*`
+- jika profile sedang dipakai proses aktif, script akan skip kecuali dipanggil dengan `--force`
+- fallback prefix tetap bisa diambil dari `PROFILE_CLEANUP_PREFIX`, `CARLIST_PROFILE_CLEANUP_PREFIX`, atau `BOTASAURUS_PROFILE`
+
+Rekomendasi profile per job:
+
+- `mudahmy_scrape`
+- `mudahmy_track`
+- `carlist_scrape`
+- `carlist_track`
+
+Contoh cron dengan profile terpisah per job:
+
+```cron
+*/15 * * * * flock -n /tmp/cars_scrap_mudahmy_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && uv run scrape-mudahmy --details --profile mudahmy_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy.log 2>&1
+*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && DB_BATCH_SIZE=1 uv run scrape-mudahmy --track-older-than 2m --track-last-scraped-older-than 1d --track-limit 15 --profile mudahmy_track' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_track.log 2>&1
+*/15 * * * * flock -n /tmp/cars_scrap_carlist_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && uv run scrape-carlist --details --profile carlist_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist.log 2>&1
+*/5 * * * * flock -n /tmp/cars_scrap_carlist_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && DB_BATCH_SIZE=1 uv run scrape-carlist --track-older-than 3m --track-last-scraped-older-than 1d --track-limit 15 --profile carlist_track' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist_track.log 2>&1
+```
+
+Contoh cron cleanup per job tiap 1 menit:
+
+```cron
+* * * * * flock -n /tmp/cars_scrap_mudahmy_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix mudahmy_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_scrape_cleanup.log 2>&1
+* * * * * flock -n /tmp/cars_scrap_mudahmy_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix mudahmy_track' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_track_cleanup.log 2>&1
+* * * * * flock -n /tmp/cars_scrap_carlist_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist_scrape_cleanup.log 2>&1
+* * * * * flock -n /tmp/cars_scrap_carlist_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix carlist_track' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist_track_cleanup.log 2>&1
+```
+
 ## Menjalankan scraper via CLI
 
 ### A. Ambil listing links saja
