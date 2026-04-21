@@ -169,7 +169,7 @@ def main() -> None:
                 SELECT listing_id, listing_url
                 FROM cars_scrap_carlistmy
                 WHERE {where_joiner.join(where)}
-                ORDER BY information_ads_date ASC
+                ORDER BY last_scraped_at ASC, information_ads_date ASC
                 """
                 if limit:
                     sql += " LIMIT %s"

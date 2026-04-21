@@ -324,6 +324,7 @@ Catatan:
 ### C. Re-scrape data lama dari DB (tracking mode)
 
 Tracking mode membaca listing `active` dari DB, lalu scrape ulang detail listing berdasarkan cutoff umur iklan.
+Urutan proses memprioritaskan `last_scraped_at` yang paling lama, lalu `information_ads_date` yang paling lama sebagai tie-breaker.
 
 Contoh dasar:
 
