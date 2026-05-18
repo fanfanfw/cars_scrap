@@ -701,6 +701,23 @@ class Mobil123CarsService(CarlistCarsService):
         except Exception:
             return None
 
+    def _extract_mileage_from_bold_span_botasaurus(self, driver) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const mileageRe = /\b\d[\d.,\s]*(?:-\s*\d[\d.,\s]*k?)?\s*km\b/i;
+                const nodes = Array.from(document.querySelectorAll('span.u-text-bold.u-block, span.u-text-bold, .u-text-bold'));
+                for (const el of nodes) {
+                  const text = norm(el.textContent || el.innerText);
+                  if (text && mileageRe.test(text)) return text;
+                }
+                return null;
+                """
+            )
+        except Exception:
+            return None
+
     def _extract_contact_seller_fallback_botasaurus(self, driver) -> str | None:
         try:
             return driver.run_js(
@@ -1312,6 +1329,7 @@ class Mobil123CarsService(CarlistCarsService):
         mileage_raw = (
             self._get_text_by_xpath_botasaurus(driver, carlist_base.MILEAGE_XPATH)
             or key_details_fields.get("mileage")
+            or self._extract_mileage_from_bold_span_botasaurus(driver)
             or self._extract_text_by_nearby_label_botasaurus(driver, ("mileage", "kilometer", "kilometres", "kilometers"))
         )
         mileage_value = self._parse_mileage(mileage_raw)
