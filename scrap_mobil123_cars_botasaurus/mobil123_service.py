@@ -589,6 +589,13 @@ class Mobil123CarsService(CarlistCarsService):
         except Exception:
             return 0
 
+    def _parse_first_mileage(self, *values: str | None) -> int:
+        for value in values:
+            parsed = self._parse_mileage(value)
+            if parsed > 0:
+                return parsed
+        return 0
+
     def _normalize_seat_capacity(self, value: str | None) -> str | None:
         text = str(value or "").strip()
         if not text:
@@ -1326,13 +1333,12 @@ class Mobil123CarsService(CarlistCarsService):
             self._get_attr_by_xpath_botasaurus(driver, carlist_base.YEAR_META_XPATH, "content")
         )
         key_details_fields = self._extract_key_details_dict_botasaurus(driver)
-        mileage_raw = (
-            self._get_text_by_xpath_botasaurus(driver, carlist_base.MILEAGE_XPATH)
-            or key_details_fields.get("mileage")
-            or self._extract_mileage_from_bold_span_botasaurus(driver)
-            or self._extract_text_by_nearby_label_botasaurus(driver, ("mileage", "kilometer", "kilometres", "kilometers"))
+        mileage_value = self._parse_first_mileage(
+            self._get_text_by_xpath_botasaurus(driver, carlist_base.MILEAGE_XPATH),
+            key_details_fields.get("mileage"),
+            self._extract_mileage_from_bold_span_botasaurus(driver),
+            self._extract_text_by_nearby_label_botasaurus(driver, ("mileage", "kilometer", "kilometres", "kilometers")),
         )
-        mileage_value = self._parse_mileage(mileage_raw)
         transmission_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.TRANSMISSION_META_XPATH, "content")
         seat_capacity_value = self._normalize_seat_capacity(
             self._get_text_by_xpath_botasaurus(driver, carlist_base.SEAT_CAPACITY_XPATH)
@@ -1422,7 +1428,7 @@ class Mobil123CarsService(CarlistCarsService):
             )
             flat_specifications = self._flatten_grouped_kv(specifications_value)
             if not mileage_value:
-                mileage_value = self._parse_mileage(
+                mileage_value = self._parse_first_mileage(
                     self._pick_field(flat_specifications, ("mileage", "kilometer", "kilometers", "kilometres"))
                 )
             if not seat_capacity_value:
