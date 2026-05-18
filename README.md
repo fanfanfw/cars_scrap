@@ -1,9 +1,10 @@
 # cars_scrap
 
-Repo scraping listing mobil untuk dua source:
+Repo scraping listing mobil untuk tiga source:
 
 - `mudah.my`
 - `carlist.my`
+- `mobil123.com`
 
 Project ini memakai:
 
@@ -22,7 +23,7 @@ Secara umum ada dua mode utama:
 1. Scrape halaman listing untuk mengumpulkan `listing_url`.
 2. Scrape halaman detail untuk mengambil data lengkap lalu `upsert` ke PostgreSQL.
 
-Kedua source (`mudah.my` dan `carlist.my`) punya pola yang sama:
+Ketiga source (`mudah.my`, `carlist.my`, dan `mobil123.com`) punya pola yang sama:
 
 - service class untuk logic scraping
 - CLI entrypoint untuk eksekusi manual
@@ -46,6 +47,11 @@ Tracking/re-scrape juga tersedia. Mode ini membaca data `active` dari database, 
 │   ├── database.py
 │   ├── carlist_service.py
 │   └── run_scraper.py
+├── scrap_mobil123_cars_botasaurus/      # scraper mobil123.com
+│   ├── app.py
+│   ├── database.py
+│   ├── mobil123_service.py
+│   └── run_scraper.py
 ├── sql/                                 # schema tabel dan price history trigger
 ├── scripts/                             # script migrasi dari DB lama
 ├── profiles/                            # profile Botasaurus + state proxy rotation
@@ -60,8 +66,10 @@ Script berikut didefinisikan di `pyproject.toml`:
 
 - `uv run scrape-mudahmy`
 - `uv run scrape-carlist`
+- `uv run scrape-mobil123`
 - `uv run serve-mudahmy`
 - `uv run serve-carlist`
+- `uv run serve-mobil123`
 
 ## Setup lokal
 
@@ -78,6 +86,7 @@ Lalu isi minimal:
 - `DB_PASSWORD`
 - opsional `MUDAHMY_CARS_LISTING_URL`
 - opsional `CARLIST_CARS_LISTING_URL`
+- opsional `MOBIL123_CARS_LISTING_URL`
 
 ### 2. Install dependency
 
@@ -94,7 +103,7 @@ source .venv/bin/activate
 
 ## Setup PostgreSQL
 
-Project ini menyimpan data ke 6 tabel:
+Project ini menyimpan data ke 9 tabel:
 
 - `cars_scrap_mudahmy`
 - `cars_scrap_mudahmy_details`
@@ -102,6 +111,9 @@ Project ini menyimpan data ke 6 tabel:
 - `cars_scrap_carlistmy`
 - `cars_scrap_carlistmy_details`
 - `price_history_scrap_carlistmy`
+- `cars_scrap_mobil123`
+- `cars_scrap_mobil123_details`
+- `price_history_scrap_mobil123`
 
 File SQL yang tersedia:
 
@@ -111,6 +123,9 @@ File SQL yang tersedia:
 - `sql/cars_scrap_carlist.sql`
 - `sql/cars_scrap_carlistmy_details.sql`
 - `sql/price_history_scrap_carlist.sql`
+- `sql/cars_scrap_mobil123.sql`
+- `sql/cars_scrap_mobil123_details.sql`
+- `sql/price_history_scrap_mobil123.sql`
 
 Contoh bootstrap schema:
 
@@ -124,6 +139,10 @@ psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_histor
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carlist.sql
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carlistmy_details.sql
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_carlist.sql
+
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mobil123.sql
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mobil123_details.sql
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_mobil123.sql
 ```
 
 Catatan:
@@ -140,6 +159,7 @@ Berikut variabel penting dari `.env.example`.
 
 - `MUDAHMY_CARS_LISTING_URL`: default URL listing mudah.my, bisa dioverride lewat `--start-url` atau body HTTP request
 - `CARLIST_CARS_LISTING_URL`: default URL listing carlist.my, bisa dioverride lewat `--start-url` atau body HTTP request
+- `MOBIL123_CARS_LISTING_URL`: default URL listing mobil123.com, bisa dioverride lewat `--start-url` atau body HTTP request
 
 ### Database
 
@@ -154,6 +174,7 @@ Catatan kompatibilitas:
 
 - scraper mudah.my juga menerima fallback `DB_NAME_MUDAH_CARS`
 - scraper carlist juga menerima fallback `DB_NAME_CARLIST_CARS`
+- scraper mobil123.com juga menerima fallback `DB_NAME_MOBIL123_CARS`
 
 ### Logging dan Flask
 
@@ -166,6 +187,7 @@ Default port:
 
 - `serve-mudahmy` -> `5201`
 - `serve-carlist` -> `5202`
+- `serve-mobil123` -> `5203`
 
 ### Botasaurus runtime
 
@@ -205,13 +227,16 @@ Catatan:
 - format yang didukung: URL penuh, `HOST:PORT`, atau `HOST:PORT:USER:PASS`
 - jika lebih dari satu proxy diberikan, repo ini melakukan rotasi round-robin dan menyimpan state di `profiles/proxy_state.json`
 
-### Cloudflare fallback khusus carlist
+### Cloudflare fallback khusus carlist dan mobil123
 
 - `CARLIST_AUTO_ATTEMPT_CLOUDFLARE`
 - `CARLIST_CLOUDFLARE_MAX_ATTEMPTS`
 - `CARLIST_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
+- `MOBIL123_AUTO_ATTEMPT_CLOUDFLARE`
+- `MOBIL123_CLOUDFLARE_MAX_ATTEMPTS`
+- `MOBIL123_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
 
-### Retry dan proteksi tambahan khusus carlist
+### Retry dan proteksi tambahan khusus carlist dan mobil123
 
 - `CARLIST_STICKY_BROWSER_RETRIES`: retry di browser session yang sama sebelum ganti proxy/profile
 - `CARLIST_STICKY_BROWSER_RETRY_WAIT_SECONDS`
@@ -223,11 +248,21 @@ Catatan:
 - `CARLIST_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
 - `CARLIST_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
 - `CARLIST_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
+- `MOBIL123_STICKY_BROWSER_RETRIES`
+- `MOBIL123_STICKY_BROWSER_RETRY_WAIT_SECONDS`
+- `MOBIL123_HTTP_400_RETRY_ENABLED`
+- `MOBIL123_HTTP_400_MAX_RETRIES`
+- `MOBIL123_RUN_MAX_ATTEMPTS`
+- `MOBIL123_RUN_RETRY_WAIT_SECONDS`
+- `MOBIL123_DETAIL_CIRCUIT_BREAKER_ENABLED`
+- `MOBIL123_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
+- `MOBIL123_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
+- `MOBIL123_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
 
 Catatan:
 
-- default `CARLIST_RUN_MAX_ATTEMPTS` sekarang `2`
-- saat halaman listing carlist kosong atau terlihat seperti soft-block, scraper akan menyimpan artefak debug ke `botasaurus_test/output/carlist_debug/`
+- default `CARLIST_RUN_MAX_ATTEMPTS` dan `MOBIL123_RUN_MAX_ATTEMPTS` sekarang `2`
+- saat halaman listing carlist atau mobil123 kosong/terlihat seperti soft-block, scraper akan menyimpan artefak debug ke `botasaurus_test/output/*_debug/`
 
 ### Cleanup profile Botasaurus per job
 
@@ -253,6 +288,8 @@ Rekomendasi profile per job:
 - `mudahmy_track`
 - `carlist_scrape`
 - `carlist_track`
+- `mobil123_scrape`
+- `mobil123_track`
 
 Contoh cron dengan profile terpisah per job:
 
@@ -281,6 +318,7 @@ Mode ini hanya mengembalikan daftar `listing_url`, belum menyimpan detail ke Pos
 ```bash
 uv run scrape-mudahmy --max-pages 1
 uv run scrape-carlist --max-pages 1
+uv run scrape-mobil123 --max-pages 1
 ```
 
 Override halaman awal:
@@ -288,6 +326,7 @@ Override halaman awal:
 ```bash
 uv run scrape-mudahmy --start-url "https://www.mudah.my/malaysia/cars-for-sale"
 uv run scrape-carlist --start-url "https://www.carlist.my/cars-for-sale/malaysia"
+uv run scrape-mobil123 --start-url "https://www.mobil123.com/mobil-bekas-dijual/indonesia?sort=modification_date_search.desc"
 ```
 
 ### B. Ambil detail dan simpan ke Postgres
@@ -303,6 +342,7 @@ Mode ini:
 ```bash
 uv run scrape-mudahmy --max-pages 1 --details
 uv run scrape-carlist --max-pages 1 --details
+uv run scrape-mobil123 --max-pages 1 --details
 ```
 
 Output CLI berupa JSON ringkasan seperti:
@@ -331,6 +371,7 @@ Contoh dasar:
 ```bash
 uv run scrape-mudahmy --track-older-than 1w
 uv run scrape-carlist --track-older-than 1w
+uv run scrape-mobil123 --track-older-than 1w
 ```
 
 Contoh dengan filter `last_scraped_at` supaya listing yang baru diproses tidak terkena lagi:
@@ -338,6 +379,7 @@ Contoh dengan filter `last_scraped_at` supaya listing yang baru diproses tidak t
 ```bash
 uv run scrape-mudahmy --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
 uv run scrape-carlist --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
+uv run scrape-mobil123 --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
 ```
 
 Mode hitung saja:
@@ -345,6 +387,7 @@ Mode hitung saja:
 ```bash
 uv run scrape-mudahmy --track-older-than 1w --track-count
 uv run scrape-carlist --track-older-than 1w --track-count
+uv run scrape-mobil123 --track-older-than 1w --track-count
 ```
 
 Mode preview tanpa scrape:
@@ -352,6 +395,7 @@ Mode preview tanpa scrape:
 ```bash
 uv run scrape-mudahmy --track-older-than 1w --track-dry-run
 uv run scrape-carlist --track-older-than 1w --track-dry-run
+uv run scrape-mobil123 --track-older-than 1w --track-dry-run
 ```
 
 Format durasi yang didukung:
@@ -379,6 +423,7 @@ Berguna untuk validasi parser satu halaman detail. Command ini:
 ```bash
 uv run scrape-mudahmy --debug-detail-url "https://www.mudah.my/view?ad_id=..."
 uv run scrape-carlist --debug-detail-url "https://www.carlist.my/used-cars/..."
+uv run scrape-mobil123 --debug-detail-url "https://www.mobil123.com/..."
 ```
 
 ## Menjalankan HTTP service
@@ -457,6 +502,39 @@ curl -X POST http://localhost:5202/scrape/carlist-cars-details \
   -d '{"max_pages": 1}'
 ```
 
+### Mobil123 service
+
+Jalankan:
+
+```bash
+uv run serve-mobil123
+```
+
+Default:
+
+- host `0.0.0.0`
+- port `5203`
+
+Endpoint:
+
+- `GET /health`
+- `POST /scrape/mobil123-cars`
+- `POST /scrape/mobil123-cars-details`
+
+Contoh request:
+
+```bash
+curl http://localhost:5203/health
+
+curl -X POST http://localhost:5203/scrape/mobil123-cars \
+  -H "Content-Type: application/json" \
+  -d '{"max_pages": 1}'
+
+curl -X POST http://localhost:5203/scrape/mobil123-cars-details \
+  -H "Content-Type: application/json" \
+  -d '{"max_pages": 1}'
+```
+
 ## Migrasi data dari DB lama
 
 Repo ini menyediakan dua script migrasi:
@@ -515,7 +593,7 @@ Kalau scraping macet karena challenge browser:
 
 Cek:
 
-- `MUDAHMY_CARS_LISTING_URL` atau `CARLIST_CARS_LISTING_URL`
+- `MUDAHMY_CARS_LISTING_URL`, `CARLIST_CARS_LISTING_URL`, atau `MOBIL123_CARS_LISTING_URL`
 - timeout Botasaurus (`BOTASAURUS_LISTING_WAIT_SECONDS`, `BOTASAURUS_DETAIL_WAIT_SECONDS`)
 - `logs/` dan `error_logs/`
 
@@ -535,6 +613,8 @@ Command yang paling sering dipakai:
 uv sync
 uv run scrape-mudahmy --max-pages 1 --details
 uv run scrape-carlist --max-pages 1 --details
+uv run scrape-mobil123 --max-pages 1 --details
 uv run serve-mudahmy
 uv run serve-carlist
+uv run serve-mobil123
 ```
