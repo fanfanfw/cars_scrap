@@ -20,14 +20,40 @@ from cars_scrap_common.botasaurus_utils import (
 from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
 from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
-from scrap_carlist_cars_botasaurus import carlist_service as carlist_base
-from scrap_carlist_cars_botasaurus.carlist_service import CarlistCarsService
+from cars_scrap_common.shared_base_service import SharedBaseService
 from scrap_carmudi_cars_botasaurus.database import get_connection
 
 load_dotenv(override=True)
 
 DEFAULT_LISTING_URL = "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia?sort=modification_date_search.desc"
 WHATSAPP_PHONE_RE = re.compile(r"(?:wa\.me/|phone=|tel:)(\+?\d+)", re.IGNORECASE)
+
+LISTING_ID_META_XPATH = "/html/head/meta[47]"
+CONDITION_META_XPATH = "/html/head/meta[46]"
+BRAND_META_XPATH = "/html/head/meta[57]"
+MODEL_META_XPATH = "/html/head/meta[59]"
+VARIANT_META_XPATH = "/html/head/meta[60]"
+PRICE_META_XPATH = "/html/head/meta[55]"
+YEAR_META_XPATH = "/html/head/meta[61]"
+TRANSMISSION_META_XPATH = "/html/head/meta[62]"
+FUEL_TYPE_META_XPATH = "/html/head/meta[54]"
+
+INFORMATION_ADS_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/span"
+LOCATION_CONTAINER_XPATH = "/html/body/main/article/section/section[2]/div/div/div[2]/div[1]/div[1]/div/div/div"
+MILEAGE_XPATH = (
+    "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[3]/div/div/div/span[2]"
+)
+ENGINE_CC_XPATH = (
+    "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[5]/div/div/div/span[2]"
+)
+SEAT_CAPACITY_XPATH = (
+    "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[7]/div/div/div/span[2]"
+)
+IMAGES_CONTAINER_XPATH = "/html/body/main/article/section/section[4]/section[1]/div/div/div/div/div[1]/div/div[1]/div[1]"
+
+TAB_SELLER_NOTES_SELECTOR = "#tab-seller-notes"
+TAB_SPECIFICATIONS_SELECTOR = "#tab-specifications"
+TAB_EQUIPMENTS_SELECTOR = "#tab-equipments"
 
 DETAIL_TITLE_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/h1"
 DETAIL_PRICE_XPATH = "/html/body/main/article/section/section[1]/section[4]/div/div/div[1]/div[1]/div[2]/div/div[1]/h3"
@@ -40,7 +66,7 @@ DETAIL_SPECIFICATIONS_SELECTOR = "#tab-specifications"
 DETAIL_EQUIPMENTS_SELECTOR = "#tab-equipments"
 
 
-class CarmudiCarsService(CarlistCarsService):
+class CarmudiCarsService(SharedBaseService):
     def __init__(self):
         self.logger = setup_logger("scrape_carmudi_cars")
         self.stop_flag = False
@@ -703,12 +729,90 @@ class CarmudiCarsService(CarlistCarsService):
 
         return None
 
+    def _extract_legacy_location_botasaurus(self, driver) -> str | None:
+        try:
+            parts = driver.run_js(
+                """
+                const root = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!root) return [];
+                const texts = Array.from(root.querySelectorAll('span'))
+                  .map((el) => (el.innerText || el.textContent || '').trim())
+                  .filter(Boolean);
+                return texts;
+                """,
+                {"xpath": LOCATION_CONTAINER_XPATH},
+            )
+        except Exception:
+            parts = []
+
+        items = [p for p in (parts or []) if isinstance(p, str) and p.strip()]
+        if len(items) >= 3:
+            return f"{items[1]} - {items[2]}"
+        if len(items) >= 2:
+            return items[1]
+        return None
+
+    def _extract_legacy_images_botasaurus(self, driver) -> list[str] | None:
+        try:
+            urls = driver.run_js(
+                """
+                const isValid = (url) => /^https?:\/\//i.test(String(url || '').trim());
+                const root = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!root) return [];
+                const out = [];
+                const attrs = ['src', 'data-src', 'data-lazy', 'data-original'];
+                for (const img of Array.from(root.querySelectorAll('img'))) {
+                  for (const attr of attrs) {
+                    const v = img.getAttribute(attr);
+                    if (v && isValid(v)) out.push(v);
+                  }
+                  const srcset = img.getAttribute('srcset');
+                  if (srcset) {
+                    for (const part of srcset.split(',')) {
+                      const url = part.trim().split(' ')[0];
+                      if (url && isValid(url)) out.push(url);
+                    }
+                  }
+                }
+                return Array.from(new Set(out.filter(Boolean)));
+                """,
+                {"xpath": IMAGES_CONTAINER_XPATH},
+            )
+        except Exception:
+            urls = []
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for u in urls or []:
+            if not isinstance(u, str):
+                continue
+            url = u.strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            deduped.append(url)
+        return deduped or None
+
     def _extract_key_details_dict_botasaurus(self, driver) -> dict[str, str]:
-        data = carlist_base.CarlistCarsService._extract_carousel_dict_botasaurus(self, driver) or {}
+        data = self._extract_carousel_dict_botasaurus(driver) or {}
         return {str(key): str(value).strip() for key, value in data.items() if value is not None and str(value).strip()}
 
     def _extract_flat_tab_fields_botasaurus(self, driver, *, tab_selector: str) -> dict[str, str]:
-        grouped = carlist_base.CarlistCarsService._extract_tab_grouped_kv_botasaurus(self, driver, tab_selector=tab_selector)
+        grouped = self._extract_tab_grouped_kv_botasaurus(driver, tab_selector=tab_selector)
         return self._flatten_grouped_kv(grouped)
 
     def _extract_text_by_nearby_label_botasaurus(self, driver, labels: tuple[str, ...]) -> str | None:
@@ -821,8 +925,7 @@ class CarmudiCarsService(CarlistCarsService):
             return False
 
     def _extract_contact_seller_value_botasaurus(self, driver, *, listing_id: str) -> str | None:
-        value = carlist_base.CarlistCarsService._extract_contact_seller_botasaurus(
-            self,
+        value = self._extract_contact_seller_botasaurus(
             driver,
             listing_id=listing_id,
         )
@@ -839,9 +942,9 @@ class CarmudiCarsService(CarlistCarsService):
                 time.sleep(0.25)
                 value = self._extract_contact_seller_fallback_botasaurus(driver)
                 if value:
-                    carlist_base.CarlistCarsService._close_contact_seller_modal_botasaurus(self, driver)
+                    self._close_contact_seller_modal_botasaurus(driver)
                     return value
-            carlist_base.CarlistCarsService._close_contact_seller_modal_botasaurus(self, driver)
+            self._close_contact_seller_modal_botasaurus(driver)
 
         return None
 
@@ -1311,12 +1414,12 @@ class CarmudiCarsService(CarlistCarsService):
 
         wait_for_xpath(
             driver,
-            carlist_base.INFORMATION_ADS_XPATH,
+            INFORMATION_ADS_XPATH,
             timeout_seconds=cfg.detail_wait_seconds,
             poll_interval_seconds=cfg.poll_interval_seconds,
         )
 
-        listing_id_meta = self._get_attr_by_xpath_botasaurus(driver, carlist_base.LISTING_ID_META_XPATH, "content")
+        listing_id_meta = self._get_attr_by_xpath_botasaurus(driver, LISTING_ID_META_XPATH, "content")
         listing_id_from_url = (listing_id or self._extract_numeric_listing_id(url) or "").strip()
 
         listing_id_meta_numeric = None
@@ -1346,59 +1449,58 @@ class CarmudiCarsService(CarlistCarsService):
         if not listing_id_final:
             raise RuntimeError("Missing listing_id on page")
 
-        condition_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.CONDITION_META_XPATH, "content")
-        brand_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.BRAND_META_XPATH, "content")
-        model_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.MODEL_META_XPATH, "content")
-        variant_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.VARIANT_META_XPATH, "content")
+        condition_value = self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
+        brand_value = self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
+        model_value = self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
+        variant_value = self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
 
-        info_ads_value = self._get_text_by_xpath_botasaurus(driver, carlist_base.INFORMATION_ADS_XPATH)
+        info_ads_value = self._get_text_by_xpath_botasaurus(driver, INFORMATION_ADS_XPATH)
         info_ads_date_value = self._parse_information_ads_date(info_ads_value)
 
         location_value = (
-            carlist_base.CarlistCarsService._extract_location_botasaurus(self, driver)
+            self._extract_legacy_location_botasaurus(driver)
             or self._extract_location_botasaurus(driver)
         )
         price_value = self._parse_int_from_text(
-            self._get_attr_by_xpath_botasaurus(driver, carlist_base.PRICE_META_XPATH, "content")
+            self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content")
         )
         year_value = self._parse_int_from_text(
-            self._get_attr_by_xpath_botasaurus(driver, carlist_base.YEAR_META_XPATH, "content")
+            self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content")
         )
         key_details_fields = self._extract_key_details_dict_botasaurus(driver)
         mileage_value = self._parse_first_mileage(
-            self._get_text_by_xpath_botasaurus(driver, carlist_base.MILEAGE_XPATH),
+            self._get_text_by_xpath_botasaurus(driver, MILEAGE_XPATH),
             key_details_fields.get("mileage"),
             self._extract_mileage_from_bold_span_botasaurus(driver),
             self._extract_text_by_nearby_label_botasaurus(driver, ("mileage", "kilometer", "kilometres", "kilometers")),
         )
-        transmission_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.TRANSMISSION_META_XPATH, "content")
+        transmission_value = self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
         seat_capacity_value = self._normalize_seat_capacity(
-            self._get_text_by_xpath_botasaurus(driver, carlist_base.SEAT_CAPACITY_XPATH)
+            self._get_text_by_xpath_botasaurus(driver, SEAT_CAPACITY_XPATH)
             or key_details_fields.get("seat_capacity")
             or key_details_fields.get("seats")
             or self._extract_text_by_nearby_label_botasaurus(driver, ("seat capacity", "seats", "kursi"))
         )
         engine_cc_value = self._normalize_engine_cc(
-            self._get_text_by_xpath_botasaurus(driver, carlist_base.ENGINE_CC_XPATH)
+            self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH)
             or key_details_fields.get("engine_cc")
             or key_details_fields.get("engine_capacity")
             or self._extract_text_by_nearby_label_botasaurus(driver, ("engine cc", "engine capacity", "kapasitas mesin"))
         )
         fuel_type_value = (
-            self._get_attr_by_xpath_botasaurus(driver, carlist_base.FUEL_TYPE_META_XPATH, "content")
+            self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
             or key_details_fields.get("fuel_type")
             or key_details_fields.get("fuel")
             or self._extract_text_by_nearby_label_botasaurus(driver, ("fuel type", "fuel", "bahan bakar"))
         )
-        images_value = carlist_base.CarlistCarsService._extract_images_botasaurus(self, driver) or self._extract_images_botasaurus(driver)
-        whatsapp_numbers_value = carlist_base.CarlistCarsService._extract_whatsapp_numbers_botasaurus(
-            self,
+        images_value = self._extract_legacy_images_botasaurus(driver) or self._extract_images_botasaurus(driver)
+        whatsapp_numbers_value = self._extract_whatsapp_numbers_botasaurus(
             driver,
             listing_id=listing_id_final,
         )
         contact_seller_value = self._extract_contact_seller_value_botasaurus(driver, listing_id=listing_id_final)
         seller_name_value = (
-            carlist_base.CarlistCarsService._extract_seller_name_botasaurus(self, driver, listing_id=listing_id_final)
+            self._extract_seller_name_botasaurus(driver, listing_id=listing_id_final)
             or self._get_text_by_xpath_botasaurus(driver, DETAIL_SELLER_NAME_XPATH)
         )
 
@@ -1448,15 +1550,15 @@ class CarmudiCarsService(CarlistCarsService):
         if status == "active":
             carousel_value = self._extract_carousel_dict_botasaurus(driver)
 
-            if self._click_tab_by_href_botasaurus(driver, href=carlist_base.TAB_SELLER_NOTES_SELECTOR):
+            if self._click_tab_by_href_botasaurus(driver, href=TAB_SELLER_NOTES_SELECTOR):
                 time.sleep(0.2)
             seller_notes_value = self._extract_seller_notes_text_botasaurus(driver)
 
-            if self._click_tab_by_href_botasaurus(driver, href=carlist_base.TAB_SPECIFICATIONS_SELECTOR):
+            if self._click_tab_by_href_botasaurus(driver, href=TAB_SPECIFICATIONS_SELECTOR):
                 time.sleep(0.2)
             specifications_value = self._extract_tab_grouped_kv_botasaurus(
                 driver,
-                tab_selector=carlist_base.TAB_SPECIFICATIONS_SELECTOR,
+                tab_selector=TAB_SPECIFICATIONS_SELECTOR,
             )
             flat_specifications = self._flatten_grouped_kv(specifications_value)
             if not mileage_value:
@@ -1474,11 +1576,11 @@ class CarmudiCarsService(CarlistCarsService):
             if not fuel_type_value:
                 fuel_type_value = self._pick_field(flat_specifications, ("fuel_type", "fuel", "bahan_bakar"))
 
-            if self._click_tab_by_href_botasaurus(driver, href=carlist_base.TAB_EQUIPMENTS_SELECTOR):
+            if self._click_tab_by_href_botasaurus(driver, href=TAB_EQUIPMENTS_SELECTOR):
                 time.sleep(0.2)
             equipment_value = self._extract_tab_grouped_kv_botasaurus(
                 driver,
-                tab_selector=carlist_base.TAB_EQUIPMENTS_SELECTOR,
+                tab_selector=TAB_EQUIPMENTS_SELECTOR,
             )
 
         return {

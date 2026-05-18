@@ -20,6 +20,7 @@ from cars_scrap_common.botasaurus_utils import (
 from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
 from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
+from cars_scrap_common.shared_base_service import SharedBaseService
 from scrap_carlist_cars_botasaurus.database import get_connection
 
 load_dotenv(override=True)
@@ -57,7 +58,7 @@ TAB_EQUIPMENTS_SELECTOR = "#tab-equipments"
 WHATSAPP_PHONE_RE = re.compile(r"(?:wa\.me/|phone=|tel:)(\+?\d+)", re.IGNORECASE)
 
 
-class CarlistCarsService:
+class CarlistCarsService(SharedBaseService):
     def __init__(self):
         self.logger = setup_logger("scrape_carlist_cars")
         self.stop_flag = False
