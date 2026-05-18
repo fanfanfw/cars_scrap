@@ -15,10 +15,12 @@ from cars_scrap_common.botasaurus_utils import (
     is_cloudflare_challenge,
     load_botasaurus_config,
     raise_if_cloudflare_challenge,
+    wait_for_xpath,
 )
 from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
 from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
+from scrap_carlist_cars_botasaurus import carlist_service as carlist_base
 from scrap_carlist_cars_botasaurus.carlist_service import CarlistCarsService
 from scrap_mobil123_cars_botasaurus.database import get_connection
 
@@ -587,39 +589,60 @@ class Mobil123CarsService(CarlistCarsService):
         except Exception:
             return 0
 
+    def _normalize_seat_capacity(self, value: str | None) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        match = re.search(r"\d+", text)
+        return match.group(0) if match else None
+
     def _parse_information_ads_date(self, information_ads: str | None) -> date | None:
         if not information_ads:
             return None
         month_mapping = {
+            "january": "01",
             "januari": "01",
             "jan": "01",
+            "february": "02",
             "februari": "02",
             "feb": "02",
+            "march": "03",
             "maret": "03",
             "mar": "03",
             "april": "04",
             "apr": "04",
+            "may": "05",
             "mei": "05",
+            "june": "06",
             "juni": "06",
             "jun": "06",
+            "july": "07",
             "juli": "07",
             "jul": "07",
+            "august": "08",
             "agustus": "08",
             "agu": "08",
             "aug": "08",
             "september": "09",
             "sep": "09",
+            "sept": "09",
+            "october": "10",
             "oktober": "10",
             "okt": "10",
             "oct": "10",
             "november": "11",
             "nov": "11",
+            "december": "12",
             "desember": "12",
             "des": "12",
             "dec": "12",
         }
         text = str(information_ads).lower().strip()
-        text = re.sub(r"^(diperbarui\s*:|diposting\s*:|tanggal\s*:|updated\s+on:|posted\s+on:|date:)\s*", "", text)
+        text = re.sub(
+            r"^(diperbarui(?:\s+pada)?\s*:|diposting(?:\s+pada)?\s*:|tanggal\s*:|updated\s+on:|posted\s+on:|date:)\s*",
+            "",
+            text,
+        )
 
         match = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", text)
         if match:
@@ -638,6 +661,131 @@ class Mobil123CarsService(CarlistCarsService):
                 return datetime(int(year), int(month), int(day)).date()
             except ValueError:
                 return None
+
+        return None
+
+    def _extract_key_details_dict_botasaurus(self, driver) -> dict[str, str]:
+        data = carlist_base.CarlistCarsService._extract_carousel_dict_botasaurus(self, driver) or {}
+        return {str(key): str(value).strip() for key, value in data.items() if value is not None and str(value).strip()}
+
+    def _extract_flat_tab_fields_botasaurus(self, driver, *, tab_selector: str) -> dict[str, str]:
+        grouped = carlist_base.CarlistCarsService._extract_tab_grouped_kv_botasaurus(self, driver, tab_selector=tab_selector)
+        return self._flatten_grouped_kv(grouped)
+
+    def _extract_text_by_nearby_label_botasaurus(self, driver, labels: tuple[str, ...]) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const labels = args.labels.map((s) => String(s || '').toLowerCase());
+                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const nodes = Array.from(document.querySelectorAll('span, div, li, dt, dd'));
+                const isLabel = (text) => labels.some((label) => text === label || text.includes(label));
+                for (const el of nodes) {
+                  const text = norm(el.textContent || el.innerText);
+                  const lower = text.toLowerCase();
+                  if (!lower || !isLabel(lower)) continue;
+                  const parent = el.parentElement;
+                  if (!parent) continue;
+                  const siblings = Array.from(parent.querySelectorAll('span, div, dd'))
+                    .map((node) => norm(node.textContent || node.innerText))
+                    .filter(Boolean);
+                  for (const value of siblings) {
+                    const valueLower = value.toLowerCase();
+                    if (valueLower && valueLower !== lower && !isLabel(valueLower)) return value;
+                  }
+                }
+                return null;
+                """,
+                {"labels": list(labels)},
+            )
+        except Exception:
+            return None
+
+    def _extract_contact_seller_fallback_botasaurus(self, driver) -> str | None:
+        try:
+            return driver.run_js(
+                """
+                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const normalizePhone = (value) => {
+                  const text = norm(value);
+                  if (!text) return null;
+                  const digits = text.replace(/\D+/g, '');
+                  if (digits.length < 8) return null;
+                  return text;
+                };
+                const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
+                for (const el of nodes) {
+                  const href = String(el.href || el.getAttribute('href') || '').trim();
+                  if (/^tel:/i.test(href)) {
+                    const phone = normalizePhone(href.split(':').slice(1).join(':'));
+                    if (phone) return phone;
+                  }
+                  const dataPhone = el.getAttribute('data-phone') || el.getAttribute('data-phones') || '';
+                  const phone = normalizePhone(dataPhone);
+                  if (phone) return phone;
+                }
+                return null;
+                """
+            )
+        except Exception:
+            return None
+
+    def _click_contact_seller_fallback_botasaurus(self, driver) -> bool:
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
+                    const candidates = nodes.map((el) => {
+                      const text = norm(el.textContent || el.innerText);
+                      const cls = String(el.className || '').toLowerCase();
+                      const href = String(el.href || el.getAttribute('href') || '').trim().toLowerCase();
+                      const dataPhone = String(el.getAttribute('data-phone') || el.getAttribute('data-phones') || '').trim();
+                      let score = 0;
+                      if (href.startsWith('tel:')) score += 100;
+                      if (dataPhone) score += 90;
+                      if (cls.includes('jump-phone') || cls.includes('phone')) score += 70;
+                      if (text.includes('contact') || text.includes('call')) score += 50;
+                      if (text.includes('hubungi') || text.includes('telepon')) score += 50;
+                      if (text.includes('lihat nomor') || text.includes('nomor')) score += 40;
+                      if (score <= 0) return null;
+                      return {el, score, isAnchor: el.tagName === 'A' ? 1 : 0};
+                    }).filter(Boolean);
+                    candidates.sort((a, b) => (b.score - a.score) || (b.isAnchor - a.isAnchor));
+                    for (const item of candidates) {
+                      try { item.el.scrollIntoView({block: 'center'}); } catch (e) {}
+                      try { item.el.click(); return true; } catch (e) {}
+                    }
+                    return false;
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _extract_contact_seller_value_botasaurus(self, driver, *, listing_id: str) -> str | None:
+        value = carlist_base.CarlistCarsService._extract_contact_seller_botasaurus(
+            self,
+            driver,
+            listing_id=listing_id,
+        )
+        if value:
+            return value
+
+        value = self._extract_contact_seller_fallback_botasaurus(driver)
+        if value:
+            return value
+
+        if self._click_contact_seller_fallback_botasaurus(driver):
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                time.sleep(0.25)
+                value = self._extract_contact_seller_fallback_botasaurus(driver)
+                if value:
+                    carlist_base.CarlistCarsService._close_contact_seller_modal_botasaurus(self, driver)
+                    return value
+            carlist_base.CarlistCarsService._close_contact_seller_modal_botasaurus(self, driver)
 
         return None
 
@@ -994,48 +1142,6 @@ class Mobil123CarsService(CarlistCarsService):
             deduped.append(url)
         return deduped or None
 
-    def _extract_whatsapp_numbers_botasaurus(self, driver, *, listing_id: str | None = None) -> list[str] | None:
-        try:
-            candidates = driver.run_js(
-                """
-                return Array.from(document.querySelectorAll('a[href], button, [role="button"]')).map((el) => ({
-                  href: el.href || el.getAttribute('href') || '',
-                  text: (el.innerText || el.textContent || '').trim(),
-                  data_whatsapp_number: el.getAttribute('data-whatsapp-number') || '',
-                  data_phone: el.getAttribute('data-phone') || el.getAttribute('data-phones') || '',
-                  class_name: String(el.className || ''),
-                }));
-                """
-            )
-        except Exception:
-            candidates = []
-
-        seen: set[str] = set()
-        numbers: list[str] = []
-        for item in candidates or []:
-            if not isinstance(item, dict):
-                continue
-            haystack = " ".join(str(item.get(k) or "") for k in ("href", "text", "class_name", "data_whatsapp_number"))
-            if "whatsapp" not in haystack.lower() and "wa.me" not in haystack.lower():
-                continue
-            values = [item.get("data_whatsapp_number"), item.get("data_phone")]
-            href = str(item.get("href") or "")
-            try:
-                query_phone = parse_qs(urlparse(href).query).get("phone")
-                if query_phone:
-                    values.append(query_phone[0])
-            except Exception:
-                pass
-            match = WHATSAPP_PHONE_RE.search(href)
-            if match:
-                values.append(match.group(1))
-            for value in values:
-                number = self._normalize_whatsapp_number(value)
-                if number and number not in seen:
-                    seen.add(number)
-                    numbers.append(number)
-        return numbers or None
-
     def _normalize_whatsapp_number(self, value: str | None) -> str | None:
         text = str(value or "").strip()
         if not text:
@@ -1046,80 +1152,6 @@ class Mobil123CarsService(CarlistCarsService):
         if digits.startswith("0") and len(digits) >= 9:
             return f"62{digits[1:]}"
         return digits
-
-    def _extract_contact_seller_botasaurus(self, driver, *, listing_id: str | None = None) -> str | None:
-        try:
-            return driver.run_js(
-                """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-                const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
-                for (const el of nodes) {
-                  const href = String(el.href || el.getAttribute('href') || '');
-                  const text = norm(el.innerText || el.textContent);
-                  const dataPhone = el.getAttribute('data-phone') || el.getAttribute('data-phones') || '';
-                  const lower = `${href} ${text} ${el.className || ''}`.toLowerCase();
-                  if (!lower.includes('kontak') && !lower.includes('contact') && !lower.includes('tel:') && !dataPhone) continue;
-                  if (dataPhone) return dataPhone;
-                  if (/^tel:/i.test(href)) return href.split(':').slice(1).join(':');
-                  if (/\d{8,}/.test(text)) return text;
-                }
-                return null;
-                """
-            )
-        except Exception:
-            return None
-
-    def _extract_seller_name_botasaurus(self, driver, *, listing_id: str | None = None) -> str | None:
-        xpath_value = self._get_text_by_xpath_botasaurus(driver, DETAIL_SELLER_NAME_XPATH)
-        if xpath_value:
-            return xpath_value
-        try:
-            return driver.run_js(
-                """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-                const bad = /^(kontak|contact|whatsapp|chat|telepon|call|save|simpan)$/i;
-                const selectors = [
-                  '[class*="seller"] h1', '[class*="seller"] h2', '[class*="seller"] h3', '[class*="seller"] h4',
-                  '[class*="dealer"] h1', '[class*="dealer"] h2', '[class*="dealer"] h3', '[class*="dealer"] h4',
-                  '[data-testid*="seller"]', '[data-testid*="dealer"]'
-                ];
-                for (const selector of selectors) {
-                  for (const el of Array.from(document.querySelectorAll(selector))) {
-                    const text = norm(el.innerText || el.textContent);
-                    if (!text || bad.test(text) || /^Rp\s*[\d.]+/i.test(text) || /^\d+$/.test(text)) continue;
-                    if (text.length >= 3 && text.length <= 100) return text;
-                  }
-                }
-                return null;
-                """
-            )
-        except Exception:
-            return None
-
-    def _extract_tab_grouped_kv_botasaurus(self, driver, *, tab_selector: str | None = None) -> dict[str, object] | None:
-        if tab_selector:
-            grouped = self._extract_grouped_kv_botasaurus(driver, tab_selector=tab_selector)
-            if grouped:
-                return grouped
-        fields = self._extract_structured_fields_botasaurus(driver)
-        return fields or None
-
-    def _extract_seller_notes_text_botasaurus(self, driver) -> str | None:
-        try:
-            return driver.run_js(
-                """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-                const selectors = ['[itemprop="description"]', '[class*="description"]', '[class*="Description"]'];
-                for (const selector of selectors) {
-                  const el = document.querySelector(selector);
-                  const text = norm(el && (el.innerText || el.textContent));
-                  if (text && text.length > 20) return text;
-                }
-                return null;
-                """
-            )
-        except Exception:
-            return None
 
     def _extract_listing_urls_botasaurus(self, driver) -> list[str]:
         try:
@@ -1198,99 +1230,121 @@ class Mobil123CarsService(CarlistCarsService):
         current_url = str(getattr(driver, "current_url", "") or "")
         expected_id = (listing_id or self._extract_listing_id(url)).strip()
         redirected_off_detail = bool(current_url) and (not self._is_on_target_domain(current_url))
+        is_http_error_page = self._is_http_error_page_botasaurus(driver)
 
-        if self._is_http_error_page_botasaurus(driver):
+        if is_http_error_page:
             raise RuntimeError(f"Retryable error page while scraping mobil123 detail: current_url={current_url!r}")
+
         if self._is_access_blocked_botasaurus(driver):
             raise RuntimeError(f"Blocked while scraping mobil123 detail: current_url={current_url!r}")
 
         is_not_found_page = self._is_listing_not_found_botasaurus(driver)
         is_sold_page = self._is_sold_page_botasaurus(driver)
+
         if is_not_found_page or is_sold_page or redirected_off_detail:
-            if expected_id and (is_sold_page or tracking_mode):
+            if expected_id:
+                should_mark_sold = bool(is_sold_page) or (tracking_mode and (is_not_found_page or redirected_off_detail))
+                if not should_mark_sold:
+                    raise RuntimeError(
+                        "Detail page unavailable but not confidently sold. "
+                        f"current_url={current_url!r} redirected_off_detail={redirected_off_detail} "
+                        f"is_not_found_page={is_not_found_page} is_sold_page={is_sold_page}"
+                    )
                 return self._sold_result(listing_id=expected_id, url=url)
-            raise RuntimeError(
-                "Detail page unavailable but not confidently sold. "
-                f"current_url={current_url!r} redirected_off_detail={redirected_off_detail} "
-                f"is_not_found_page={is_not_found_page} is_sold_page={is_sold_page}"
-            )
+            raise RuntimeError("Listing not found/redirected (missing listing_id).")
 
-        time.sleep(max(0.0, cfg.detail_wait_seconds))
+        wait_for_xpath(
+            driver,
+            carlist_base.INFORMATION_ADS_XPATH,
+            timeout_seconds=cfg.detail_wait_seconds,
+            poll_interval_seconds=cfg.poll_interval_seconds,
+        )
 
-        json_ld_items = self._json_ld_objects_botasaurus(driver)
-        fields = self._extract_structured_fields_botasaurus(driver)
-        title = self._extract_title_botasaurus(driver)
-        title_fields = self._infer_title_fields(title)
-        description = self._first_meta_content_botasaurus(driver, ["og:description", "description", "twitter:description"])
+        listing_id_meta = self._get_attr_by_xpath_botasaurus(driver, carlist_base.LISTING_ID_META_XPATH, "content")
+        listing_id_from_url = (listing_id or self._extract_numeric_listing_id(url) or "").strip()
+
+        listing_id_meta_numeric = None
+        if listing_id_meta:
+            match = re.search(r"\d{5,}", str(listing_id_meta))
+            if match:
+                listing_id_meta_numeric = match.group(0)
+
+        if listing_id_meta_numeric and listing_id_from_url and listing_id_meta_numeric != listing_id_from_url:
+            if not self._logged_listing_id_meta_mismatch:
+                self._logged_listing_id_meta_mismatch = True
+                self.logger.warning(
+                    "Ignoring mismatched listing_id from meta (meta=%r url=%r) for %s",
+                    listing_id_meta_numeric,
+                    listing_id_from_url,
+                    url,
+                )
+            listing_id_meta_numeric = None
 
         listing_id_final = (
-            (listing_id or "").strip()
-            or (self._extract_numeric_listing_id(url) or "").strip()
+            listing_id_from_url
+            or listing_id_meta_numeric
             or (self._extract_numeric_listing_id(current_url) or "").strip()
-            or expected_id
+            or self._extract_listing_id(url)
+            or ""
         ).strip()
         if not listing_id_final:
             raise RuntimeError("Missing listing_id on page")
 
-        price_value = self._extract_price_botasaurus(driver, json_ld_items)
-        year_value = self._parse_int_from_text(self._pick_field(fields, ("tahun", "year", "model_year")))
-        if not year_value and isinstance(title_fields.get("year"), int):
-            year_value = int(title_fields["year"])
-        if not year_value:
-            match = re.search(r"\b(19\d{2}|20\d{2})\b", title or "")
-            year_value = int(match.group(1)) if match else None
+        condition_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.CONDITION_META_XPATH, "content")
+        brand_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.BRAND_META_XPATH, "content")
+        model_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.MODEL_META_XPATH, "content")
+        variant_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.VARIANT_META_XPATH, "content")
 
-        brand_value = self._pick_field(fields, ("merek", "brand", "make"))
-        model_value = self._pick_field(fields, ("model",))
-        variant_value = self._pick_field(fields, ("varian", "variant", "tipe", "type"))
-        if brand_value and str(brand_value).strip().lower() in {"jual", "dijual", "mobil"}:
-            brand_value = None
-        brand_value = brand_value or str(title_fields.get("brand") or "").strip() or None
-        model_value = model_value or str(title_fields.get("model") or "").strip() or None
-        variant_value = variant_value or str(title_fields.get("variant") or "").strip() or None
-        if not (brand_value and model_value):
-            inferred_brand, inferred_model, inferred_variant = self._infer_brand_model_from_title(title, year_value)
-            brand_value = brand_value or inferred_brand
-            model_value = model_value or inferred_model
-            variant_value = variant_value or inferred_variant
-
-        condition_value = self._pick_field(fields, ("kondisi", "condition")) or "used"
-        info_ads_value = self._pick_field(
-            fields,
-            ("tanggal_iklan", "diperbarui", "diposting", "posted", "updated", "information_ads"),
-        )
+        info_ads_value = self._get_text_by_xpath_botasaurus(driver, carlist_base.INFORMATION_ADS_XPATH)
         info_ads_date_value = self._parse_information_ads_date(info_ads_value)
-        location_value = self._extract_location_botasaurus(driver) or self._pick_field(fields, ("lokasi", "location", "area", "kota", "city"))
-        mileage_value = self._parse_mileage(
-            self._get_text_by_xpath_botasaurus(driver, DETAIL_MILEAGE_XPATH)
-            or self._pick_field(fields, ("kilometer", "jarak_tempuh", "mileage", "odometer"))
+
+        location_value = (
+            carlist_base.CarlistCarsService._extract_location_botasaurus(self, driver)
+            or self._extract_location_botasaurus(driver)
         )
-        transmission_value = (
-            self._get_text_by_xpath_botasaurus(driver, DETAIL_TRANSMISSION_XPATH)
-            or self._pick_field(fields, ("transmisi", "transmission"))
-            or str(title_fields.get("transmission") or "").strip()
-            or None
+        price_value = self._parse_int_from_text(
+            self._get_attr_by_xpath_botasaurus(driver, carlist_base.PRICE_META_XPATH, "content")
         )
-        specifications_value = self._extract_grouped_kv_botasaurus(driver, tab_selector=DETAIL_SPECIFICATIONS_SELECTOR)
-        equipment_value = self._extract_grouped_kv_botasaurus(driver, tab_selector=DETAIL_EQUIPMENTS_SELECTOR)
-        spec_fields = self._flatten_grouped_kv(specifications_value)
-        seat_capacity_value = self._pick_field(fields, ("kapasitas_kursi", "seat_capacity", "kursi"))
-        if not seat_capacity_value:
-            seat_capacity_value = self._pick_field(spec_fields, ("kapasitas_kursi", "seat_capacity", "kursi"))
+        year_value = self._parse_int_from_text(
+            self._get_attr_by_xpath_botasaurus(driver, carlist_base.YEAR_META_XPATH, "content")
+        )
+        key_details_fields = self._extract_key_details_dict_botasaurus(driver)
+        mileage_raw = (
+            self._get_text_by_xpath_botasaurus(driver, carlist_base.MILEAGE_XPATH)
+            or key_details_fields.get("mileage")
+            or self._extract_text_by_nearby_label_botasaurus(driver, ("mileage", "kilometer", "kilometres", "kilometers"))
+        )
+        mileage_value = self._parse_mileage(mileage_raw)
+        transmission_value = self._get_attr_by_xpath_botasaurus(driver, carlist_base.TRANSMISSION_META_XPATH, "content")
+        seat_capacity_value = self._normalize_seat_capacity(
+            self._get_text_by_xpath_botasaurus(driver, carlist_base.SEAT_CAPACITY_XPATH)
+            or key_details_fields.get("seat_capacity")
+            or key_details_fields.get("seats")
+            or self._extract_text_by_nearby_label_botasaurus(driver, ("seat capacity", "seats", "kursi"))
+        )
         engine_cc_value = self._normalize_engine_cc(
-            self._pick_field(fields, ("kapasitas_mesin", "engine_cc", "engine", "mesin"))
-            or self._pick_field(spec_fields, ("kapasitas_mesin", "engine_cc", "engine", "mesin"))
+            self._get_text_by_xpath_botasaurus(driver, carlist_base.ENGINE_CC_XPATH)
+            or key_details_fields.get("engine_cc")
+            or key_details_fields.get("engine_capacity")
+            or self._extract_text_by_nearby_label_botasaurus(driver, ("engine cc", "engine capacity", "kapasitas mesin"))
         )
-        fuel_type_value = self._pick_field(fields, ("bahan_bakar", "fuel_type", "fuel"))
-        if not fuel_type_value:
-            fuel_type_value = self._pick_field(spec_fields, ("tipe_bahan_bakar", "bahan_bakar", "fuel_type", "fuel"))
-        images_value = self._extract_images_botasaurus(driver)
-        whatsapp_numbers_value = self._extract_whatsapp_numbers_botasaurus(driver, listing_id=listing_id_final)
-        contact_seller_value = self._extract_contact_seller_botasaurus(driver, listing_id=listing_id_final)
-        seller_name_value = self._extract_seller_name_botasaurus(driver, listing_id=listing_id_final)
-        seller_notes_value = self._extract_seller_notes_text_botasaurus(driver) or description
-        if not specifications_value:
-            specifications_value = fields or None
+        fuel_type_value = (
+            self._get_attr_by_xpath_botasaurus(driver, carlist_base.FUEL_TYPE_META_XPATH, "content")
+            or key_details_fields.get("fuel_type")
+            or key_details_fields.get("fuel")
+            or self._extract_text_by_nearby_label_botasaurus(driver, ("fuel type", "fuel", "bahan bakar"))
+        )
+        images_value = carlist_base.CarlistCarsService._extract_images_botasaurus(self, driver) or self._extract_images_botasaurus(driver)
+        whatsapp_numbers_value = carlist_base.CarlistCarsService._extract_whatsapp_numbers_botasaurus(
+            self,
+            driver,
+            listing_id=listing_id_final,
+        )
+        contact_seller_value = self._extract_contact_seller_value_botasaurus(driver, listing_id=listing_id_final)
+        seller_name_value = (
+            carlist_base.CarlistCarsService._extract_seller_name_botasaurus(self, driver, listing_id=listing_id_final)
+            or self._get_text_by_xpath_botasaurus(driver, DETAIL_SELLER_NAME_XPATH)
+        )
 
         def has_value(v) -> bool:
             if v is None:
@@ -1306,54 +1360,100 @@ class Mobil123CarsService(CarlistCarsService):
         has_any_data = any(
             has_value(v)
             for v in (
+                condition_value,
                 brand_value,
                 model_value,
-                title,
+                variant_value,
+                info_ads_value,
+                info_ads_date_value,
                 price_value,
                 year_value,
                 location_value,
                 mileage_value,
                 transmission_value,
+                seat_capacity_value,
                 engine_cc_value,
                 fuel_type_value,
                 images_value,
-                seller_notes_value,
             )
         )
         if not has_any_data:
-            if self._is_sold_page_botasaurus(driver):
-                return self._sold_result(listing_id=listing_id_final, url=url)
-            raise RuntimeError("No extractable data on detail page (treating as error, not sold).")
+            if listing_id_final and self._is_sold_page_botasaurus(driver):
+                status = "sold"
+            else:
+                raise RuntimeError("No extractable data on detail page (treating as error, not sold).")
+        else:
+            status = "active"
+
+        carousel_value = None
+        seller_notes_value = None
+        specifications_value: dict[str, object] | None = None
+        equipment_value: dict[str, object] | None = None
+        if status == "active":
+            carousel_value = self._extract_carousel_dict_botasaurus(driver)
+
+            if self._click_tab_by_href_botasaurus(driver, href=carlist_base.TAB_SELLER_NOTES_SELECTOR):
+                time.sleep(0.2)
+            seller_notes_value = self._extract_seller_notes_text_botasaurus(driver)
+
+            if self._click_tab_by_href_botasaurus(driver, href=carlist_base.TAB_SPECIFICATIONS_SELECTOR):
+                time.sleep(0.2)
+            specifications_value = self._extract_tab_grouped_kv_botasaurus(
+                driver,
+                tab_selector=carlist_base.TAB_SPECIFICATIONS_SELECTOR,
+            )
+            flat_specifications = self._flatten_grouped_kv(specifications_value)
+            if not mileage_value:
+                mileage_value = self._parse_mileage(
+                    self._pick_field(flat_specifications, ("mileage", "kilometer", "kilometers", "kilometres"))
+                )
+            if not seat_capacity_value:
+                seat_capacity_value = self._normalize_seat_capacity(
+                    self._pick_field(flat_specifications, ("seat_capacity", "seats", "kursi"))
+                )
+            if not engine_cc_value:
+                engine_cc_value = self._normalize_engine_cc(
+                    self._pick_field(flat_specifications, ("engine_cc", "engine_capacity", "kapasitas_mesin"))
+                )
+            if not fuel_type_value:
+                fuel_type_value = self._pick_field(flat_specifications, ("fuel_type", "fuel", "bahan_bakar"))
+
+            if self._click_tab_by_href_botasaurus(driver, href=carlist_base.TAB_EQUIPMENTS_SELECTOR):
+                time.sleep(0.2)
+            equipment_value = self._extract_tab_grouped_kv_botasaurus(
+                driver,
+                tab_selector=carlist_base.TAB_EQUIPMENTS_SELECTOR,
+            )
 
         return {
             "listing_id": listing_id_final,
             "listing_url": url,
-            "condition": condition_value,
-            "brand": brand_value,
-            "model": model_value,
-            "variant": variant_value,
-            "information_ads": info_ads_value,
-            "information_ads_date": info_ads_date_value,
-            "location": location_value,
-            "price": price_value,
-            "year": year_value,
-            "mileage": mileage_value,
-            "transmission": transmission_value,
-            "seat_capacity": seat_capacity_value,
-            "engine_cc": engine_cc_value,
-            "fuel_type": fuel_type_value,
+            "condition": condition_value if status == "active" else None,
+            "brand": brand_value if status == "active" else None,
+            "model": model_value if status == "active" else None,
+            "variant": variant_value if status == "active" else None,
+            "information_ads": info_ads_value if status == "active" else None,
+            "information_ads_date": info_ads_date_value if status == "active" else None,
+            "location": location_value if status == "active" else None,
+            "price": price_value if status == "active" else None,
+            "year": year_value if status == "active" else None,
+            "mileage": mileage_value if status == "active" else None,
+            "transmission": transmission_value if status == "active" else None,
+            "seat_capacity": seat_capacity_value if status == "active" else None,
+            "engine_cc": engine_cc_value if status == "active" else None,
+            "fuel_type": fuel_type_value if status == "active" else None,
             "series": None,
-            "type": str(title_fields.get("body_type") or "").strip() or None,
-            "carousel": fields or None,
-            "seller_notes": seller_notes_value,
-            "specifications": specifications_value,
-            "equipment": equipment_value,
-            "images": images_value,
-            "whatsapp_number": whatsapp_numbers_value,
-            "contact_seller": contact_seller_value,
-            "seller_name": seller_name_value,
+            "type": None,
+            "carousel": carousel_value if status == "active" else None,
+            "seller_notes": seller_notes_value if status == "active" else None,
+            "specifications": specifications_value if status == "active" else None,
+            "equipment": equipment_value if status == "active" else None,
+            "images": images_value if status == "active" else None,
+            "whatsapp_number": whatsapp_numbers_value if status == "active" else None,
+            "contact_seller": contact_seller_value if status == "active" else None,
+            "seller_name": seller_name_value if status == "active" else None,
             "error": None,
-            "status": "active",
+            "status": status,
         }
 
     def scrape_all_from_main(self, start_url: str | None = None, max_pages: int = 1) -> list[str]:
