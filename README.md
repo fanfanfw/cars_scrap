@@ -1,10 +1,11 @@
 # cars_scrap
 
-Repo scraping listing mobil untuk tiga source:
+Repo scraping listing mobil untuk empat source:
 
 - `mudah.my`
 - `carlist.my`
 - `mobil123.com`
+- `carmudi.co.id`
 
 Project ini memakai:
 
@@ -23,7 +24,7 @@ Secara umum ada dua mode utama:
 1. Scrape halaman listing untuk mengumpulkan `listing_url`.
 2. Scrape halaman detail untuk mengambil data lengkap lalu `upsert` ke PostgreSQL.
 
-Ketiga source (`mudah.my`, `carlist.my`, dan `mobil123.com`) punya pola yang sama:
+Semua source (`mudah.my`, `carlist.my`, `mobil123.com`, dan `carmudi.co.id`) punya pola yang sama:
 
 - service class untuk logic scraping
 - CLI entrypoint untuk eksekusi manual
@@ -52,6 +53,11 @@ Tracking/re-scrape juga tersedia. Mode ini membaca data `active` dari database, 
 │   ├── database.py
 │   ├── mobil123_service.py
 │   └── run_scraper.py
+├── scrap_carmudi_cars_botasaurus/       # scraper carmudi.co.id
+│   ├── app.py
+│   ├── database.py
+│   ├── carmudi_service.py
+│   └── run_scraper.py
 ├── sql/                                 # schema tabel dan price history trigger
 ├── scripts/                             # script migrasi dari DB lama
 ├── profiles/                            # profile Botasaurus + state proxy rotation
@@ -67,9 +73,11 @@ Script berikut didefinisikan di `pyproject.toml`:
 - `uv run scrape-mudahmy`
 - `uv run scrape-carlist`
 - `uv run scrape-mobil123`
+- `uv run scrape-carmudi`
 - `uv run serve-mudahmy`
 - `uv run serve-carlist`
 - `uv run serve-mobil123`
+- `uv run serve-carmudi`
 
 ## Setup lokal
 
@@ -87,6 +95,7 @@ Lalu isi minimal:
 - opsional `MUDAHMY_CARS_LISTING_URL`
 - opsional `CARLIST_CARS_LISTING_URL`
 - opsional `MOBIL123_CARS_LISTING_URL`
+- opsional `CARMUDI_CARS_LISTING_URL`
 
 ### 2. Install dependency
 
@@ -103,7 +112,7 @@ source .venv/bin/activate
 
 ## Setup PostgreSQL
 
-Project ini menyimpan data ke 9 tabel:
+Project ini menyimpan data ke 12 tabel:
 
 - `cars_scrap_mudahmy`
 - `cars_scrap_mudahmy_details`
@@ -114,6 +123,9 @@ Project ini menyimpan data ke 9 tabel:
 - `cars_scrap_mobil123`
 - `cars_scrap_mobil123_details`
 - `price_history_scrap_mobil123`
+- `cars_scrap_carmudi`
+- `cars_scrap_carmudi_details`
+- `price_history_scrap_carmudi`
 
 File SQL yang tersedia:
 
@@ -126,6 +138,9 @@ File SQL yang tersedia:
 - `sql/cars_scrap_mobil123.sql`
 - `sql/cars_scrap_mobil123_details.sql`
 - `sql/price_history_scrap_mobil123.sql`
+- `sql/cars_scrap_carmudi.sql`
+- `sql/cars_scrap_carmudi_details.sql`
+- `sql/price_history_scrap_carmudi.sql`
 
 Contoh bootstrap schema:
 
@@ -143,6 +158,10 @@ psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_histor
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mobil123.sql
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mobil123_details.sql
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_mobil123.sql
+
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carmudi.sql
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carmudi_details.sql
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_carmudi.sql
 ```
 
 Catatan:
@@ -160,6 +179,7 @@ Berikut variabel penting dari `.env.example`.
 - `MUDAHMY_CARS_LISTING_URL`: default URL listing mudah.my, bisa dioverride lewat `--start-url` atau body HTTP request
 - `CARLIST_CARS_LISTING_URL`: default URL listing carlist.my, bisa dioverride lewat `--start-url` atau body HTTP request
 - `MOBIL123_CARS_LISTING_URL`: default URL listing mobil123.com, bisa dioverride lewat `--start-url` atau body HTTP request
+- `CARMUDI_CARS_LISTING_URL`: default URL listing carmudi.co.id, bisa dioverride lewat `--start-url` atau body HTTP request
 
 ### Database
 
@@ -175,6 +195,7 @@ Catatan kompatibilitas:
 - scraper mudah.my juga menerima fallback `DB_NAME_MUDAH_CARS`
 - scraper carlist juga menerima fallback `DB_NAME_CARLIST_CARS`
 - scraper mobil123.com juga menerima fallback `DB_NAME_MOBIL123_CARS`
+- scraper carmudi.co.id juga menerima fallback `DB_NAME_CARMUDI_CARS`
 
 ### Logging dan Flask
 
@@ -188,6 +209,7 @@ Default port:
 - `serve-mudahmy` -> `5201`
 - `serve-carlist` -> `5202`
 - `serve-mobil123` -> `5203`
+- `serve-carmudi` -> `5204`
 
 ### Botasaurus runtime
 
@@ -227,7 +249,7 @@ Catatan:
 - format yang didukung: URL penuh, `HOST:PORT`, atau `HOST:PORT:USER:PASS`
 - jika lebih dari satu proxy diberikan, repo ini melakukan rotasi round-robin dan menyimpan state di `profiles/proxy_state.json`
 
-### Cloudflare fallback khusus carlist dan mobil123
+### Cloudflare fallback khusus carlist, mobil123, dan carmudi
 
 - `CARLIST_AUTO_ATTEMPT_CLOUDFLARE`
 - `CARLIST_CLOUDFLARE_MAX_ATTEMPTS`
@@ -235,8 +257,11 @@ Catatan:
 - `MOBIL123_AUTO_ATTEMPT_CLOUDFLARE`
 - `MOBIL123_CLOUDFLARE_MAX_ATTEMPTS`
 - `MOBIL123_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
+- `CARMUDI_AUTO_ATTEMPT_CLOUDFLARE`
+- `CARMUDI_CLOUDFLARE_MAX_ATTEMPTS`
+- `CARMUDI_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
 
-### Retry dan proteksi tambahan khusus carlist dan mobil123
+### Retry dan proteksi tambahan khusus carlist, mobil123, dan carmudi
 
 - `CARLIST_STICKY_BROWSER_RETRIES`: retry di browser session yang sama sebelum ganti proxy/profile
 - `CARLIST_STICKY_BROWSER_RETRY_WAIT_SECONDS`
@@ -258,11 +283,21 @@ Catatan:
 - `MOBIL123_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
 - `MOBIL123_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
 - `MOBIL123_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
+- `CARMUDI_STICKY_BROWSER_RETRIES`
+- `CARMUDI_STICKY_BROWSER_RETRY_WAIT_SECONDS`
+- `CARMUDI_HTTP_400_RETRY_ENABLED`
+- `CARMUDI_HTTP_400_MAX_RETRIES`
+- `CARMUDI_RUN_MAX_ATTEMPTS`
+- `CARMUDI_RUN_RETRY_WAIT_SECONDS`
+- `CARMUDI_DETAIL_CIRCUIT_BREAKER_ENABLED`
+- `CARMUDI_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
+- `CARMUDI_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
+- `CARMUDI_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
 
 Catatan:
 
-- default `CARLIST_RUN_MAX_ATTEMPTS` dan `MOBIL123_RUN_MAX_ATTEMPTS` sekarang `2`
-- saat halaman listing carlist atau mobil123 kosong/terlihat seperti soft-block, scraper akan menyimpan artefak debug ke `botasaurus_test/output/*_debug/`
+- default `CARLIST_RUN_MAX_ATTEMPTS`, `MOBIL123_RUN_MAX_ATTEMPTS`, dan `CARMUDI_RUN_MAX_ATTEMPTS` sekarang `2`
+- saat halaman listing carlist, mobil123, atau carmudi kosong/terlihat seperti soft-block, scraper akan menyimpan artefak debug ke `botasaurus_test/output/*_debug/`
 
 ### Cleanup profile Botasaurus per job
 
@@ -290,6 +325,8 @@ Rekomendasi profile per job:
 - `carlist_track`
 - `mobil123_scrape`
 - `mobil123_track`
+- `carmudi_scrape`
+- `carmudi_track`
 
 Contoh cron dengan profile terpisah per job:
 
@@ -319,6 +356,7 @@ Mode ini hanya mengembalikan daftar `listing_url`, belum menyimpan detail ke Pos
 uv run scrape-mudahmy --max-pages 1
 uv run scrape-carlist --max-pages 1
 uv run scrape-mobil123 --max-pages 1
+uv run scrape-carmudi --max-pages 1
 ```
 
 Override halaman awal:
@@ -327,6 +365,7 @@ Override halaman awal:
 uv run scrape-mudahmy --start-url "https://www.mudah.my/malaysia/cars-for-sale"
 uv run scrape-carlist --start-url "https://www.carlist.my/cars-for-sale/malaysia"
 uv run scrape-mobil123 --start-url "https://www.mobil123.com/mobil-bekas-dijual/indonesia?sort=modification_date_search.desc"
+uv run scrape-carmudi --start-url "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia?sort=modification_date_search.desc"
 ```
 
 ### B. Ambil detail dan simpan ke Postgres
@@ -343,6 +382,7 @@ Mode ini:
 uv run scrape-mudahmy --max-pages 1 --details
 uv run scrape-carlist --max-pages 1 --details
 uv run scrape-mobil123 --max-pages 1 --details
+uv run scrape-carmudi --max-pages 1 --details
 ```
 
 Output CLI berupa JSON ringkasan seperti:
@@ -372,6 +412,7 @@ Contoh dasar:
 uv run scrape-mudahmy --track-older-than 1w
 uv run scrape-carlist --track-older-than 1w
 uv run scrape-mobil123 --track-older-than 1w
+uv run scrape-carmudi --track-older-than 1w
 ```
 
 Contoh dengan filter `last_scraped_at` supaya listing yang baru diproses tidak terkena lagi:
@@ -380,6 +421,7 @@ Contoh dengan filter `last_scraped_at` supaya listing yang baru diproses tidak t
 uv run scrape-mudahmy --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
 uv run scrape-carlist --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
 uv run scrape-mobil123 --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
+uv run scrape-carmudi --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
 ```
 
 Mode hitung saja:
@@ -388,6 +430,7 @@ Mode hitung saja:
 uv run scrape-mudahmy --track-older-than 1w --track-count
 uv run scrape-carlist --track-older-than 1w --track-count
 uv run scrape-mobil123 --track-older-than 1w --track-count
+uv run scrape-carmudi --track-older-than 1w --track-count
 ```
 
 Mode preview tanpa scrape:
@@ -396,6 +439,7 @@ Mode preview tanpa scrape:
 uv run scrape-mudahmy --track-older-than 1w --track-dry-run
 uv run scrape-carlist --track-older-than 1w --track-dry-run
 uv run scrape-mobil123 --track-older-than 1w --track-dry-run
+uv run scrape-carmudi --track-older-than 1w --track-dry-run
 ```
 
 Format durasi yang didukung:
@@ -424,6 +468,7 @@ Berguna untuk validasi parser satu halaman detail. Command ini:
 uv run scrape-mudahmy --debug-detail-url "https://www.mudah.my/view?ad_id=..."
 uv run scrape-carlist --debug-detail-url "https://www.carlist.my/used-cars/..."
 uv run scrape-mobil123 --debug-detail-url "https://www.mobil123.com/..."
+uv run scrape-carmudi --debug-detail-url "https://www.carmudi.co.id/..."
 ```
 
 ## Menjalankan HTTP service
@@ -531,6 +576,39 @@ curl -X POST http://localhost:5203/scrape/mobil123-cars \
   -d '{"max_pages": 1}'
 
 curl -X POST http://localhost:5203/scrape/mobil123-cars-details \
+  -H "Content-Type: application/json" \
+  -d '{"max_pages": 1}'
+```
+
+### Carmudi service
+
+Jalankan:
+
+```bash
+uv run serve-carmudi
+```
+
+Default:
+
+- host `0.0.0.0`
+- port `5204`
+
+Endpoint:
+
+- `GET /health`
+- `POST /scrape/carmudi-cars`
+- `POST /scrape/carmudi-cars-details`
+
+Contoh request:
+
+```bash
+curl http://localhost:5204/health
+
+curl -X POST http://localhost:5204/scrape/carmudi-cars \
+  -H "Content-Type: application/json" \
+  -d '{"max_pages": 1}'
+
+curl -X POST http://localhost:5204/scrape/carmudi-cars-details \
   -H "Content-Type: application/json" \
   -d '{"max_pages": 1}'
 ```
