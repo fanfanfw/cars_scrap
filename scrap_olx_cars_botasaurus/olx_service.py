@@ -13,13 +13,13 @@ from psycopg2.extras import Json, execute_values
 from cars_scrap_common.botasaurus_utils import load_botasaurus_config, raise_if_cloudflare_challenge, wait_for_css
 from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
-from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip
+from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
 from cars_scrap_common.shared_base_service import SharedBaseService
 from scrap_olx_cars_botasaurus.database import get_connection
 
 load_dotenv(override=True)
 
-DEFAULT_LISTING_URL = "https://www.olx.co.id/mobil-bekas_c198"
+DEFAULT_LISTING_URL = "https://www.olx.co.id/indonesia_g1000001/mobil-bekas_c198"
 ITEM_TITLE_SELECTOR = '[data-aut-id="itemTitle"]'
 ITEM_PRICE_SELECTOR = '[data-aut-id="itemPrice"]'
 ITEM_MILEAGE_SELECTOR = '[data-aut-id="itemAttribute_mileage"]'
@@ -70,6 +70,90 @@ class OlxCarsService(SharedBaseService):
             prompt_on_cloudflare=cfg.prompt_on_cloudflare,
         )
 
+    def _is_browser_error_page_botasaurus(self, driver) -> bool:
+        return self._page_has_tokens_botasaurus(
+            driver,
+            (
+                "this site can't be reached",
+                "this site cant be reached",
+                "err_tunnel_connection_failed",
+                "tunnel_connection_failed",
+                "err_proxy_connection_failed",
+                "proxy_connection_failed",
+                "err_timed_out",
+                "took too long to respond",
+                "http error 400",
+                "400 bad request",
+                "request header or cookie too large",
+            ),
+        )
+
+    def _load_listing_cards_botasaurus(self, driver, *, url: str, cfg) -> list[dict]:
+        self.logger.info("Navigating (botasaurus): %s", url)
+        self._navigate_botasaurus(driver, url, cfg)
+        time.sleep(max(0.0, cfg.listing_wait_seconds))
+        if self._is_browser_error_page_botasaurus(driver):
+            raise RuntimeError(f"Retryable OLX listing browser error page: current_url={getattr(driver, 'current_url', None)!r}")
+        cards = self._extract_listing_cards_botasaurus(driver)
+        if not cards:
+            raise RuntimeError(f"Retryable OLX listing empty result: current_url={getattr(driver, 'current_url', None)!r}")
+        return cards
+
+    def _retry_listing_with_new_session(self, *, url: str, max_pages: int, base_profile: str) -> list[dict] | None:
+        max_retries = self._env_int("OLX_LISTING_PROXY_RETRIES", 3, minimum=0)
+        if max_retries < 1:
+            return None
+
+        from botasaurus.browser import Driver, browser
+
+        previous_profile = os.getenv("BOTASAURUS_PROFILE")
+        try:
+            for retry_index in range(1, max_retries + 1):
+                retry_profile = f"{base_profile}_listing_r{retry_index}_{str(time.time_ns())[-8:]}"
+                try:
+                    os.environ["BOTASAURUS_PROFILE"] = retry_profile
+                    reset_cached_proxy()
+                    cfg = load_botasaurus_config(service_name="olx")
+                finally:
+                    if previous_profile is None:
+                        os.environ.pop("BOTASAURUS_PROFILE", None)
+                    else:
+                        os.environ["BOTASAURUS_PROFILE"] = previous_profile
+                    reset_cached_proxy()
+
+                self.logger.warning(
+                    "Retrying OLX listing with new session/proxy. retry=%s/%s profile=%s proxy=%s url=%s",
+                    retry_index,
+                    max_retries,
+                    cfg.browser_kwargs.get("profile"),
+                    mask_proxy_url(str(cfg.proxy_url)) if getattr(cfg, "proxy_url", None) else "direct",
+                    url,
+                )
+
+                @browser(**cfg.browser_kwargs)
+                def run_retry(driver: Driver, data):
+                    if cfg.human_mode:
+                        try:
+                            driver.enable_human_mode()
+                        except Exception:
+                            pass
+                    return self._load_listing_cards_botasaurus(driver, url=data["url"], cfg=cfg)
+
+                try:
+                    cards = run_retry({"url": url, "max_pages": max_pages})
+                    if cards:
+                        return cards
+                except Exception as exc:
+                    self.logger.warning("OLX listing retry %s failed: %s", retry_index, exc)
+        finally:
+            if previous_profile is None:
+                os.environ.pop("BOTASAURUS_PROFILE", None)
+            else:
+                os.environ["BOTASAURUS_PROFILE"] = previous_profile
+            reset_cached_proxy()
+
+        return None
+
     def _extract_listing_id(self, url: str) -> str:
         match = re.search(r"iid-(\d+)", url, re.IGNORECASE)
         if match:
@@ -96,6 +180,70 @@ class OlxCarsService(SharedBaseService):
             return False
         path = parsed.path or ""
         return "/item/" in path and bool(re.search(r"iid-\d+", path, re.IGNORECASE))
+
+    def _parse_information_ads_date(self, information_ads: str | None) -> date | None:
+        text = re.sub(r"\s+", " ", str(information_ads or "")).strip().lower()
+        if not text:
+            return None
+
+        today = date.today()
+        if text in {"hari ini", "today"}:
+            return today
+        if "kemarin" in text:
+            try:
+                from datetime import timedelta
+
+                return today - timedelta(days=1)
+            except Exception:
+                return None
+
+        relative_match = re.search(r"(\d+)\s+hari\s+yang\s+lalu", text)
+        if relative_match:
+            try:
+                from datetime import timedelta
+
+                return today - timedelta(days=int(relative_match.group(1)))
+            except Exception:
+                return None
+
+        month_map = {
+            "jan": 1,
+            "januari": 1,
+            "feb": 2,
+            "februari": 2,
+            "mar": 3,
+            "maret": 3,
+            "apr": 4,
+            "april": 4,
+            "mei": 5,
+            "jun": 6,
+            "juni": 6,
+            "jul": 7,
+            "juli": 7,
+            "agu": 8,
+            "agustus": 8,
+            "sep": 9,
+            "sept": 9,
+            "september": 9,
+            "okt": 10,
+            "oktober": 10,
+            "nov": 11,
+            "november": 11,
+            "des": 12,
+            "desember": 12,
+        }
+        match = re.search(r"\b(\d{1,2})\s+([a-z]+)(?:\s+(\d{4}))?\b", text)
+        if not match:
+            return None
+        day = int(match.group(1))
+        month = month_map.get(match.group(2))
+        if not month:
+            return None
+        year = int(match.group(3)) if match.group(3) else today.year
+        try:
+            return date(year, month, day)
+        except Exception:
+            return None
 
     def _normalize_title_token(self, value: str | None) -> str | None:
         text = re.sub(r"\s+", " ", str(value or "")).strip()
@@ -144,8 +292,12 @@ class OlxCarsService(SharedBaseService):
         numbers = re.findall(r"\d+(?:[.,]\d+)*", value)
         if not numbers:
             return None
-        last = numbers[-1].replace(".", "").replace(",", "")
-        return last or None
+        if re.search(r"<\s*\d", value):
+            picked = numbers[0]
+        else:
+            picked = numbers[-1]
+        normalized = picked.replace(".", "").replace(",", "")
+        return normalized or None
 
     def _text_by_css_botasaurus(self, driver, selector: str) -> str | None:
         try:
@@ -178,6 +330,27 @@ class OlxCarsService(SharedBaseService):
                     return value;
                   }
                 }
+
+                const labels = Array.from(document.querySelectorAll('#main_content ._CCSn, #main_content div, #main_content span'));
+                for (const labelEl of labels) {
+                  const label = norm(labelEl.innerText || labelEl.textContent).toLowerCase();
+                  if (!wanted.some((wantedLabel) => label === wantedLabel)) continue;
+
+                  const siblings = [];
+                  if (labelEl.nextElementSibling) siblings.push(labelEl.nextElementSibling);
+                  const parent = labelEl.parentElement;
+                  if (parent) {
+                    siblings.push(...Array.from(parent.querySelectorAll('._3VRXh')));
+                    siblings.push(...Array.from(parent.children).filter((el) => el !== labelEl));
+                  }
+
+                  for (const candidate of siblings) {
+                    const value = norm(candidate.innerText || candidate.textContent);
+                    const valueLower = value.toLowerCase();
+                    if (!value || valueLower === label || wanted.includes(valueLower)) continue;
+                    if (value.length <= 140) return value;
+                  }
+                }
                 return null;
                 """,
                 {"labels": list(labels)},
@@ -185,14 +358,31 @@ class OlxCarsService(SharedBaseService):
         except Exception:
             return None
 
+    def _wait_for_label_value_botasaurus(self, driver, labels: tuple[str, ...], *, timeout_seconds: float = 8.0) -> str | None:
+        deadline = time.time() + max(0.1, timeout_seconds)
+        while time.time() < deadline:
+            value = self._extract_label_value_botasaurus(driver, labels)
+            if value:
+                return value
+            time.sleep(0.25)
+        return None
+
     def _extract_location_botasaurus(self, driver) -> str | None:
-        value = self._extract_label_value_botasaurus(driver, ("lokasi", "location"))
+        value = self._wait_for_label_value_botasaurus(
+            driver,
+            ("lokasi", "location"),
+            timeout_seconds=self._env_float("OLX_DETAIL_LOCATION_WAIT_SECONDS", 8.0, minimum=0.1),
+        )
         if value:
             return value
         return None
 
     def _extract_engine_cc_botasaurus(self, driver) -> str | None:
-        value = self._extract_label_value_botasaurus(driver, ("kapasitas mesin", "engine capacity", "engine"))
+        value = self._wait_for_label_value_botasaurus(
+            driver,
+            ("kapasitas mesin", "engine capacity", "engine"),
+            timeout_seconds=self._env_float("OLX_DETAIL_ENGINE_CC_WAIT_SECONDS", 8.0, minimum=0.1),
+        )
         if value:
             return self._parse_olx_engine_cc(value)
         return None
@@ -452,25 +642,69 @@ class OlxCarsService(SharedBaseService):
             ),
         )
 
-    def _extract_listing_urls_botasaurus(self, driver) -> list[str]:
+    def _extract_listing_cards_botasaurus(self, driver) -> list[dict]:
         try:
-            hrefs = driver.run_js(
-                """
-                return Array.from(document.querySelectorAll('a[href]'))
-                  .map((a) => a.href || a.getAttribute('href'))
-                  .filter(Boolean);
+            items = driver.run_js(
+                r"""
+                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const out = [];
+                for (const li of Array.from(document.querySelectorAll('li[data-aut-id="itemBox"]'))) {
+                  const a = li.querySelector('a[href*="/item/"][href*="iid-"]');
+                  if (!a) continue;
+                  const details = li.querySelector('[data-aut-id="itemDetails"]');
+                  let informationAds = null;
+                  if (details) {
+                    const span = details.querySelector('span');
+                    informationAds = norm(span && (span.innerText || span.textContent));
+                  }
+                  if (!informationAds) {
+                    const text = norm(li.innerText || li.textContent);
+                    const match = text.match(/(Hari ini|Kemarin|\d+\s+hari\s+yang\s+lalu|\d{1,2}\s+(?:Jan|Januari|Feb|Februari|Mar|Maret|Apr|April|Mei|Jun|Juni|Jul|Juli|Agu|Agustus|Sep|Sept|September|Okt|Oktober|Nov|November|Des|Desember)(?:\s+\d{4})?)/i);
+                    informationAds = match ? match[1] : null;
+                  }
+                  out.push({
+                    listing_url: a.href || a.getAttribute('href'),
+                    information_ads: informationAds || null,
+                  });
+                }
+                return out;
                 """
             )
         except Exception:
-            hrefs = []
-        urls: list[str] = []
-        for href in hrefs or []:
-            url = urljoin("https://www.olx.co.id", str(href or "").strip())
+            items = []
+        cards: list[dict] = []
+        seen: set[str] = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            url = urljoin("https://www.olx.co.id", str(item.get("listing_url") or "").strip())
             if self._is_listing_detail_url(url):
-                urls.append(url)
-        return list(dict.fromkeys(urls))
+                if url in seen:
+                    continue
+                seen.add(url)
+                information_ads = str(item.get("information_ads") or "").strip() or None
+                cards.append(
+                    {
+                        "listing_url": url,
+                        "information_ads": information_ads,
+                        "information_ads_date": self._parse_information_ads_date(information_ads),
+                    }
+                )
+        return cards
 
-    def _scrape_single_detail_botasaurus(self, driver, *, url: str, cfg, listing_id: str | None = None) -> dict:
+    def _extract_listing_urls_botasaurus(self, driver) -> list[str]:
+        return [str(item["listing_url"]) for item in self._extract_listing_cards_botasaurus(driver) if item.get("listing_url")]
+
+    def _scrape_single_detail_botasaurus(
+        self,
+        driver,
+        *,
+        url: str,
+        cfg,
+        listing_id: str | None = None,
+        listing_meta: dict | None = None,
+        tracking_mode: bool = False,
+    ) -> dict:
         self._navigate_botasaurus(driver, url, cfg)
         wait_for_css(
             driver,
@@ -487,6 +721,8 @@ class OlxCarsService(SharedBaseService):
 
         listing_id_final = (listing_id or self._extract_listing_id(url) or "").strip()
         if self._is_listing_not_found_botasaurus(driver):
+            if not tracking_mode:
+                raise RuntimeError("OLX listing unavailable/not-found during fresh scrape; not marking sold")
             return self._build_sold_result(url=url, listing_id=listing_id_final)
 
         title_value = self._text_by_css_botasaurus(driver, ITEM_TITLE_SELECTOR)
@@ -505,6 +741,8 @@ class OlxCarsService(SharedBaseService):
 
         if not listing_id_final:
             raise RuntimeError("Missing OLX listing_id")
+        if not location_value:
+            raise RuntimeError("Missing OLX location after detail load wait")
         if not any([brand_value, model_value, price_value, year_value, location_value, mileage_value, engine_cc_value]):
             raise RuntimeError("No extractable OLX detail data")
 
@@ -515,8 +753,8 @@ class OlxCarsService(SharedBaseService):
             "brand": brand_value,
             "model": model_value,
             "variant": variant_value,
-            "information_ads": None,
-            "information_ads_date": None,
+            "information_ads": (listing_meta or {}).get("information_ads"),
+            "information_ads_date": (listing_meta or {}).get("information_ads_date"),
             "location": location_value,
             "price": price_value,
             "year": year_value,
@@ -539,6 +777,48 @@ class OlxCarsService(SharedBaseService):
             "error": None,
             "status": "active",
         }
+
+    def _scrape_single_detail_with_retries(
+        self,
+        driver,
+        *,
+        url: str,
+        cfg,
+        listing_id: str | None = None,
+        listing_meta: dict | None = None,
+        tracking_mode: bool = False,
+    ) -> dict:
+        retries = self._env_int("OLX_DETAIL_RETRIES", 2, minimum=0)
+        retry_wait_seconds = self._env_float("OLX_DETAIL_RETRY_WAIT_SECONDS", 2.0, minimum=0.0)
+        last_exc: Exception | None = None
+
+        for attempt in range(1, retries + 2):
+            try:
+                return self._scrape_single_detail_botasaurus(
+                    driver,
+                    url=url,
+                    cfg=cfg,
+                    listing_id=listing_id,
+                    listing_meta=listing_meta,
+                    tracking_mode=tracking_mode,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt > retries:
+                    break
+                self.logger.warning(
+                    "Retrying OLX detail after error. retry=%s/%s url=%s error=%s",
+                    attempt,
+                    retries,
+                    url,
+                    exc,
+                )
+                if retry_wait_seconds:
+                    time.sleep(retry_wait_seconds)
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("OLX detail retry exhausted")
 
     def _build_sold_result(self, *, url: str, listing_id: str | None) -> dict:
         return {
@@ -594,12 +874,16 @@ class OlxCarsService(SharedBaseService):
                     driver.enable_human_mode()
                 except Exception:
                     pass
-            self.logger.info("Navigating (botasaurus): %s", data["url"])
-            self._navigate_botasaurus(driver, data["url"], cfg)
-            time.sleep(max(0.0, cfg.listing_wait_seconds))
-            return self._extract_listing_urls_botasaurus(driver)
+            return self._load_listing_cards_botasaurus(driver, url=data["url"], cfg=cfg)
 
-        links = run({"url": url, "max_pages": max_pages}) or []
+        try:
+            cards = run({"url": url, "max_pages": max_pages}) or []
+        except Exception as exc:
+            self.logger.warning("OLX listing scrape failed, trying new session/proxy: %s", exc)
+            base_profile = str(cfg.browser_kwargs.get("profile") or "olx")
+            cards = self._retry_listing_with_new_session(url=url, max_pages=max_pages, base_profile=base_profile) or []
+        self._listing_meta_by_url = {str(item.get("listing_url")): item for item in cards if item.get("listing_url")}
+        links = list(self._listing_meta_by_url.keys())
         self.logger.info("Collected %s OLX links.", len(links))
         return links
 
@@ -608,6 +892,7 @@ class OlxCarsService(SharedBaseService):
         links: list[str],
         *,
         listing_id_by_url: dict[str, str] | None = None,
+        listing_meta_by_url: dict[str, dict] | None = None,
         allow_revive_sold: bool = False,
     ) -> list[dict]:
         batch_size = int(os.getenv("DB_BATCH_SIZE", "100"))
@@ -728,9 +1013,22 @@ class OlxCarsService(SharedBaseService):
                     continue
                 self.logger.info("OLX detail %s/%s: %s", idx, len(data["links"]), url)
 
+                tracking_mode = bool(listing_id_by_url)
                 listing_id = listing_id_by_url.get(url) if listing_id_by_url else None
+                listing_meta = None
+                if listing_meta_by_url:
+                    listing_meta = listing_meta_by_url.get(url)
+                if listing_meta is None:
+                    listing_meta = getattr(self, "_listing_meta_by_url", {}).get(url)
                 try:
-                    result = self._scrape_single_detail_botasaurus(driver, url=url, cfg=cfg, listing_id=listing_id)
+                    result = self._scrape_single_detail_with_retries(
+                        driver,
+                        url=url,
+                        cfg=cfg,
+                        listing_id=listing_id,
+                        listing_meta=listing_meta,
+                        tracking_mode=tracking_mode,
+                    )
                 except Exception as exc:
                     self.logger.warning("Error while scraping OLX %s: %s", url, exc)
                     result = self._build_error_result(url, listing_id=listing_id, error_message=str(exc))
