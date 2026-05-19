@@ -273,13 +273,13 @@ class OlxCarsService(SharedBaseService):
         if not value:
             return None, None, None
 
-        match = re.search(r"\b(Bensin|Diesel|Hybrid|Listrik|Electric)\s*-\s*([A-Za-z0-9]+)\b", value, re.IGNORECASE)
+        match = re.search(r"\s+([A-Za-z][A-Za-z-]*)\s*-\s*(AT|MT|A/T|M/T|Automatic|Manual)\s*$", value, re.IGNORECASE)
         if not match:
-            return value, None, None
+            return None, None, None
 
         variant = value[: match.start()].strip(" -") or None
         fuel_type = match.group(1).strip()
-        transmission = match.group(2).strip().upper()
+        transmission = match.group(2).strip().upper().replace("/", "")
         return variant, fuel_type, transmission
 
     def _parse_price(self, text: str | None) -> int | None:
@@ -478,11 +478,18 @@ class OlxCarsService(SharedBaseService):
                     if (/^https?:\/\//i.test(token)) urls.push(token);
                   }
                 };
-                const root = document.querySelector('[data-aut-id="imageGallery"]') || document;
+                const galleries = Array.from(document.querySelectorAll('[data-aut-id="imageGallery"]'));
+                const root = galleries
+                  .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+                  .filter((item) => item.rect.width > 300 && item.rect.height > 200)
+                  .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0]?.el || galleries[0];
+                if (!root) return [];
                 for (const img of Array.from(root.querySelectorAll('img'))) {
                   add(img.currentSrc || img.src || img.getAttribute('src'));
                   add(img.getAttribute('srcset'));
                   add(img.getAttribute('data-src'));
+                  const source = img.closest('picture') && img.closest('picture').querySelector('source[srcset]');
+                  add(source && source.getAttribute('srcset'));
                 }
                 for (const el of Array.from(root.querySelectorAll('[style]'))) {
                   const style = String(el.getAttribute('style') || '');
@@ -492,6 +499,9 @@ class OlxCarsService(SharedBaseService):
                     add(cleaned);
                   }
                 }
+                const html = root.innerHTML || '';
+                const apolloMatches = html.match(/https?:\/\/apollo\.olx\.co\.id(?::443)?\/v1\/files\/[^\s"'<>]+\/image[^\s"'<>]*/g) || [];
+                for (const match of apolloMatches) add(match.replace(':443/', '/'));
                 return Array.from(new Set(urls));
                 """
             )
@@ -535,26 +545,9 @@ class OlxCarsService(SharedBaseService):
         return score
 
     def _extract_images_botasaurus(self, driver) -> list[str] | None:
-        seen: dict[str, None] = {}
         self._open_gallery_botasaurus(driver)
         time.sleep(self._env_float("OLX_IMAGE_GALLERY_OPEN_WAIT_SECONDS", 0.5, minimum=0.0))
-        image_total = self._gallery_image_total_botasaurus(driver)
-        max_clicks = self._env_int("OLX_IMAGE_NEXT_CLICKS", 40, minimum=0)
-        if image_total:
-            max_clicks = min(max_clicks, image_total + 2)
-        wait_seconds = self._env_float("OLX_IMAGE_NEXT_WAIT_SECONDS", 0.25, minimum=0.0)
-        for idx in range(max_clicks + 1):
-            for image_url in self._extract_images_once_botasaurus(driver):
-                seen.setdefault(image_url, None)
-            if image_total and len(seen) >= image_total:
-                break
-            if idx >= max_clicks:
-                break
-            if not self._click_next_gallery_botasaurus(driver):
-                break
-            if wait_seconds:
-                time.sleep(wait_seconds)
-        return list(seen.keys()) or None
+        return self._extract_images_once_botasaurus(driver) or None
 
     def _extract_description_botasaurus(self, driver) -> str | None:
         self._click_show_more_description_botasaurus(driver)
@@ -941,17 +934,17 @@ class OlxCarsService(SharedBaseService):
           condition = COALESCE(EXCLUDED.condition, cars_scrap_olx.condition),
           brand = COALESCE(EXCLUDED.brand, cars_scrap_olx.brand),
           model = COALESCE(EXCLUDED.model, cars_scrap_olx.model),
-          variant = COALESCE(EXCLUDED.variant, cars_scrap_olx.variant),
+          variant = EXCLUDED.variant,
           information_ads = COALESCE(EXCLUDED.information_ads, cars_scrap_olx.information_ads),
           information_ads_date = COALESCE(EXCLUDED.information_ads_date, cars_scrap_olx.information_ads_date),
           location = COALESCE(EXCLUDED.location, cars_scrap_olx.location),
           price = COALESCE(EXCLUDED.price, cars_scrap_olx.price),
           year = COALESCE(EXCLUDED.year, cars_scrap_olx.year),
           mileage = COALESCE(EXCLUDED.mileage, cars_scrap_olx.mileage),
-          transmission = COALESCE(EXCLUDED.transmission, cars_scrap_olx.transmission),
+          transmission = EXCLUDED.transmission,
           seat_capacity = COALESCE(EXCLUDED.seat_capacity, cars_scrap_olx.seat_capacity),
           engine_cc = COALESCE(EXCLUDED.engine_cc, cars_scrap_olx.engine_cc),
-          fuel_type = COALESCE(EXCLUDED.fuel_type, cars_scrap_olx.fuel_type),
+          fuel_type = EXCLUDED.fuel_type,
           series = COALESCE(EXCLUDED.series, cars_scrap_olx.series),
           type = COALESCE(EXCLUDED.type, cars_scrap_olx.type),
           images = COALESCE(EXCLUDED.images, cars_scrap_olx.images),
