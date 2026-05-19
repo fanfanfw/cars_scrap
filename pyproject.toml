@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cars-scrap"
 version = "0.1.0"
-description = "Cars scraping services (mudah.my, carlist, mobil123 & carmudi) using Botasaurus"
+description = "Cars scraping services (mudah.my, carlist, mobil123, carmudi & olx) using Botasaurus"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,10 +22,12 @@ scrape-mudahmy = "scrap_mudahmy_cars_botasaurus.run_scraper:main"
 scrape-carlist = "scrap_carlist_cars_botasaurus.run_scraper:main"
 scrape-mobil123 = "scrap_mobil123_cars_botasaurus.run_scraper:main"
 scrape-carmudi = "scrap_carmudi_cars_botasaurus.run_scraper:main"
+scrape-olx = "scrap_olx_cars_botasaurus.run_scraper:main"
 serve-mudahmy = "scrap_mudahmy_cars_botasaurus.app:main"
 serve-carlist = "scrap_carlist_cars_botasaurus.app:main"
 serve-mobil123 = "scrap_mobil123_cars_botasaurus.app:main"
 serve-carmudi = "scrap_carmudi_cars_botasaurus.app:main"
+serve-olx = "scrap_olx_cars_botasaurus.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = [
@@ -34,4 +36,5 @@ packages = [
   "scrap_carlist_cars_botasaurus",
   "scrap_mobil123_cars_botasaurus",
   "scrap_carmudi_cars_botasaurus",
+  "scrap_olx_cars_botasaurus",
 ]
