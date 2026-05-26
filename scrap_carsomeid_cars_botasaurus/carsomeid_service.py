@@ -7,17 +7,21 @@ from hashlib import sha1
 from urllib.parse import urljoin, urlparse
 
 from dotenv import load_dotenv
+import requests
+from psycopg2.extras import Json, execute_values
 
 from cars_scrap_common.botasaurus_utils import load_botasaurus_config
 from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
 from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
 from cars_scrap_common.shared_base_service import SharedBaseService
+from scrap_carsomeid_cars_botasaurus.database import get_connection
 
 load_dotenv(override=True)
 
 DEFAULT_LISTING_URL = "https://www.carsome.id/beli-mobil-bekas?sortKey=2"
 BASE_URL = "https://www.carsome.id"
+CARSOMEID_DETAIL_API_URL = "https://www.carsome.id/website/CarList/CarListDetail/v2"
 
 
 class CarsomeIdCarsService(SharedBaseService):
@@ -93,8 +97,11 @@ class CarsomeIdCarsService(SharedBaseService):
         path = (parsed.path or "").rstrip("/")
         slug = path.rsplit("/", 1)[-1].strip()
         if slug:
-            return slug
+            return slug.lower()
         return sha1(url.encode("utf-8")).hexdigest()[:16]
+
+    def _listing_id_to_car_no(self, listing_id: str) -> str:
+        return str(listing_id or "").strip().upper()
 
     def _is_on_target_domain(self, url: str) -> bool:
         try:
@@ -196,6 +203,152 @@ class CarsomeIdCarsService(SharedBaseService):
                 urls.append(url)
         return list(dict.fromkeys(urls))
 
+    def _parse_int(self, value: object) -> int | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.startswith("-") and text[1:].isdigit():
+            return int(text)
+        digits = re.findall(r"\d+", text)
+        if not digits:
+            return None
+        try:
+            return int("".join(digits))
+        except Exception:
+            return None
+
+    def _first_text(self, *values: object) -> str | None:
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return None
+
+    def _collect_images(self, car: dict) -> list[str] | None:
+        images: list[str] = []
+
+        def add(value: object) -> None:
+            if isinstance(value, str):
+                url = value.strip()
+                if url.startswith(("http://", "https://")):
+                    images.append(url)
+                return
+            if isinstance(value, dict):
+                for key in ("url", "image", "imageUrl", "src"):
+                    add(value.get(key))
+                return
+            if isinstance(value, list):
+                for item in value:
+                    add(item)
+
+        add(car.get("image"))
+        for key in ("innerImage", "outerImage", "imagesInner", "imagesOuter", "carInnerImage", "carOutImage"):
+            add(car.get(key))
+
+        deduped = list(dict.fromkeys(images))
+        return deduped or None
+
+    def _status_from_detail(self, payload: dict) -> str:
+        car = ((payload or {}).get("data") or {}).get("car") or {}
+        sale_status_name = str(car.get("saleStatusName") or "").strip().lower()
+        car_status_label = str(car.get("carStatusLabel") or "").strip().lower()
+        if sale_status_name and sale_status_name not in {"listed"}:
+            return "sold"
+        if "sold" in car_status_label or "unavailable" in car_status_label:
+            return "sold"
+        return "active"
+
+    def _extract_detail_fields(self, *, url: str, payload: dict) -> dict:
+        listing_id = self._extract_listing_id(url)
+        car = ((payload or {}).get("data") or {}).get("car") or {}
+        all_price = car.get("allPrice") or {}
+        images = self._collect_images(car)
+        image = self._first_text(car.get("image"), *(images or []))
+        price = self._parse_int(all_price.get("price") or car.get("installmentPrice") or car.get("expSellingPrice"))
+
+        return {
+            "listing_id": listing_id,
+            "listing_url": url,
+            "car_no": self._first_text(car.get("carNo"), self._listing_id_to_car_no(listing_id)),
+            "reg_no": self._first_text(car.get("licensePlate"), car.get("regNo")),
+            "car_id": self._parse_int(car.get("carId") or car.get("id")),
+            "image": image,
+            "brand": self._first_text(car.get("brandName")),
+            "model": self._first_text(car.get("modelName")),
+            "model_group": "NO MODEL GROUP",
+            "variant": self._first_text(car.get("carVariant")),
+            "year": self._parse_int(car.get("carYear")),
+            "mileage": self._parse_int(car.get("carMileage")),
+            "price": price,
+            "cash_price": self._parse_int(
+                all_price.get("originalPrice") or all_price.get("expSellingPrice") or car.get("expSellingPrice")
+            ),
+            "installment_price": self._parse_int(
+                all_price.get("installmentPrice") or car.get("installmentPrice") or all_price.get("price")
+            ),
+            "monthly_payment": self._parse_int(all_price.get("monthPrice") or car.get("monthPayment")),
+            "location": self._first_text(car.get("location"), car.get("locationName"), car.get("storeName")),
+            "transmission": self._first_text(car.get("transmissionLabel")),
+            "engine_cc": self._first_text(car.get("carEngine")),
+            "fuel_type": self._first_text(car.get("fuelLabel")),
+            "seat_capacity": self._first_text(car.get("seatSize")),
+            "car_type": self._first_text(car.get("carTypeName"), car.get("carTypeKey")),
+            "color": self._first_text(car.get("colorLabel"), car.get("colorName")),
+            "images": images,
+            "status": self._status_from_detail(payload),
+            "source": "carsomeid",
+            "raw_detail": payload,
+            "error": None,
+        }
+
+    def _build_error_result(self, url: str, *, error_message: str) -> dict:
+        listing_id = self._extract_listing_id(url)
+        return {
+            "listing_id": listing_id,
+            "listing_url": url,
+            "car_no": self._listing_id_to_car_no(listing_id),
+            "status": "active",
+            "source": "carsomeid",
+            "raw_detail": None,
+            "error": "error",
+            "error_message": error_message,
+        }
+
+    def fetch_detail_api(self, url: str) -> dict:
+        listing_id = self._extract_listing_id(url)
+        car_no = self._listing_id_to_car_no(listing_id)
+        timeout = self._carsomeid_env_float("DETAIL_API_TIMEOUT_SECONDS", 30.0, minimum=1.0)
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "country": "ID",
+            "origin": BASE_URL,
+            "referer": url,
+            "user-agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+            ),
+            "x-language": "id",
+            "x-platform": "web",
+        }
+        response = requests.post(
+            CARSOMEID_DETAIL_API_URL,
+            headers=headers,
+            json={"recommendCount": 6, "carNo": car_no, "token": ""},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("CarsomeID detail API returned non-object JSON")
+        if payload.get("code") != "0000" or not (((payload.get("data") or {}).get("car") or {})):
+            raise RuntimeError(f"CarsomeID detail API returned invalid payload for {car_no}: {payload.get('msg')}")
+        return payload
+
     def _load_listing_urls_with_scrolls(self, driver, *, url: str, cfg, scroll_rounds: int) -> list[str]:
         self._navigate_botasaurus(driver, url)
         time.sleep(max(0.0, cfg.listing_wait_seconds))
@@ -259,3 +412,138 @@ class CarsomeIdCarsService(SharedBaseService):
         links = run({"url": url, "max_pages": max_pages}) or []
         self.logger.info("Collected %s links.", len(links))
         return links
+
+    def scrape_listing_details(self, links: list[str]) -> list[dict]:
+        batch_size = self._env_int("DB_BATCH_SIZE", 100, minimum=1)
+        columns = (
+            "listing_id",
+            "listing_url",
+            "car_no",
+            "reg_no",
+            "car_id",
+            "image",
+            "brand",
+            "model",
+            "model_group",
+            "variant",
+            "year",
+            "mileage",
+            "price",
+            "cash_price",
+            "installment_price",
+            "monthly_payment",
+            "location",
+            "transmission",
+            "engine_cc",
+            "fuel_type",
+            "seat_capacity",
+            "car_type",
+            "color",
+            "images",
+            "status",
+            "source",
+        )
+        upsert_sql = f"""
+        INSERT INTO cars_scrap_carsomeid ({", ".join(columns)})
+        VALUES %s
+        ON CONFLICT (listing_id) DO UPDATE SET
+          listing_url = EXCLUDED.listing_url,
+          car_no = COALESCE(EXCLUDED.car_no, cars_scrap_carsomeid.car_no),
+          reg_no = COALESCE(EXCLUDED.reg_no, cars_scrap_carsomeid.reg_no),
+          car_id = COALESCE(EXCLUDED.car_id, cars_scrap_carsomeid.car_id),
+          image = COALESCE(EXCLUDED.image, cars_scrap_carsomeid.image),
+          brand = COALESCE(EXCLUDED.brand, cars_scrap_carsomeid.brand),
+          model = COALESCE(EXCLUDED.model, cars_scrap_carsomeid.model),
+          model_group = COALESCE(EXCLUDED.model_group, cars_scrap_carsomeid.model_group),
+          variant = COALESCE(EXCLUDED.variant, cars_scrap_carsomeid.variant),
+          year = COALESCE(EXCLUDED.year, cars_scrap_carsomeid.year),
+          mileage = COALESCE(EXCLUDED.mileage, cars_scrap_carsomeid.mileage),
+          price = COALESCE(EXCLUDED.price, cars_scrap_carsomeid.price),
+          cash_price = COALESCE(EXCLUDED.cash_price, cars_scrap_carsomeid.cash_price),
+          installment_price = COALESCE(EXCLUDED.installment_price, cars_scrap_carsomeid.installment_price),
+          monthly_payment = COALESCE(EXCLUDED.monthly_payment, cars_scrap_carsomeid.monthly_payment),
+          location = COALESCE(EXCLUDED.location, cars_scrap_carsomeid.location),
+          transmission = COALESCE(EXCLUDED.transmission, cars_scrap_carsomeid.transmission),
+          engine_cc = COALESCE(EXCLUDED.engine_cc, cars_scrap_carsomeid.engine_cc),
+          fuel_type = COALESCE(EXCLUDED.fuel_type, cars_scrap_carsomeid.fuel_type),
+          seat_capacity = COALESCE(EXCLUDED.seat_capacity, cars_scrap_carsomeid.seat_capacity),
+          car_type = COALESCE(EXCLUDED.car_type, cars_scrap_carsomeid.car_type),
+          color = COALESCE(EXCLUDED.color, cars_scrap_carsomeid.color),
+          images = COALESCE(EXCLUDED.images, cars_scrap_carsomeid.images),
+          status = COALESCE(EXCLUDED.status, cars_scrap_carsomeid.status),
+          source = COALESCE(EXCLUDED.source, cars_scrap_carsomeid.source),
+          version = COALESCE(cars_scrap_carsomeid.version, 0) + 1,
+          last_scraped_at = NOW()
+        """
+
+        details_upsert_sql = """
+        INSERT INTO cars_scrap_carsomeid_details (listing_id, listing_url, raw_detail)
+        VALUES %s
+        ON CONFLICT (listing_id) DO UPDATE SET
+          listing_url = EXCLUDED.listing_url,
+          raw_detail = COALESCE(EXCLUDED.raw_detail, cars_scrap_carsomeid_details.raw_detail),
+          last_scraped_at = NOW()
+        """
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        rows: list[tuple] = []
+        details_rows: list[tuple] = []
+        results: list[dict] = []
+
+        def flush_rows() -> None:
+            if not rows and not details_rows:
+                return
+            try:
+                if rows:
+                    deduped_rows = {str(row[0]): row for row in rows if row and row[0]}
+                    execute_values(cursor, upsert_sql, list(deduped_rows.values()), page_size=100)
+                if details_rows:
+                    deduped_details = {str(row[0]): row for row in details_rows if row and row[0]}
+                    execute_values(cursor, details_upsert_sql, list(deduped_details.values()), page_size=100)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            rows.clear()
+            details_rows.clear()
+
+        try:
+            for idx, url in enumerate([str(u or "").strip() for u in links if str(u or "").strip()], start=1):
+                if self.stop_flag:
+                    break
+                self.logger.info("CarsomeID detail %s/%s: %s", idx, len(links), url)
+                try:
+                    payload = self.fetch_detail_api(url)
+                    result = self._extract_detail_fields(url=url, payload=payload)
+                except Exception as exc:
+                    self.logger.warning("Error while scraping CarsomeID %s: %s", url, exc)
+                    result = self._build_error_result(url, error_message=str(exc))
+
+                results.append(result)
+                if result.get("error"):
+                    continue
+
+                rows.append(tuple(result.get(column) for column in columns))
+                details_rows.append(
+                    (
+                        result.get("listing_id"),
+                        result.get("listing_url"),
+                        Json(result.get("raw_detail")) if result.get("raw_detail") else None,
+                    )
+                )
+
+                if len(rows) >= batch_size or len(details_rows) >= batch_size:
+                    flush_rows()
+
+            flush_rows()
+            return results
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
