@@ -23,7 +23,12 @@ def main() -> None:
         "--max-pages",
         type=int,
         default=1,
-        help="Listing scroll rounds to run while collecting URLs (default: 1)",
+        help="Max listing pages to visit using pageNo pagination (default: 1)",
+    )
+    parser.add_argument(
+        "--all-pages",
+        action="store_true",
+        help="Visit pageNo=1,2,3... until CarsomeID returns an empty listing page. Safety cap: CARSOMEID_ALL_PAGES_MAX (default 200).",
     )
     parser.add_argument("--details", action="store_true", help="Fetch listing details and upsert into Postgres")
     parser.add_argument(
@@ -53,7 +58,7 @@ def main() -> None:
             print(json.dumps({"count": len(details), "sample": compact_sample(details, 1), "stored_to_db": True}, indent=2, default=str))
             return
 
-        links = scraper.scrape_all_from_main(start_url=args.start_url, max_pages=args.max_pages)
+        links = scraper.scrape_all_from_main(start_url=args.start_url, max_pages=args.max_pages, all_pages=args.all_pages)
         if args.details:
             details = scraper.scrape_listing_details(links)
             errors = [row for row in details if row.get("error")]

@@ -30,10 +30,11 @@ def scrape_carsomeid_cars():
     data = request.get_json(silent=True) or {}
     start_url = data.get("start_url")
     max_pages = int(data.get("max_pages", 1))
+    all_pages = bool(data.get("all_pages", False))
 
     scraper = CarsomeIdCarsService()
     try:
-        links = scraper.scrape_all_from_main(start_url=start_url, max_pages=max_pages)
+        links = scraper.scrape_all_from_main(start_url=start_url, max_pages=max_pages, all_pages=all_pages)
         return jsonify({"count": len(links), "sample": links[:200]}), 200
     finally:
         scraper.close()
@@ -44,12 +45,13 @@ def scrape_carsomeid_cars_details():
     data = request.get_json(silent=True) or {}
     start_url = data.get("start_url")
     max_pages = int(data.get("max_pages", 1))
+    all_pages = bool(data.get("all_pages", False))
     links = data.get("links")
 
     scraper = CarsomeIdCarsService()
     try:
         if not links:
-            links = scraper.scrape_all_from_main(start_url=start_url, max_pages=max_pages)
+            links = scraper.scrape_all_from_main(start_url=start_url, max_pages=max_pages, all_pages=all_pages)
         details = scraper.scrape_listing_details(links)
         errors = [row for row in details if row.get("error")]
         return jsonify(

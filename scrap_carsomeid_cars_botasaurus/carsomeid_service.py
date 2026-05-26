@@ -4,7 +4,7 @@ import os
 import re
 import time
 from hashlib import sha1
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from dotenv import load_dotenv
 import requests
@@ -203,6 +203,35 @@ class CarsomeIdCarsService(SharedBaseService):
                 urls.append(url)
         return list(dict.fromkeys(urls))
 
+    def _page_has_no_listing_botasaurus(self, driver) -> bool:
+        try:
+            return bool(
+                driver.run_js(
+                    """
+                    const text = ((document.body && document.body.innerText) || '').toLowerCase();
+                    const hasCards = !!document.querySelector(
+                      '.list-card__item a.mod-b-card__header[href], a.mod-b-card__header[href]'
+                    );
+                    return !hasCards && (
+                      text.includes('tidak ada lagi mobil') ||
+                      text.includes('tidak menemukan apa yang anda cari') ||
+                      text.includes('tidak ada mobil')
+                    );
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _url_for_page(self, url: str, page_no: int) -> str:
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query["pageNo"] = [str(page_no)]
+        if "sortKey" not in query:
+            query["sortKey"] = ["2"]
+        encoded = urlencode(query, doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, encoded, parsed.fragment))
+
     def _parse_int(self, value: object) -> int | None:
         if value is None:
             return None
@@ -349,38 +378,44 @@ class CarsomeIdCarsService(SharedBaseService):
             raise RuntimeError(f"CarsomeID detail API returned invalid payload for {car_no}: {payload.get('msg')}")
         return payload
 
-    def _load_listing_urls_with_scrolls(self, driver, *, url: str, cfg, scroll_rounds: int) -> list[str]:
-        self._navigate_botasaurus(driver, url)
-        time.sleep(max(0.0, cfg.listing_wait_seconds))
-        self._dismiss_popups_botasaurus(driver)
-
+    def _load_listing_urls_by_pages(self, driver, *, url: str, cfg, max_pages: int, all_pages: bool) -> list[str]:
         collected: list[str] = []
-        stable_rounds = 0
-        scroll_pause = self._carsomeid_env_float("LISTING_SCROLL_PAUSE_SECONDS", 2.0, minimum=0.0)
+        page_pause = self._carsomeid_env_float("LISTING_PAGE_PAUSE_SECONDS", 1.0, minimum=0.0)
+        page_limit = max_pages
+        if all_pages:
+            page_limit = self._carsomeid_env_int("ALL_PAGES_MAX", 200, minimum=1)
 
-        for round_index in range(0, max(1, scroll_rounds)):
+        for page_no in range(1, page_limit + 1):
+            page_url = self._url_for_page(url, page_no)
+            self.logger.info("Navigating CarsomeID listing page %s/%s: %s", page_no, page_limit, page_url)
+            self._navigate_botasaurus(driver, page_url)
+            time.sleep(max(0.0, cfg.listing_wait_seconds))
+            self._dismiss_popups_botasaurus(driver)
+
             urls = self._extract_listing_urls_botasaurus(driver)
-            before = len(collected)
-            collected = list(dict.fromkeys([*collected, *urls]))
-
-            if len(collected) == before:
-                stable_rounds += 1
-            else:
-                stable_rounds = 0
-
-            if round_index >= scroll_rounds - 1 or stable_rounds >= 2:
+            if not urls:
+                if self._page_has_no_listing_botasaurus(driver):
+                    self.logger.info("CarsomeID listing page %s has no listings; stopping pagination.", page_no)
+                    break
+                self.logger.warning("CarsomeID listing page %s returned no listing links; stopping pagination.", page_no)
                 break
 
-            try:
-                driver.run_js("window.scrollTo(0, document.body.scrollHeight);")
-            except Exception:
-                pass
-            if scroll_pause:
-                time.sleep(scroll_pause)
+            before = len(collected)
+            collected = list(dict.fromkeys([*collected, *urls]))
+            self.logger.info("CarsomeID listing page %s collected %s links (%s new).", page_no, len(urls), len(collected) - before)
+
+            if page_no < page_limit and page_pause:
+                time.sleep(page_pause)
+
+        if all_pages and len(collected) > 0 and page_no >= page_limit:
+            self.logger.warning(
+                "CarsomeID all-pages reached safety cap of %s page(s). Increase CARSOMEID_ALL_PAGES_MAX if needed.",
+                page_limit,
+            )
 
         return collected
 
-    def scrape_all_from_main(self, start_url: str | None = None, max_pages: int = 1) -> list[str]:
+    def scrape_all_from_main(self, start_url: str | None = None, max_pages: int = 1, *, all_pages: bool = False) -> list[str]:
         if max_pages < 1:
             raise ValueError("max_pages must be >= 1")
 
@@ -402,14 +437,15 @@ class CarsomeIdCarsService(SharedBaseService):
                     pass
 
             self.logger.info("Navigating (botasaurus): %s", data["url"])
-            return self._load_listing_urls_with_scrolls(
+            return self._load_listing_urls_by_pages(
                 driver,
                 url=data["url"],
                 cfg=cfg,
-                scroll_rounds=int(data["max_pages"]),
+                max_pages=int(data["max_pages"]),
+                all_pages=bool(data.get("all_pages")),
             )
 
-        links = run({"url": url, "max_pages": max_pages}) or []
+        links = run({"url": url, "max_pages": max_pages, "all_pages": all_pages}) or []
         self.logger.info("Collected %s links.", len(links))
         return links
 
