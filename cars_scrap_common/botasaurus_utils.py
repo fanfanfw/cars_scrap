@@ -27,7 +27,7 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
     """
     Loads a single global Botasaurus driver configuration for all scrapers.
 
-    `service_name` is only used to pick a default profile name when BOTASAURUS_PROFILE is empty.
+    `service_name` is used to pick a default profile name and proxy pool.
     """
     enable_xvfb = env_bool("BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY", False)
     headless = False
@@ -54,7 +54,7 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
     }
     if enable_xvfb:
         browser_kwargs["enable_xvfb_virtual_display"] = True
-    proxy = load_proxy_for_run()
+    proxy = load_proxy_for_run(service_name=service_name)
     if proxy:
         browser_kwargs["proxy"] = proxy
 

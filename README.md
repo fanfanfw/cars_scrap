@@ -236,10 +236,15 @@ Catatan operasional:
 - `PROXY_ENABLED`
 - `PROXY_SERVER`
 - `PROXY_SERVERS`
+- `PROXY_SERVER_ID`
+- `PROXY_SERVER_MY`
+- `PROXY_POOL_<SERVICE>`
 - `PROXY_SCHEME`
+- `PROXY_SCHEME_<POOL>`
 - `PROXY_USERNAME`
 - `PROXY_PASSWORD`
 - `PROXY_STATE_FILE`
+- `PROXY_STATE_FILE_<POOL>`
 - `PROXY_CHECK_IP`
 - `PROXY_CHECK_URL`
 
@@ -247,7 +252,30 @@ Catatan:
 
 - `PROXY_SERVERS` bisa berisi daftar proxy dipisah koma
 - format yang didukung: URL penuh, `HOST:PORT`, atau `HOST:PORT:USER:PASS`
-- jika lebih dari satu proxy diberikan, repo ini melakukan rotasi round-robin dan menyimpan state di `profiles/proxy_state.json`
+- proxy pool per service bisa memakai `PROXY_SERVER_<POOL>` atau `PROXY_SERVERS_<POOL>`, misalnya `PROXY_SERVER_ID` dan `PROXY_SERVER_MY`
+- default pool: `mudahmy` dan `carlist` memakai `MY`; source lain memakai `ID`
+- override pool per source dengan `PROXY_POOL_<SERVICE>`, misalnya `PROXY_POOL_OLX=ID` atau `PROXY_POOL_CARLIST=MY`
+- `PROXY_POOL_*` menerima `IND` sebagai alias untuk `ID`
+- jika pool-specific proxy kosong, scraper fallback ke `PROXY_SERVER` atau `PROXY_SERVERS`
+- jika lebih dari satu proxy diberikan, repo ini melakukan rotasi round-robin dan menyimpan state di `profiles/proxy_state.json`; pool-specific proxy memakai state terpisah seperti `profiles/proxy_state_id.json` dan `profiles/proxy_state_my.json`
+
+Contoh proxy pool:
+
+```env
+PROXY_ENABLED=true
+PROXY_SCHEME=http
+PROXY_CHECK_IP=true
+
+PROXY_SERVER_ID=ip:port:user:pass,ip:port:user:pass
+PROXY_SERVER_MY=ip:port:user:pass,ip:port:user:pass
+
+PROXY_POOL_MUDAHMY=MY
+PROXY_POOL_CARLIST=MY
+PROXY_POOL_OLX=ID
+PROXY_POOL_MOBIL123=ID
+PROXY_POOL_CARMUDI=ID
+PROXY_POOL_CARSOMEID=ID
+```
 
 ### Cloudflare fallback khusus carlist, mobil123, dan carmudi
 

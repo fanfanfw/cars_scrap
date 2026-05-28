@@ -10,6 +10,12 @@ from urllib.parse import quote, urlparse
 from cars_scrap_common.env_utils import env_bool
 
 
+DEFAULT_PROXY_POOLS = {
+    "carlist": "MY",
+    "mudahmy": "MY",
+}
+
+
 @dataclass(frozen=True)
 class ProxySpec:
     host: str
@@ -32,6 +38,36 @@ def _repo_root() -> Path:
 
 def default_proxy_state_path() -> Path:
     return _repo_root() / "profiles" / "proxy_state.json"
+
+
+def default_proxy_pool_state_path(pool: str) -> Path:
+    safe_pool = "".join(ch.lower() if ch.isalnum() else "_" for ch in pool).strip("_")
+    return _repo_root() / "profiles" / f"proxy_state_{safe_pool or 'default'}.json"
+
+
+def _normalize_service_name(service_name: str | None) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "_" for ch in (service_name or "")).strip("_")
+
+
+def _normalize_pool_name(pool: str | None) -> str | None:
+    value = (pool or "").strip().upper()
+    if not value:
+        return None
+    if value == "IND":
+        return "ID"
+    return value
+
+
+def resolve_proxy_pool(service_name: str | None) -> str | None:
+    service = _normalize_service_name(service_name)
+    if not service:
+        return None
+
+    override = os.getenv(f"PROXY_POOL_{service.upper()}")
+    if override is not None:
+        return _normalize_pool_name(override)
+
+    return DEFAULT_PROXY_POOLS.get(service, "ID")
 
 
 def parse_proxy_items(raw: str | None, *, scheme: str = "http") -> list[str]:
@@ -110,43 +146,64 @@ def pick_next_proxy(proxies: Iterable[str], *, state_path: Path | None = None) -
     return picked
 
 
-def load_proxy_for_run() -> str | None:
+def load_proxy_for_run(*, service_name: str | None = None) -> str | None:
     """
-    Loads PROXY_SERVER/PROXY_SERVERS and returns a single proxy URL to be used for the entire run.
+    Loads a proxy URL to be used for the entire run.
+
+    If `service_name` is provided, PROXY_POOL_<SERVICE> selects a pool and then
+    PROXY_SERVER_<POOL>/PROXY_SERVERS_<POOL> is preferred. Defaults route
+    carlist/mudahmy to MY and all other services to ID. Falls back to the global
+    PROXY_SERVER/PROXY_SERVERS when no pool-specific proxy is configured.
     Rotation is round-robin using a small state file under ./profiles.
     """
     enabled_raw = os.getenv("PROXY_ENABLED")
     if enabled_raw is not None and not env_bool("PROXY_ENABLED", True):
         return None
 
-    global _CACHED_PROXY, _CACHED_PROXY_SET
-    if _CACHED_PROXY_SET:
-        return _CACHED_PROXY
+    pool = resolve_proxy_pool(service_name)
+    cache_key = pool or "__global__"
+    if cache_key in _CACHED_PROXIES:
+        return _CACHED_PROXIES[cache_key]
 
-    raw = os.getenv("PROXY_SERVER") or os.getenv("PROXY_SERVERS") or ""
-    scheme = (os.getenv("PROXY_SCHEME") or "http").strip() or "http"
+    raw = ""
+    raw_from_pool = False
+    if pool:
+        raw = os.getenv(f"PROXY_SERVER_{pool}") or os.getenv(f"PROXY_SERVERS_{pool}") or ""
+        raw_from_pool = bool(raw.strip())
+    if not raw:
+        raw = os.getenv("PROXY_SERVER") or os.getenv("PROXY_SERVERS") or ""
+
+    scheme = ""
+    if pool:
+        scheme = os.getenv(f"PROXY_SCHEME_{pool}") or ""
+    scheme = (scheme or os.getenv("PROXY_SCHEME") or "http").strip() or "http"
 
     proxies = parse_proxy_items(raw, scheme=scheme)
     if not proxies:
-        _CACHED_PROXY = None
-        _CACHED_PROXY_SET = True
+        _CACHED_PROXIES[cache_key] = None
         return None
 
-    state_override = (os.getenv("PROXY_STATE_FILE") or "").strip()
-    state_path = Path(state_override) if state_override else None
-    _CACHED_PROXY = pick_next_proxy(proxies, state_path=state_path)
-    _CACHED_PROXY_SET = True
-    return _CACHED_PROXY
+    state_override = ""
+    if pool:
+        state_override = os.getenv(f"PROXY_STATE_FILE_{pool}") or ""
+    state_override = (state_override or os.getenv("PROXY_STATE_FILE") or "").strip()
+    if state_override:
+        state_path = Path(state_override)
+    elif pool and raw_from_pool:
+        state_path = default_proxy_pool_state_path(pool)
+    else:
+        state_path = None
+
+    proxy = pick_next_proxy(proxies, state_path=state_path)
+    _CACHED_PROXIES[cache_key] = proxy
+    return proxy
 
 
 def reset_cached_proxy() -> None:
-    global _CACHED_PROXY, _CACHED_PROXY_SET
-    _CACHED_PROXY = None
-    _CACHED_PROXY_SET = False
+    _CACHED_PROXIES.clear()
 
 
-_CACHED_PROXY: str | None = None
-_CACHED_PROXY_SET = False
+_CACHED_PROXIES: dict[str, str | None] = {}
 
 
 def mask_proxy_url(proxy_url: str) -> str:

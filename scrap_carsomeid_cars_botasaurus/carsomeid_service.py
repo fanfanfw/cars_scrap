@@ -80,7 +80,9 @@ class CarsomeIdCarsService(SharedBaseService):
 
     def _load_botasaurus_config(self):
         previous = os.getenv("PROXY_ENABLED")
-        proxy_enabled = os.getenv("CARSOMEID_PROXY_ENABLED", "false")
+        proxy_enabled = os.getenv("CARSOMEID_PROXY_ENABLED")
+        if proxy_enabled is None:
+            return load_botasaurus_config(service_name="carsomeid")
         try:
             os.environ["PROXY_ENABLED"] = proxy_enabled
             reset_cached_proxy()
