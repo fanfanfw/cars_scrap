@@ -54,6 +54,9 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
     }
     if enable_xvfb:
         browser_kwargs["enable_xvfb_virtual_display"] = True
+        # Xvfb only provides an X11 display. On Wayland desktops Chrome can ignore
+        # DISPLAY and still open on the real desktop unless Ozone is forced to X11.
+        browser_kwargs["add_arguments"] = ["--ozone-platform=x11"]
     proxy = load_proxy_for_run(service_name=service_name)
     if proxy:
         browser_kwargs["proxy"] = proxy
