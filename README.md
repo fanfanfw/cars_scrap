@@ -145,28 +145,21 @@ File SQL yang tersedia:
 Contoh bootstrap schema:
 
 ```bash
-export PGPASSWORD="$DB_PASSWORD"
+./scripts/migrate_sql.sh
+```
 
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mudahmy.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mudahmy_details.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_mudahmy.sql
+Jika package sudah terinstall sebagai command project, bisa juga menjalankan:
 
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carlist.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carlistmy_details.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_carlist.sql
-
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mobil123.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_mobil123_details.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_mobil123.sql
-
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carmudi.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/cars_scrap_carmudi_details.sql
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f sql/price_history_scrap_carmudi.sql
+```bash
+migrate-sql
 ```
 
 Catatan:
 
 - file SQL bersifat idempotent karena memakai `CREATE TABLE IF NOT EXISTS` dan `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+- `scripts/migrate_sql.sh` otomatis menjalankan semua file `sql/*.sql`; jika ada source baru, cukup tambah file SQL dengan pola nama yang sama
+- urutan migrasi otomatis: tabel utama `cars_scrap_*`, tabel details `cars_scrap_*_details`, lalu price history `price_history_scrap_*`
+- cek urutan tanpa menyentuh DB dengan `./scripts/migrate_sql.sh --dry-run`
 - tabel `price_history_*` memakai trigger untuk mencatat perubahan `price`
 - tabel `*_details` menyimpan field ekstra dari halaman detail
 
