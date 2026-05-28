@@ -375,6 +375,42 @@ class OlxCarsService(SharedBaseService):
         )
         if value:
             return value
+
+        try:
+            fallback = driver.run_js(
+                r"""
+                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const bad = /^(lokasi|location|lihat peta|share|bagikan|chat|hubungi|jual mobil)$/i;
+                const selectors = [
+                  '[data-aut-id="itemLocation"]',
+                  '[data-aut-id="item-location"]',
+                  '[data-aut-id*="location" i]',
+                  '[class*="location" i]',
+                  '[aria-label*="location" i]',
+                  '[aria-label*="lokasi" i]'
+                ];
+
+                for (const selector of selectors) {
+                  for (const el of Array.from(document.querySelectorAll(selector))) {
+                    const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label'));
+                    if (text && !bad.test(text) && text.length <= 160) return text;
+                  }
+                }
+
+                const haystack = norm(document.querySelector('#main_content')?.innerText || document.body?.innerText || '');
+                const labeled = haystack.match(/(?:Lokasi|Location)\s*[:\n]\s*([^\n]+?)(?=\s{2,}|\n|$)/i);
+                if (labeled) {
+                  const text = norm(labeled[1]);
+                  if (text && !bad.test(text) && text.length <= 160) return text;
+                }
+
+                return null;
+                """
+            )
+        except Exception:
+            fallback = None
+        if fallback:
+            return str(fallback).strip() or None
         return None
 
     def _extract_engine_cc_botasaurus(self, driver) -> str | None:
@@ -734,10 +770,10 @@ class OlxCarsService(SharedBaseService):
 
         if not listing_id_final:
             raise RuntimeError("Missing OLX listing_id")
-        if not location_value:
-            raise RuntimeError("Missing OLX location after detail load wait")
         if not any([brand_value, model_value, price_value, year_value, location_value, mileage_value, engine_cc_value]):
             raise RuntimeError("No extractable OLX detail data")
+        if not location_value:
+            self.logger.debug("OLX location missing but detail data was extracted: %s", url)
 
         return {
             "listing_id": listing_id_final,
