@@ -1178,22 +1178,53 @@ class CarlistCarsService(SharedBaseService):
         if not listing_id_final:
             raise RuntimeError("Missing listing_id on page")
 
-        condition_value = self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
-        brand_value = self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
-        model_value = self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
-        variant_value = self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
+        json_ld_items = self._json_ld_objects_botasaurus(driver)
+        condition_value = self._normalize_condition_value(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:type", "variant_type"])
+            or self._first_json_ld_value(json_ld_items, "itemCondition")
+            or self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
+        )
+        brand_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:make", "WT.z_make"])
+            or self._first_json_ld_value(json_ld_items, "brand")
+            or self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
+        )
+        model_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:model", "WT.z_model"])
+            or self._first_json_ld_value(json_ld_items, "model")
+            or self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
+        )
+        variant_value = self._clean_variant_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:variant"])
+            or self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
+        )
 
         info_ads_value = self._extract_information_ads_botasaurus(driver)
         info_ads_date_value = self._parse_information_ads_date(info_ads_value)
 
         location_value = self._extract_location_botasaurus(driver)
-        price_value = self._parse_int_from_text(self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content"))
-        year_value = self._parse_int_from_text(self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content"))
+        price_value = self._parse_rupiah_price(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:price", "WT.z_price"])
+            or self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content")
+        )
+        year_value = self._clean_year(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:year", "WT.z_year"])
+            or self._first_json_ld_value(json_ld_items, "vehicleModelDate")
+            or self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content")
+        )
         mileage_value = self._parse_mileage(self._get_text_by_xpath_botasaurus(driver, MILEAGE_XPATH))
-        transmission_value = self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
+        transmission_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:transmission", "WT.z_transmission"])
+            or self._first_json_ld_value(json_ld_items, "vehicleTransmission")
+            or self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
+        )
         seat_capacity_value = self._get_text_by_xpath_botasaurus(driver, SEAT_CAPACITY_XPATH)
         engine_cc_value = self._normalize_engine_cc(self._get_text_by_xpath_botasaurus(driver, ENGINE_CC_XPATH))
-        fuel_type_value = self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
+        fuel_type_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:fuel_type", "WT.z_Fueltype"])
+            or self._first_json_ld_value(json_ld_items, "fuelType")
+            or self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
+        )
         images_value = self._extract_images_botasaurus(driver)
         whatsapp_numbers_value = self._extract_whatsapp_numbers_botasaurus(driver, listing_id=listing_id_final)
         contact_seller_value = self._extract_contact_seller_botasaurus(driver, listing_id=listing_id_final)

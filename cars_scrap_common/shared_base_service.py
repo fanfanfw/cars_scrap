@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import re
 import time
+import json
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 
@@ -187,6 +189,168 @@ class SharedBaseService:
             return int("".join(digits))
         except Exception:
             return None
+
+    def _parse_rupiah_price(self, text: object | None) -> int | None:
+        if isinstance(text, (int, float)):
+            value = int(text)
+            return value if 0 < value <= 100_000_000_000 else None
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        if re.search(r"https?://|icarcdn|\.webp|\.jpg|\.png", raw, re.IGNORECASE):
+            return None
+        decimal_match = re.fullmatch(r"\d+\.\d{1,2}", raw)
+        if decimal_match:
+            value = int(float(raw))
+            return value if 0 < value <= 100_000_000_000 else None
+        if ("rp" not in raw.lower()) and ("rm" not in raw.lower()) and not re.search(r"\d[\d.,]{5,}", raw):
+            return None
+        digits = re.findall(r"\d+", raw)
+        if not digits:
+            return None
+        try:
+            value = int("".join(digits))
+        except Exception:
+            return None
+        return value if 0 < value <= 100_000_000_000 else None
+
+    def _json_ld_objects_botasaurus(self, driver) -> list[dict]:
+        try:
+            raw_items = driver.run_js(
+                """
+                return Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+                  .map((el) => el.textContent || '')
+                  .filter(Boolean);
+                """
+            )
+        except Exception:
+            raw_items = []
+
+        objects: list[dict] = []
+
+        def add_obj(value) -> None:
+            if isinstance(value, dict):
+                objects.append(value)
+                graph = value.get("@graph")
+                if isinstance(graph, list):
+                    for item in graph:
+                        add_obj(item)
+            elif isinstance(value, list):
+                for item in value:
+                    add_obj(item)
+
+        for raw in raw_items or []:
+            try:
+                add_obj(json.loads(str(raw)))
+            except Exception:
+                continue
+        return objects
+
+    def _first_meta_content_botasaurus(self, driver, names: list[str]) -> str | None:
+        ordered_names = list(dict.fromkeys(str(name or "").strip().lower() for name in names if str(name or "").strip()))
+        if not ordered_names:
+            return None
+        try:
+            value = driver.run_js(
+                """
+                const names = args.names.map((s) => String(s || '').trim().toLowerCase());
+                const metas = Array.from(document.querySelectorAll('meta'));
+                for (const name of names) {
+                  for (const meta of metas) {
+                    const keys = [
+                      meta.getAttribute('name'),
+                      meta.getAttribute('property'),
+                      meta.getAttribute('itemprop')
+                    ].map((s) => String(s || '').trim().toLowerCase());
+                    if (!keys.includes(name)) continue;
+                    const content = String(meta.getAttribute('content') || '').trim();
+                    if (content) return content;
+                  }
+                }
+                return null;
+                """,
+                {"names": ordered_names},
+            )
+            if value:
+                return str(value).strip() or None
+        except Exception:
+            pass
+
+        try:
+            html = str(driver.page_html or "")
+        except Exception:
+            html = ""
+        if not html:
+            return None
+
+        meta_re = re.compile(r"<meta\b(?P<attrs>[^>]*?)>", re.IGNORECASE | re.DOTALL)
+        attr_re = re.compile(r"([:\w-]+)\s*=\s*(['\"])(.*?)\2", re.IGNORECASE | re.DOTALL)
+        metas = []
+        for match in meta_re.finditer(html):
+            metas.append({key.lower(): value for key, _, value in attr_re.findall(match.group("attrs") or "")})
+        for name in ordered_names:
+            for attrs in metas:
+                keys = {
+                    str(attrs.get("name") or "").strip().lower(),
+                    str(attrs.get("property") or "").strip().lower(),
+                    str(attrs.get("itemprop") or "").strip().lower(),
+                }
+                if name not in keys:
+                    continue
+                content = re.sub(r"\s+", " ", str(attrs.get("content") or "")).strip()
+                if content:
+                    return content
+        return None
+
+    def _first_json_ld_value(self, items: list[dict], key: str) -> str | None:
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            value = item.get(key)
+            if isinstance(value, dict):
+                value = value.get("name") or value.get("value") or value.get("engineType")
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            if text:
+                return text
+        return None
+
+    def _normalize_condition_value(self, value: str | None) -> str | None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            return None
+        lower = text.lower()
+        if "used" in lower:
+            return "Used Car"
+        if "recon" in lower:
+            return "Recon Car"
+        if "new" in lower:
+            return "New Car"
+        return text[:50]
+
+    def _clean_short_text(self, value: object | None, *, max_len: int = 100) -> str | None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            return None
+        if re.search(r"https?://|icarcdn|\.webp|\.jpg|\.png", text, re.IGNORECASE):
+            return None
+        if len(text) > max_len:
+            return None
+        return text
+
+    def _clean_variant_text(self, value: object | None, *, max_len: int = 100) -> str | None:
+        text = self._clean_short_text(value, max_len=max_len)
+        if not text:
+            return None
+        if text.strip().lower() in {"new", "new car", "used", "used car", "recon", "recon car"}:
+            return None
+        return text
+
+    def _clean_year(self, value: object | None) -> int | None:
+        parsed = self._parse_int_from_text(value)
+        if parsed is None:
+            return None
+        current_year = datetime.now().year + 1
+        return parsed if 1900 <= parsed <= current_year else None
 
     def _parse_mileage(self, mileage_str: str | None) -> int:
         if not mileage_str or mileage_str.strip() == "- km":

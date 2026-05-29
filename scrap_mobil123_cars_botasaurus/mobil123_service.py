@@ -581,26 +581,7 @@ class Mobil123CarsService(SharedBaseService):
         return None
 
     def _parse_rupiah_price(self, text: object | None) -> int | None:
-        if isinstance(text, (int, float)):
-            value = int(text)
-            return value if value > 0 else None
-        raw = str(text or "").strip()
-        if not raw:
-            return None
-        decimal_match = re.fullmatch(r"\d+\.\d{1,2}", raw)
-        if decimal_match:
-            value = int(float(raw))
-            return value if value > 0 else None
-        if ("rp" not in raw.lower()) and not re.search(r"\d[\d.,]{5,}", raw):
-            return None
-        digits = re.findall(r"\d+", raw)
-        if not digits:
-            return None
-        try:
-            value = int("".join(digits))
-        except Exception:
-            return None
-        return value if value > 0 else None
+        return super()._parse_rupiah_price(text)
 
     def _parse_mileage(self, mileage_str: str | None) -> int:
         text = str(mileage_str or "").strip()
@@ -920,55 +901,22 @@ class Mobil123CarsService(SharedBaseService):
         return None
 
     def _json_ld_objects_botasaurus(self, driver) -> list[dict]:
-        try:
-            raw_items = driver.run_js(
-                """
-                return Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-                  .map((el) => el.textContent || '')
-                  .filter(Boolean);
-                """
-            )
-        except Exception:
-            raw_items = []
-
-        objects: list[dict] = []
-
-        def add_obj(value) -> None:
-            if isinstance(value, dict):
-                objects.append(value)
-                graph = value.get("@graph")
-                if isinstance(graph, list):
-                    for item in graph:
-                        add_obj(item)
-            elif isinstance(value, list):
-                for item in value:
-                    add_obj(item)
-
-        for raw in raw_items or []:
-            try:
-                add_obj(json.loads(str(raw)))
-            except Exception:
-                continue
-        return objects
+        return super()._json_ld_objects_botasaurus(driver)
 
     def _first_meta_content_botasaurus(self, driver, names: list[str]) -> str | None:
-        try:
-            return driver.run_js(
-                """
-                const names = args.names.map((s) => String(s || '').toLowerCase());
-                const metas = Array.from(document.querySelectorAll('meta'));
-                for (const meta of metas) {
-                  const key = String(meta.getAttribute('property') || meta.getAttribute('name') || '').toLowerCase();
-                  if (!names.includes(key)) continue;
-                  const content = String(meta.getAttribute('content') || '').trim();
-                  if (content) return content;
-                }
-                return null;
-                """,
-                {"names": names},
-            )
-        except Exception:
-            return None
+        return super()._first_meta_content_botasaurus(driver, names)
+
+    def _first_json_ld_value(self, items: list[dict], key: str) -> str | None:
+        return super()._first_json_ld_value(items, key)
+
+    def _normalize_condition_value(self, value: str | None) -> str | None:
+        return super()._normalize_condition_value(value)
+
+    def _clean_short_text(self, value: object | None, *, max_len: int = 100) -> str | None:
+        return super()._clean_short_text(value, max_len=max_len)
+
+    def _clean_year(self, value: object | None) -> int | None:
+        return super()._clean_year(value)
 
     def _get_text_by_xpath_botasaurus(self, driver, xpath: str) -> str | None:
         try:
@@ -1469,10 +1417,26 @@ class Mobil123CarsService(SharedBaseService):
         if not listing_id_final:
             raise RuntimeError("Missing listing_id on page")
 
-        condition_value = self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
-        brand_value = self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
-        model_value = self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
-        variant_value = self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
+        json_ld_items = self._json_ld_objects_botasaurus(driver)
+        condition_value = self._normalize_condition_value(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:type", "variant_type"])
+            or self._first_json_ld_value(json_ld_items, "itemCondition")
+            or self._get_attr_by_xpath_botasaurus(driver, CONDITION_META_XPATH, "content")
+        )
+        brand_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:make", "WT.z_make"])
+            or self._first_json_ld_value(json_ld_items, "brand")
+            or self._get_attr_by_xpath_botasaurus(driver, BRAND_META_XPATH, "content")
+        )
+        model_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:model", "WT.z_model"])
+            or self._first_json_ld_value(json_ld_items, "model")
+            or self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
+        )
+        variant_value = self._clean_variant_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:variant"])
+            or self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
+        )
 
         info_ads_value = self._extract_information_ads_botasaurus(driver)
         info_ads_date_value = self._parse_information_ads_date(info_ads_value)
@@ -1482,10 +1446,13 @@ class Mobil123CarsService(SharedBaseService):
             or self._extract_location_botasaurus(driver)
         )
         price_value = self._parse_int_from_text(
-            self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content")
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:price", "WT.z_price"])
+            or self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content")
         )
-        year_value = self._parse_int_from_text(
-            self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content")
+        year_value = self._clean_year(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:year", "WT.z_year"])
+            or self._first_json_ld_value(json_ld_items, "vehicleModelDate")
+            or self._get_attr_by_xpath_botasaurus(driver, YEAR_META_XPATH, "content")
         )
         key_details_fields = self._extract_key_details_dict_botasaurus(driver)
         mileage_value = self._parse_first_mileage(
@@ -1494,7 +1461,11 @@ class Mobil123CarsService(SharedBaseService):
             self._extract_mileage_from_bold_span_botasaurus(driver),
             self._extract_text_by_nearby_label_botasaurus(driver, ("mileage", "kilometer", "kilometres", "kilometers")),
         )
-        transmission_value = self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
+        transmission_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:transmission", "WT.z_transmission"])
+            or self._first_json_ld_value(json_ld_items, "vehicleTransmission")
+            or self._get_attr_by_xpath_botasaurus(driver, TRANSMISSION_META_XPATH, "content")
+        )
         seat_capacity_value = self._normalize_seat_capacity(
             self._get_text_by_xpath_botasaurus(driver, SEAT_CAPACITY_XPATH)
             or key_details_fields.get("seat_capacity")
@@ -1507,8 +1478,10 @@ class Mobil123CarsService(SharedBaseService):
             or key_details_fields.get("engine_capacity")
             or self._extract_text_by_nearby_label_botasaurus(driver, ("engine cc", "engine capacity", "kapasitas mesin"))
         )
-        fuel_type_value = (
-            self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
+        fuel_type_value = self._clean_short_text(
+            self._first_meta_content_botasaurus(driver, ["ga:cad:details:fuel_type", "WT.z_Fueltype"])
+            or self._first_json_ld_value(json_ld_items, "fuelType")
+            or self._get_attr_by_xpath_botasaurus(driver, FUEL_TYPE_META_XPATH, "content")
             or key_details_fields.get("fuel_type")
             or key_details_fields.get("fuel")
             or self._extract_text_by_nearby_label_botasaurus(driver, ("fuel type", "fuel", "bahan bakar"))
@@ -1691,6 +1664,24 @@ class Mobil123CarsService(SharedBaseService):
             if isinstance(value, str):
                 return bool(value.strip())
             return True
+
+        def bounded_text(value: object, *, field: str, listing_id: str, max_len: int) -> str | None:
+            if value is None:
+                return None
+            text = re.sub(r"\s+", " ", str(value)).strip()
+            if not text:
+                return None
+            if len(text) <= max_len:
+                return text
+            self.logger.warning(
+                "Truncating mobil123 %s for listing_id=%s from %s to %s chars: %r",
+                field,
+                listing_id,
+                len(text),
+                max_len,
+                text[:160],
+            )
+            return text[:max_len]
 
         columns = (
             "listing_id",
@@ -1965,10 +1956,10 @@ class Mobil123CarsService(SharedBaseService):
                         (
                             str(row_listing_id),
                             result.get("listing_url"),
-                            result.get("condition"),
-                            result.get("brand"),
-                            result.get("model"),
-                            result.get("variant"),
+                            bounded_text(result.get("condition"), field="condition", listing_id=str(row_listing_id), max_len=50),
+                            bounded_text(result.get("brand"), field="brand", listing_id=str(row_listing_id), max_len=100),
+                            bounded_text(result.get("model"), field="model", listing_id=str(row_listing_id), max_len=100),
+                            bounded_text(result.get("variant"), field="variant", listing_id=str(row_listing_id), max_len=100),
                             result.get("information_ads"),
                             result.get("information_ads_date"),
                             result.get("location"),
@@ -1976,11 +1967,11 @@ class Mobil123CarsService(SharedBaseService):
                             result.get("year"),
                             result.get("mileage"),
                             result.get("transmission"),
-                            result.get("seat_capacity"),
-                            result.get("engine_cc"),
+                            bounded_text(result.get("seat_capacity"), field="seat_capacity", listing_id=str(row_listing_id), max_len=10),
+                            bounded_text(result.get("engine_cc"), field="engine_cc", listing_id=str(row_listing_id), max_len=50),
                             result.get("fuel_type"),
-                            result.get("series"),
-                            result.get("type"),
+                            bounded_text(result.get("series"), field="series", listing_id=str(row_listing_id), max_len=100),
+                            bounded_text(result.get("type"), field="type", listing_id=str(row_listing_id), max_len=100),
                             result.get("images"),
                             result.get("whatsapp_number"),
                             result.get("contact_seller"),
