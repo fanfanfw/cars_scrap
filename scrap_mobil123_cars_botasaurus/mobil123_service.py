@@ -39,7 +39,9 @@ TRANSMISSION_META_XPATH = "/html/head/meta[62]"
 FUEL_TYPE_META_XPATH = "/html/head/meta[54]"
 
 INFORMATION_ADS_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/span"
+INFORMATION_ADS_DATE_CONTAINER_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/div/div[1]"
 INFORMATION_ADS_DATE_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/div/div[1]/span"
+INFORMATION_ADS_DATE_SECONDARY_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/div/div[1]/span[2]"
 LOCATION_CONTAINER_XPATH = "/html/body/main/article/section/section[2]/div/div/div[2]/div[1]/div[1]/div/div/div"
 MILEAGE_XPATH = (
     "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[3]/div/div/div/span[2]"
@@ -994,12 +996,45 @@ class Mobil123CarsService(SharedBaseService):
             text = re.sub(r"\s+", " ", str(value or "")).strip()
             if not text:
                 return None
+            if text in {"-", "·", "•"}:
+                return None
             lower = text.lower()
-            if "verified ready stock" in lower or "verified for information authenticity" in lower:
+            if (
+                "verified ready stock" in lower
+                or "verified for information authenticity" in lower
+                or "view registration card" in lower
+            ):
+                return None
+            if not self._parse_information_ads_date(text):
                 return None
             return text
 
-        for xpath in (INFORMATION_ADS_DATE_XPATH, INFORMATION_ADS_XPATH):
+        try:
+            candidates = driver.run_js(
+                """
+                const root = document.evaluate(
+                  args.xpath,
+                  document,
+                  null,
+                  XPathResult.FIRST_ORDERED_NODE_TYPE,
+                  null
+                ).singleNodeValue;
+                if (!root) return [];
+                return Array.from(root.querySelectorAll('span'))
+                  .map((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())
+                  .filter(Boolean);
+                """,
+                {"xpath": INFORMATION_ADS_DATE_CONTAINER_XPATH},
+            )
+        except Exception:
+            candidates = []
+
+        for candidate in candidates or []:
+            value = clean(candidate)
+            if value:
+                return value
+
+        for xpath in (INFORMATION_ADS_DATE_SECONDARY_XPATH, INFORMATION_ADS_DATE_XPATH, INFORMATION_ADS_XPATH):
             value = clean(self._get_text_by_xpath_botasaurus(driver, xpath))
             if value:
                 return value
