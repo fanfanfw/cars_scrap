@@ -39,6 +39,7 @@ TRANSMISSION_META_XPATH = "/html/head/meta[62]"
 FUEL_TYPE_META_XPATH = "/html/head/meta[54]"
 
 INFORMATION_ADS_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/span"
+INFORMATION_ADS_DATE_XPATH = "/html/body/main/article/section/section[1]/section[3]/div/div/div[1]/span"
 LOCATION_CONTAINER_XPATH = "/html/body/main/article/section/section[2]/div/div/div[2]/div[1]/div[1]/div/div/div"
 MILEAGE_XPATH = (
     "/html/body/main/article/section/section[1]/section[5]/div/div/div/div/div[1]/div/div[3]/div/div/div/span[2]"
@@ -988,6 +989,22 @@ class Mobil123CarsService(SharedBaseService):
             text = None
         return text or None
 
+    def _extract_information_ads_botasaurus(self, driver) -> str | None:
+        def clean(value: str | None) -> str | None:
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            if not text:
+                return None
+            lower = text.lower()
+            if "verified ready stock" in lower or "verified for information authenticity" in lower:
+                return None
+            return text
+
+        for xpath in (INFORMATION_ADS_DATE_XPATH, INFORMATION_ADS_XPATH):
+            value = clean(self._get_text_by_xpath_botasaurus(driver, xpath))
+            if value:
+                return value
+        return None
+
     def _extract_title_botasaurus(self, driver) -> str | None:
         title = self._get_text_by_xpath_botasaurus(driver, DETAIL_TITLE_XPATH)
         if title:
@@ -1422,7 +1439,7 @@ class Mobil123CarsService(SharedBaseService):
         model_value = self._get_attr_by_xpath_botasaurus(driver, MODEL_META_XPATH, "content")
         variant_value = self._get_attr_by_xpath_botasaurus(driver, VARIANT_META_XPATH, "content")
 
-        info_ads_value = self._get_text_by_xpath_botasaurus(driver, INFORMATION_ADS_XPATH)
+        info_ads_value = self._extract_information_ads_botasaurus(driver)
         info_ads_date_value = self._parse_information_ads_date(info_ads_value)
 
         location_value = (
