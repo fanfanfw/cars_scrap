@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -180,6 +181,224 @@ class GoonetCarsService(SharedBaseService):
             href = None
         url = self._normalize_url(href)
         return url if url and url.startswith(BASE_URL) else None
+
+    def _slug(self, value: object | None) -> str:
+        text = self._clean_text(value) or ""
+        text = text.upper().replace(" ", "_")
+        return re.sub(r"[^A-Z0-9_:\-]", "", text)
+
+    def _extract_listing_links_from_html(self, html: str) -> list[str]:
+        seen: set[str] = set()
+        links: list[str] = []
+        for match in re.finditer(r"(?:https?://www\.goo-net-exchange\.com)?(/usedcars/[^\"'\s<>]+/[^\"'\s<>]+/\d{12,}/?)", html or ""):
+            url = self._normalize_url(match.group(1))
+            if url and url not in seen:
+                seen.add(url)
+                links.append(url)
+        return links
+
+    def _extract_form_payload(self, html: str) -> dict[str, str]:
+        soup = BeautifulSoup(html or "", "html.parser")
+        payload: dict[str, str] = {}
+        for node in soup.select("input[name]"):
+            payload[str(node.get("name"))] = str(node.get("value") or "")
+        for node in soup.select("select[name]"):
+            selected = node.select_one("option[selected]") or node.select_one("option")
+            payload[str(node.get("name"))] = str(selected.get("value") if selected else "")
+        return payload
+
+    def _extract_listing_total(self, html: str, default: int) -> int:
+        soup = BeautifulSoup(html or "", "html.parser")
+        node = soup.select_one('input[name="total"]')
+        total = self._parse_int_from_text(node.get("value") if node else None)
+        return total if total is not None else default
+
+    def _select_listing_targets(
+        self,
+        *,
+        maker: str | None = None,
+        model: str | None = None,
+        grade: str | None = None,
+    ) -> list[dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            maker_filter = self._clean_text(maker)
+            model_filter = self._clean_text(model)
+            grade_filter = self._clean_text(grade)
+            sql = """
+            SELECT DISTINCT
+              mk.maker_cd,
+              mk.maker_name,
+              md.car_cd,
+              md.model_name,
+              gr.grade_cd,
+              gr.grade_name
+            FROM cars_scrap_goonet_makers mk
+            JOIN cars_scrap_goonet_models md ON md.maker_cd = mk.maker_cd
+            LEFT JOIN cars_scrap_goonet_grades gr ON gr.car_cd = md.car_cd
+            WHERE (%s IS NULL OR UPPER(mk.maker_name) = UPPER(%s) OR mk.maker_cd = %s)
+              AND (%s IS NULL OR UPPER(md.model_name) = UPPER(%s) OR md.car_cd = %s)
+              AND (%s IS NULL OR UPPER(gr.grade_name) = UPPER(%s) OR gr.grade_cd = %s)
+            ORDER BY mk.maker_name, md.model_name, gr.grade_name NULLS FIRST
+            """
+            cursor.execute(
+                sql,
+                (
+                    maker_filter,
+                    maker_filter,
+                    maker_filter,
+                    model_filter,
+                    model_filter,
+                    model_filter,
+                    grade_filter,
+                    grade_filter,
+                    grade_filter,
+                ),
+            )
+            rows = cursor.fetchall()
+            targets: list[dict] = []
+            seen: set[tuple[str, str, str | None]] = set()
+            for maker_cd, maker_name, car_cd, model_name, grade_cd, grade_name in rows:
+                key = (str(maker_cd), str(car_cd), str(grade_cd) if grade_filter else None)
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets.append(
+                    {
+                        "maker_cd": str(maker_cd),
+                        "maker_name": str(maker_name),
+                        "car_cd": str(car_cd),
+                        "model_name": str(model_name),
+                        "grade_cd": str(grade_cd) if grade_filter and grade_cd else None,
+                        "grade_name": str(grade_name) if grade_filter and grade_name else None,
+                    }
+                )
+            return targets
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _listing_url_for_target(self, target: dict, *, use_grade: bool = False) -> str:
+        maker_slug = self._slug(target.get("maker_name"))
+        model_slug = self._slug(target.get("model_name"))
+        if use_grade and target.get("grade_cd") and target.get("car_cd"):
+            return f"{BASE_URL}/usedcars/{maker_slug}/{model_slug}/grade-{target['grade_cd']}-{target['car_cd']}/"
+        return f"{BASE_URL}/usedcars/{maker_slug}/{model_slug}/"
+
+    def _fetch_listing_links_for_target(self, target: dict, *, max_pages: int = 0, limit: int = 20) -> list[str]:
+        session = requests.Session()
+        headers = self._goonet_http_headers(ajax=False)
+        proxies = self._http_proxies()
+        url = self._listing_url_for_target(target, use_grade=bool(target.get("grade_cd")))
+        timeout = self._env_float("GOONET_HTTP_TIMEOUT", 30.0, minimum=1.0)
+        retry_count = self._env_int("GOONET_LISTING_RETRIES", 2, minimum=1)
+
+        def request_with_retries(method: str, request_url: str, **kwargs) -> requests.Response:
+            last_exc: Exception | None = None
+            for attempt in range(1, retry_count + 1):
+                try:
+                    response = session.request(method, request_url, timeout=timeout, proxies=proxies, **kwargs)
+                    response.raise_for_status()
+                    return response
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt >= retry_count:
+                        break
+                    reset_cached_proxy()
+                    time.sleep(self._env_float("GOONET_LISTING_RETRY_WAIT_SECONDS", 2.0, minimum=0.0))
+            raise last_exc or RuntimeError("Goonet listing request failed")
+
+        first = request_with_retries("GET", url, headers=headers)
+        first_links = self._extract_listing_links_from_html(first.text)
+        total = self._extract_listing_total(first.text, len(first_links))
+        pages = max(1, math.ceil(total / max(1, limit)))
+        if max_pages and max_pages > 0:
+            pages = min(pages, max_pages)
+        self.logger.info(
+            "Goonet listing %s %s: total=%s pages=%s",
+            target.get("maker_name"),
+            target.get("model_name"),
+            total,
+            pages,
+        )
+        self.logger.info(
+            "Goonet listing %s %s page 1/%s: links=%s",
+            target.get("maker_name"),
+            target.get("model_name"),
+            pages,
+            len(first_links),
+        )
+        seen: set[str] = set()
+        links: list[str] = []
+        for link in first_links:
+            if link not in seen:
+                seen.add(link)
+                links.append(link)
+        for page in range(2, pages + 1):
+            page_url = url.rstrip("/") + f"/index-{page}.html"
+            response = request_with_retries("GET", page_url, headers=headers)
+            page_links = self._extract_listing_links_from_html(response.text)
+            self.logger.info(
+                "Goonet listing %s %s page %s/%s: links=%s",
+                target.get("maker_name"),
+                target.get("model_name"),
+                page,
+                pages,
+                len(page_links),
+            )
+            if not page_links:
+                break
+            for link in page_links:
+                if link not in seen:
+                    seen.add(link)
+                    links.append(link)
+        return links
+
+    def scrape_all_from_master_listing(
+        self,
+        *,
+        maker: str | None = None,
+        model: str | None = None,
+        grade: str | None = None,
+        max_pages: int = 0,
+        limit: int = 20,
+    ) -> list[str]:
+        targets = self._select_listing_targets(maker=maker, model=model, grade=grade)
+        if not targets:
+            raise ValueError("No Goonet master targets found. Run --sync-master-data first or check maker/model/grade filters.")
+        self.logger.info("Goonet listing targets: %s", len(targets))
+        seen: set[str] = set()
+        links: list[str] = []
+        for index, target in enumerate(targets, start=1):
+            self.logger.info(
+                "Goonet listing target %s/%s: %s %s%s",
+                index,
+                len(targets),
+                target.get("maker_name"),
+                target.get("model_name"),
+                f" {target.get('grade_name')}" if grade and target.get("grade_name") else "",
+            )
+            target_links = self._fetch_listing_links_for_target(target, max_pages=max_pages, limit=limit)
+            self.logger.info(
+                "Goonet listing target %s/%s collected: %s links",
+                index,
+                len(targets),
+                len(target_links),
+            )
+            for link in target_links:
+                if link in seen:
+                    continue
+                seen.add(link)
+                links.append(link)
+        self.logger.info("Goonet listing collected total unique links: %s", len(links))
+        return links
 
     def scrape_all_from_main(self, start_url: str | None = None, max_pages: int = 1) -> list[str]:
         url = (start_url or self.listing_url or "").strip()
