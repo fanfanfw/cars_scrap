@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover - depends on local environment
     _load_dotenv = None
 
 
-SOURCE_ORDER = ("mudahmy", "carlist", "mobil123", "carmudi", "olx", "carsomeid")
+SOURCE_ORDER = ("mudahmy", "carlist", "mobil123", "carmudi", "olx", "carsomeid", "goonet")
 
 
 def repo_root() -> Path:

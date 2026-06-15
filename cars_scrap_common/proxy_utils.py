@@ -13,6 +13,7 @@ from cars_scrap_common.env_utils import env_bool
 DEFAULT_PROXY_POOLS = {
     "carlist": "MY",
     "mudahmy": "MY",
+    "goonet": "JP",
 }
 
 
