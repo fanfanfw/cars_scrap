@@ -15,7 +15,7 @@ from psycopg2.extras import Json, execute_values
 from cars_scrap_common.botasaurus_utils import load_botasaurus_config, wait_for_css
 from cars_scrap_common.env_utils import env_bool
 from cars_scrap_common.logging_utils import setup_logger
-from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
+from cars_scrap_common.proxy_utils import load_proxy_for_run, mask_proxy_url, probe_public_ip, reset_cached_proxy
 from cars_scrap_common.shared_base_service import SharedBaseService
 from scrap_goonet_cars_botasaurus.database import get_connection
 
@@ -509,16 +509,68 @@ class GoonetCarsService(SharedBaseService):
         }
         return data, self._json_ld_objects_from_html(soup)
 
-    def _fetch_detail_http(self, url: str) -> str:
-        timeout = self._env_float("GOONET_HTTP_TIMEOUT", 30.0, minimum=1.0)
+    def _http_proxies(self) -> dict[str, str] | None:
+        proxy_url = load_proxy_for_run(service_name="goonet")
+        if not proxy_url:
+            return None
+        return {"http": proxy_url, "https": proxy_url}
+
+    def _goonet_http_headers(self, *, ajax: bool = False) -> dict[str, str]:
         headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept": "*/*" if ajax else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9,id;q=0.8",
-            "referer": "https://www.goo-net-exchange.com/php/search/summary.php",
+            "referer": os.getenv("GOONET_REFERER") or "https://www.goo-net-exchange.com/php/search/summary.php",
             "user-agent": os.getenv("GOONET_USER_AGENT") or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         }
-        response = requests.get(url, headers=headers, timeout=timeout)
+        if ajax:
+            headers.update(
+                {
+                    "cache-control": "no-cache",
+                    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "origin": BASE_URL,
+                    "x-requested-with": "XMLHttpRequest",
+                }
+            )
+        csrf = (os.getenv("GOONET_X_CSRF_TOKEN") or "").strip()
+        if csrf:
+            headers["x-csrf-token"] = csrf
+        cookie = (os.getenv("GOONET_COOKIE") or "").strip()
+        if cookie:
+            headers["cookie"] = cookie
+        return headers
+
+    def _request_goonet(self, method: str, url: str, **kwargs) -> requests.Response:
+        timeout = self._env_float("GOONET_HTTP_TIMEOUT", 30.0, minimum=1.0)
+        proxies = self._http_proxies()
+        response = requests.request(method, url, timeout=timeout, proxies=proxies, **kwargs)
         response.raise_for_status()
+        return response
+
+    def _parse_master_name_count(self, value: object | None) -> tuple[str | None, int | None]:
+        text = self._clean_text(value)
+        if not text:
+            return None, None
+        match = re.search(r"^(.*?)\s*\(([\d,]+)\)\s*$", text)
+        if not match:
+            return text, None
+        name = self._clean_text(match.group(1))
+        try:
+            count = int(match.group(2).replace(",", ""))
+        except Exception:
+            count = None
+        return name, count
+
+    def _decode_goonet_json(self, response: requests.Response):
+        try:
+            return response.json()
+        except Exception:
+            text = response.text.strip()
+            if not text:
+                return []
+            return json.loads(text)
+
+    def _fetch_detail_http(self, url: str) -> str:
+        response = self._request_goonet("GET", url, headers=self._goonet_http_headers(ajax=False))
         return response.text
 
     def _build_detail_result(self, *, url: str, listing_id_final: str, data: dict, json_ld_items: list[dict], tracking_mode: bool) -> dict:
@@ -671,6 +723,350 @@ class GoonetCarsService(SharedBaseService):
             json_ld_items=json_ld_items,
             tracking_mode=tracking_mode,
         )
+
+    def fetch_master_makers(self, brand_cd: str | None = None) -> list[dict]:
+        code = (brand_cd or os.getenv("GOONET_MASTER_SEED_BRAND_CD") or os.getenv("GOONET_MAKER_SEARCH_BRAND_CD") or "5543").strip()
+        url = f"{BASE_URL}/php/search/ajax_maker_search.php"
+        response = self._request_goonet(
+            "POST",
+            url,
+            headers=self._goonet_http_headers(ajax=True),
+            data={"brand_cd": code},
+        )
+        payload = self._decode_goonet_json(response)
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            raise RuntimeError(f"Unexpected Goonet makers response: {str(payload)[:300]}")
+        rows: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            maker_cd = self._clean_text(item.get("maker_cd") or item.get("value") or item.get("id"))
+            maker_nm = self._clean_text(item.get("maker_nm") or item.get("label") or item.get("name"))
+            if not maker_cd or not maker_nm:
+                continue
+            maker_name, count = self._parse_master_name_count(maker_nm)
+            rows.append(
+                {
+                    "maker_cd": maker_cd,
+                    "maker_nm": maker_nm,
+                    "maker_name": maker_name,
+                    "listing_count": count,
+                    "raw": item,
+                }
+            )
+        return rows
+
+    def fetch_master_models(self, maker_cd: str) -> list[dict]:
+        url = f"{BASE_URL}/php/search/ajax_car_search.php"
+        response = self._request_goonet(
+            "POST",
+            url,
+            headers=self._goonet_http_headers(ajax=True),
+            data={"brand_cd": str(maker_cd).strip()},
+        )
+        payload = self._decode_goonet_json(response)
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            raise RuntimeError(f"Unexpected Goonet models response for maker_cd={maker_cd}: {str(payload)[:300]}")
+        rows: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            car_cd = self._clean_text(item.get("car_cd") or item.get("value") or item.get("id"))
+            car_nm = self._clean_text(item.get("car_nm") or item.get("label") or item.get("name"))
+            if not car_cd or not car_nm:
+                continue
+            model_name, count = self._parse_master_name_count(car_nm)
+            if count is None:
+                _, count = self._parse_master_name_count(f"{model_name or car_nm}{item.get('count_str') or ''}")
+            rows.append(
+                {
+                    "maker_cd": str(maker_cd).strip(),
+                    "car_cd": car_cd,
+                    "car_nm": car_nm,
+                    "model_name": model_name,
+                    "listing_count": count,
+                    "raw": item,
+                }
+            )
+        return rows
+
+    def fetch_master_grades(self, maker_cd: str, car_cd: str) -> list[dict]:
+        url = f"{BASE_URL}/php/search/ajax_grade_search.php"
+        response = self._request_goonet(
+            "GET",
+            url,
+            headers=self._goonet_http_headers(ajax=True),
+            params={"car_cd": str(car_cd).strip()},
+        )
+        payload = self._decode_goonet_json(response)
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            raise RuntimeError(f"Unexpected Goonet grades response for car_cd={car_cd}: {str(payload)[:300]}")
+        rows: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            grade_cd = self._clean_text(item.get("grade_cd") or item.get("value") or item.get("id"))
+            grade_nm = self._clean_text(item.get("grade_nm") or item.get("label") or item.get("name"))
+            if not grade_cd or not grade_nm:
+                continue
+            grade_name, count = self._parse_master_name_count(grade_nm)
+            rows.append(
+                {
+                    "maker_cd": str(maker_cd).strip(),
+                    "car_cd": str(car_cd).strip(),
+                    "grade_cd": grade_cd,
+                    "grade_nm": grade_nm,
+                    "grade_name": grade_name,
+                    "listing_count": count,
+                    "raw": item,
+                }
+            )
+        return rows
+
+    def sync_master_data(
+        self,
+        *,
+        brand_cd: str | None = None,
+        max_makers: int = 0,
+        max_models: int = 0,
+        resume: bool = True,
+    ) -> dict:
+        makers = self.fetch_master_makers(brand_cd=brand_cd)
+        if max_makers and max_makers > 0:
+            makers = makers[:max_makers]
+        conn = get_connection()
+        cursor = conn.cursor()
+        maker_sql = """
+        INSERT INTO cars_scrap_goonet_makers (maker_cd, maker_nm, maker_name, listing_count, raw)
+        VALUES %s
+        ON CONFLICT (maker_cd) DO UPDATE SET
+          maker_nm = EXCLUDED.maker_nm,
+          maker_name = EXCLUDED.maker_name,
+          listing_count = EXCLUDED.listing_count,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        """
+        model_sql = """
+        INSERT INTO cars_scrap_goonet_models (maker_cd, car_cd, car_nm, model_name, listing_count, raw)
+        VALUES %s
+        ON CONFLICT (car_cd) DO UPDATE SET
+          maker_cd = EXCLUDED.maker_cd,
+          car_nm = EXCLUDED.car_nm,
+          model_name = EXCLUDED.model_name,
+          listing_count = EXCLUDED.listing_count,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        """
+        grade_sql = """
+        INSERT INTO cars_scrap_goonet_grades (maker_cd, car_cd, grade_cd, grade_nm, grade_name, listing_count, raw)
+        VALUES %s
+        ON CONFLICT (car_cd, grade_cd) DO UPDATE SET
+          maker_cd = EXCLUDED.maker_cd,
+          grade_nm = EXCLUDED.grade_nm,
+          grade_name = EXCLUDED.grade_name,
+          listing_count = EXCLUDED.listing_count,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        """
+        total_models = 0
+        total_grades = 0
+        skipped_grade_models = 0
+        errors: list[dict] = []
+
+        def has_existing_grades(car_cd: str) -> bool:
+            if not resume:
+                return False
+            cursor.execute("SELECT 1 FROM cars_scrap_goonet_grades WHERE car_cd = %s LIMIT 1", (str(car_cd),))
+            return cursor.fetchone() is not None
+
+        try:
+            self.logger.info("Goonet master sync: %s makers found%s", len(makers), " (resume enabled)" if resume else "")
+            if makers:
+                execute_values(
+                    cursor,
+                    maker_sql,
+                    [(r["maker_cd"], r["maker_nm"], r["maker_name"], r["listing_count"], Json(r["raw"])) for r in makers],
+                    page_size=100,
+                )
+                conn.commit()
+            for maker_index, maker in enumerate(makers, start=1):
+                maker_cd = maker["maker_cd"]
+                maker_name = maker.get("maker_name") or maker.get("maker_nm") or maker_cd
+                self.logger.info("Goonet master sync maker %s/%s: %s (%s)", maker_index, len(makers), maker_name, maker_cd)
+                try:
+                    models = self.fetch_master_models(maker_cd)
+                    if max_models and max_models > 0:
+                        models = models[:max_models]
+                    self.logger.info("Goonet master sync maker %s/%s: %s models", maker_index, len(makers), len(models))
+                    if models:
+                        execute_values(
+                            cursor,
+                            model_sql,
+                            [
+                                (r["maker_cd"], r["car_cd"], r["car_nm"], r["model_name"], r["listing_count"], Json(r["raw"]))
+                                for r in models
+                            ],
+                            page_size=100,
+                        )
+                        conn.commit()
+                    total_models += len(models)
+                    for model_index, model in enumerate(models, start=1):
+                        car_cd = model["car_cd"]
+                        model_name = model.get("model_name") or model.get("car_nm") or car_cd
+                        try:
+                            if has_existing_grades(car_cd):
+                                skipped_grade_models += 1
+                                self.logger.debug(
+                                    "Goonet master sync maker %s/%s model %s/%s: %s (%s) skipped, grades already exist",
+                                    maker_index,
+                                    len(makers),
+                                    model_index,
+                                    len(models),
+                                    model_name,
+                                    car_cd,
+                                )
+                                continue
+                            self.logger.info(
+                                "Goonet master sync maker %s/%s model %s/%s: fetching grades for %s (%s)",
+                                maker_index,
+                                len(makers),
+                                model_index,
+                                len(models),
+                                model_name,
+                                car_cd,
+                            )
+                            grades = self.fetch_master_grades(maker_cd, car_cd)
+                            if grades:
+                                execute_values(
+                                    cursor,
+                                    grade_sql,
+                                    [
+                                        (
+                                            r["maker_cd"],
+                                            r["car_cd"],
+                                            r["grade_cd"],
+                                            r["grade_nm"],
+                                            r["grade_name"],
+                                            r["listing_count"],
+                                            Json(r["raw"]),
+                                        )
+                                        for r in grades
+                                    ],
+                                    page_size=100,
+                                )
+                                conn.commit()
+                            total_grades += len(grades)
+                            self.logger.info(
+                                "Goonet master sync maker %s/%s model %s/%s: %s grades saved",
+                                maker_index,
+                                len(makers),
+                                model_index,
+                                len(models),
+                                len(grades),
+                            )
+                        except Exception as exc:
+                            conn.rollback()
+                            errors.append({"maker_cd": maker_cd, "car_cd": car_cd, "error": str(exc)})
+                except Exception as exc:
+                    conn.rollback()
+                    errors.append({"maker_cd": maker_cd, "error": str(exc)})
+            return {
+                "makers_count": len(makers),
+                "models_count": total_models,
+                "grades_count": total_grades,
+                "skipped_grade_models_count": skipped_grade_models,
+                "resume": resume,
+                "errors_count": len(errors),
+                "errors": errors,
+            }
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def sync_missing_master_grades(self, *, limit: int = 0) -> dict:
+        conn = get_connection()
+        cursor = conn.cursor()
+        grade_sql = """
+        INSERT INTO cars_scrap_goonet_grades (maker_cd, car_cd, grade_cd, grade_nm, grade_name, listing_count, raw)
+        VALUES %s
+        ON CONFLICT (car_cd, grade_cd) DO UPDATE SET
+          maker_cd = EXCLUDED.maker_cd,
+          grade_nm = EXCLUDED.grade_nm,
+          grade_name = EXCLUDED.grade_name,
+          listing_count = EXCLUDED.listing_count,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        """
+        try:
+            sql = """
+            SELECT m.maker_cd, m.car_cd, m.model_name, m.car_nm
+            FROM cars_scrap_goonet_models m
+            WHERE NOT EXISTS (
+              SELECT 1 FROM cars_scrap_goonet_grades g WHERE g.car_cd = m.car_cd
+            )
+            ORDER BY m.maker_cd, m.car_cd
+            """
+            params: list[object] = []
+            if limit and limit > 0:
+                sql += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(sql, params)
+            models = cursor.fetchall()
+            self.logger.info("Goonet missing grades sync: %s models to process", len(models))
+            total_grades = 0
+            errors: list[dict] = []
+            for index, (maker_cd, car_cd, model_name, car_nm) in enumerate(models, start=1):
+                label = model_name or car_nm or car_cd
+                try:
+                    self.logger.info("Goonet missing grades sync model %s/%s: %s (%s)", index, len(models), label, car_cd)
+                    grades = self.fetch_master_grades(str(maker_cd), str(car_cd))
+                    if grades:
+                        execute_values(
+                            cursor,
+                            grade_sql,
+                            [
+                                (
+                                    r["maker_cd"],
+                                    r["car_cd"],
+                                    r["grade_cd"],
+                                    r["grade_nm"],
+                                    r["grade_name"],
+                                    r["listing_count"],
+                                    Json(r["raw"]),
+                                )
+                                for r in grades
+                            ],
+                            page_size=100,
+                        )
+                        conn.commit()
+                    total_grades += len(grades)
+                except Exception as exc:
+                    conn.rollback()
+                    errors.append({"maker_cd": str(maker_cd), "car_cd": str(car_cd), "error": str(exc)})
+            return {
+                "models_count": len(models),
+                "grades_count": total_grades,
+                "errors_count": len(errors),
+                "errors": errors,
+            }
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _scrape_single_detail_http(self, *, url: str, listing_id: str | None, tracking_mode: bool) -> dict:
         listing_id_final = (listing_id or self._extract_listing_id(url)).strip()

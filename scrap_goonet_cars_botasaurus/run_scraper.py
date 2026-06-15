@@ -47,6 +47,13 @@ def main() -> None:
         default=None,
         help="Scrape 1 listing URL, upsert into Postgres, then print the inserted DB row as JSON",
     )
+    parser.add_argument("--sync-master-data", action="store_true", help="Sync Goonet maker/model/grade master data into Postgres")
+    parser.add_argument("--master-brand-cd", default=None, help="Override GOONET_MASTER_SEED_BRAND_CD for maker endpoint")
+    parser.add_argument("--master-max-makers", type=int, default=0, help="Limit makers to sync for testing (0 = all)")
+    parser.add_argument("--master-max-models", type=int, default=0, help="Limit models per maker for testing (0 = all)")
+    parser.add_argument("--no-master-resume", action="store_true", help="Fetch grades again even if grades for a model already exist")
+    parser.add_argument("--sync-missing-master-grades", action="store_true", help="Sync only Goonet models that do not have any grade rows yet")
+    parser.add_argument("--missing-grades-limit", type=int, default=0, help="Limit models for --sync-missing-master-grades (0 = all)")
     args = parser.parse_args()
 
     if args.profile:
@@ -101,6 +108,25 @@ def main() -> None:
                 "sold_marked_count": len(sold),
                 "skip_reasons": skip_reasons,
             }
+
+        if args.sync_missing_master_grades:
+            if args.details or args.track_older_than or args.debug_detail_url or args.sync_master_data:
+                raise ValueError("--sync-missing-master-grades cannot be combined with other scrape modes.")
+            summary = scraper.sync_missing_master_grades(limit=int(args.missing_grades_limit or 0))
+            print(json.dumps({"mode": "sync_missing_master_grades", **summary}, indent=2, default=str))
+            return
+
+        if args.sync_master_data:
+            if args.details or args.track_older_than or args.debug_detail_url:
+                raise ValueError("--sync-master-data cannot be combined with --details, --track-older-than, or --debug-detail-url.")
+            summary = scraper.sync_master_data(
+                brand_cd=args.master_brand_cd,
+                max_makers=int(args.master_max_makers or 0),
+                max_models=int(args.master_max_models or 0),
+                resume=not bool(args.no_master_resume),
+            )
+            print(json.dumps({"mode": "sync_master_data", **summary}, indent=2, default=str))
+            return
 
         if args.track_older_than:
             if args.details:

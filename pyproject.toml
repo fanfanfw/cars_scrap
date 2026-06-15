@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cars-scrap"
 version = "0.1.0"
-description = "Cars scraping services (mudah.my, carlist, mobil123, carmudi & olx) using Botasaurus"
+description = "Cars scraping services (mudah.my, carlist, mobil123, carmudi, olx & goonet) using Botasaurus"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,6 +24,7 @@ scrape-mobil123 = "scrap_mobil123_cars_botasaurus.run_scraper:main"
 scrape-carmudi = "scrap_carmudi_cars_botasaurus.run_scraper:main"
 scrape-carsomeid = "scrap_carsomeid_cars_botasaurus.run_scraper:main"
 scrape-olx = "scrap_olx_cars_botasaurus.run_scraper:main"
+scrape-goonet = "scrap_goonet_cars_botasaurus.run_scraper:main"
 migrate-sql = "cars_scrap_common.migrate_sql:main"
 serve-mudahmy = "scrap_mudahmy_cars_botasaurus.app:main"
 serve-carlist = "scrap_carlist_cars_botasaurus.app:main"
@@ -31,6 +32,7 @@ serve-mobil123 = "scrap_mobil123_cars_botasaurus.app:main"
 serve-carmudi = "scrap_carmudi_cars_botasaurus.app:main"
 serve-carsomeid = "scrap_carsomeid_cars_botasaurus.app:main"
 serve-olx = "scrap_olx_cars_botasaurus.app:main"
+serve-goonet = "scrap_goonet_cars_botasaurus.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = [
@@ -41,4 +43,5 @@ packages = [
   "scrap_carmudi_cars_botasaurus",
   "scrap_carsomeid_cars_botasaurus",
   "scrap_olx_cars_botasaurus",
+  "scrap_goonet_cars_botasaurus",
 ]
