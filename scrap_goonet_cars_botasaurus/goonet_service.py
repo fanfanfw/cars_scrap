@@ -377,6 +377,145 @@ class GoonetCarsService(SharedBaseService):
                     links.append(link)
         return links
 
+    def _mark_model_listing_scrape(
+        self,
+        *,
+        car_cd: str,
+        status: str,
+        count: int = 0,
+        error: str | None = None,
+    ) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE cars_scrap_goonet_models
+                SET
+                  last_listing_scraped_at = NOW(),
+                  last_listing_scrape_status = %s,
+                  last_listing_scrape_count = %s,
+                  last_listing_scrape_error = %s,
+                  updated_at = NOW()
+                WHERE car_cd = %s
+                """,
+                (status, int(count or 0), error, str(car_cd)),
+            )
+            conn.commit()
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _select_listing_batch_targets(
+        self,
+        *,
+        cutoff,
+        batch_limit: int,
+        maker: str | None = None,
+        model: str | None = None,
+    ) -> list[dict]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            maker_filter = self._clean_text(maker)
+            model_filter = self._clean_text(model)
+            sql = """
+            SELECT
+              mk.maker_cd,
+              mk.maker_name,
+              md.car_cd,
+              md.model_name,
+              NULL::VARCHAR AS grade_cd,
+              NULL::TEXT AS grade_name
+            FROM cars_scrap_goonet_makers mk
+            JOIN cars_scrap_goonet_models md ON md.maker_cd = mk.maker_cd
+            WHERE (md.last_listing_scraped_at IS NULL OR md.last_listing_scraped_at::date <= %s)
+              AND (%s IS NULL OR UPPER(mk.maker_name) = UPPER(%s) OR mk.maker_cd = %s)
+              AND (%s IS NULL OR UPPER(md.model_name) = UPPER(%s) OR md.car_cd = %s)
+            ORDER BY md.last_listing_scraped_at NULLS FIRST, mk.maker_name, md.model_name
+            """
+            params: list[object] = [cutoff, maker_filter, maker_filter, maker_filter, model_filter, model_filter, model_filter]
+            if batch_limit and batch_limit > 0:
+                sql += " LIMIT %s"
+                params.append(batch_limit)
+            cursor.execute(sql, params)
+            return [
+                {
+                    "maker_cd": str(row[0]),
+                    "maker_name": str(row[1]),
+                    "car_cd": str(row[2]),
+                    "model_name": str(row[3]),
+                    "grade_cd": None,
+                    "grade_name": None,
+                }
+                for row in cursor.fetchall()
+            ]
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def scrape_listing_batch(
+        self,
+        *,
+        cutoff,
+        batch_limit: int,
+        maker: str | None = None,
+        model: str | None = None,
+        max_pages: int = 0,
+        limit: int = 20,
+    ) -> list[str]:
+        targets = self._select_listing_batch_targets(cutoff=cutoff, batch_limit=batch_limit, maker=maker, model=model)
+        self.logger.info("Goonet listing batch targets: %s", len(targets))
+        seen: set[str] = set()
+        links: list[str] = []
+        for index, target in enumerate(targets, start=1):
+            if index > 1:
+                self._sleep_seconds("GOONET_LISTING_DELAY_SECONDS")
+            self.logger.info(
+                "Goonet listing batch target %s/%s: %s %s (last older than %s)",
+                index,
+                len(targets),
+                target.get("maker_name"),
+                target.get("model_name"),
+                cutoff,
+            )
+            try:
+                target_links = self._fetch_listing_links_for_target(target, max_pages=max_pages, limit=limit)
+                self._mark_model_listing_scrape(
+                    car_cd=str(target["car_cd"]),
+                    status="success",
+                    count=len(target_links),
+                    error=None,
+                )
+            except Exception as exc:
+                self._mark_model_listing_scrape(
+                    car_cd=str(target["car_cd"]),
+                    status="error",
+                    count=0,
+                    error=str(exc),
+                )
+                self.logger.warning("Goonet listing batch target failed: %s %s: %s", target.get("maker_name"), target.get("model_name"), exc)
+                continue
+            for link in target_links:
+                if link in seen:
+                    continue
+                seen.add(link)
+                links.append(link)
+        self.logger.info("Goonet listing batch collected total unique links: %s", len(links))
+        return links
+
     def scrape_all_from_master_listing(
         self,
         *,

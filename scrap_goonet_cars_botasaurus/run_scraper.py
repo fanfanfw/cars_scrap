@@ -24,6 +24,9 @@ def main() -> None:
     parser.add_argument("--max-pages", type=int, default=0, help="Max pages to visit (0 = all for listing; default listing mode: all)")
     parser.add_argument("--details", action="store_true", help="Fetch listing details and upsert into Postgres")
     parser.add_argument("--listing", action="store_true", help="Fetch listing URLs from Goonet master maker/model/grade filters via HTTP")
+    parser.add_argument("--listing-batch", action="store_true", help="Fetch listing URLs for models not scraped yet or older than --listing-older-than")
+    parser.add_argument("--batch-limit", type=int, default=5, help="Number of models to process in --listing-batch mode")
+    parser.add_argument("--listing-older-than", default="60d", help="Batch models whose last_listing_scraped_at is NULL or older than this duration")
     parser.add_argument("--maker", default=None, help="Goonet maker name or maker_cd, e.g. TOYOTA or 1010")
     parser.add_argument("--model", default=None, help="Goonet model name or car_cd, e.g. ALLION or 10101058")
     parser.add_argument("--grade", default=None, help="Goonet grade name or grade_cd, optional")
@@ -113,6 +116,47 @@ def main() -> None:
                 "sold_marked_count": len(sold),
                 "skip_reasons": skip_reasons,
             }
+
+        if args.listing_batch:
+            selected_cutoff = cutoff_date(now=datetime.now().date(), older_than=str(args.listing_older_than))
+            links = scraper.scrape_listing_batch(
+                cutoff=selected_cutoff,
+                batch_limit=int(args.batch_limit or 0),
+                maker=args.maker,
+                model=args.model,
+                max_pages=int(args.max_pages or 0),
+                limit=int(args.listing_limit or 20),
+            )
+            if not args.details:
+                print(
+                    json.dumps(
+                        {
+                            "mode": "listing_batch",
+                            "listing_older_than": args.listing_older_than,
+                            "cutoff_date": str(selected_cutoff),
+                            "count": len(links),
+                            "links": links,
+                        },
+                        indent=2,
+                    )
+                )
+                return
+            details = scraper.scrape_listing_details_with_run_retries(links, allow_revive_sold=True, require_brand_model=True)
+            print(
+                json.dumps(
+                    {
+                        "mode": "listing_batch_details",
+                        "listing_older_than": args.listing_older_than,
+                        "cutoff_date": str(selected_cutoff),
+                        "count": len(links),
+                        **summarize_results(details),
+                        "stored_to_db": True,
+                    },
+                    indent=2,
+                    default=str,
+                )
+            )
+            return
 
         if args.listing:
             links = scraper.scrape_all_from_master_listing(
