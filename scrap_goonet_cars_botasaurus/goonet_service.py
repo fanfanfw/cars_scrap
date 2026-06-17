@@ -295,7 +295,6 @@ class GoonetCarsService(SharedBaseService):
     def _fetch_listing_links_for_target(self, target: dict, *, max_pages: int = 0, limit: int = 20) -> list[str]:
         session = requests.Session()
         headers = self._goonet_http_headers(ajax=False)
-        proxies = self._http_proxies()
         url = self._listing_url_for_target(target, use_grade=bool(target.get("grade_cd")))
         timeout = self._env_float("GOONET_HTTP_TIMEOUT", 30.0, minimum=1.0)
         retry_count = self._env_int("GOONET_LISTING_RETRIES", 2, minimum=1)
@@ -304,15 +303,31 @@ class GoonetCarsService(SharedBaseService):
             last_exc: Exception | None = None
             for attempt in range(1, retry_count + 1):
                 try:
-                    response = session.request(method, request_url, timeout=timeout, proxies=proxies, **kwargs)
+                    response = session.request(method, request_url, timeout=timeout, proxies=self._http_proxies(), **kwargs)
                     response.raise_for_status()
                     return response
+                except requests.HTTPError as exc:
+                    last_exc = exc
+                    if not self._is_retryable_http_error(exc) or attempt >= retry_count:
+                        break
+                    reset_cached_proxy()
+                    sleep_for = max(
+                        self._env_float("GOONET_LISTING_RETRY_WAIT_SECONDS", 2.0, minimum=0.0),
+                        self._backoff_seconds(attempt),
+                    )
+                    self.logger.warning("Goonet listing retry %s/%s after status %s, sleeping %.1fs", attempt, retry_count, exc.response.status_code if exc.response else "?", sleep_for)
+                    time.sleep(sleep_for)
                 except Exception as exc:
                     last_exc = exc
                     if attempt >= retry_count:
                         break
                     reset_cached_proxy()
-                    time.sleep(self._env_float("GOONET_LISTING_RETRY_WAIT_SECONDS", 2.0, minimum=0.0))
+                    sleep_for = max(
+                        self._env_float("GOONET_LISTING_RETRY_WAIT_SECONDS", 2.0, minimum=0.0),
+                        self._backoff_seconds(attempt),
+                    )
+                    self.logger.warning("Goonet listing retry %s/%s after error %s, sleeping %.1fs", attempt, retry_count, exc, sleep_for)
+                    time.sleep(sleep_for)
             raise last_exc or RuntimeError("Goonet listing request failed")
 
         first = request_with_retries("GET", url, headers=headers)
@@ -342,6 +357,7 @@ class GoonetCarsService(SharedBaseService):
                 seen.add(link)
                 links.append(link)
         for page in range(2, pages + 1):
+            self._sleep_seconds("GOONET_LISTING_DELAY_SECONDS")
             page_url = url.rstrip("/") + f"/index-{page}.html"
             response = request_with_retries("GET", page_url, headers=headers)
             page_links = self._extract_listing_links_from_html(response.text)
@@ -377,6 +393,8 @@ class GoonetCarsService(SharedBaseService):
         seen: set[str] = set()
         links: list[str] = []
         for index, target in enumerate(targets, start=1):
+            if index > 1:
+                self._sleep_seconds("GOONET_LISTING_DELAY_SECONDS")
             self.logger.info(
                 "Goonet listing target %s/%s: %s %s%s",
                 index,
@@ -758,12 +776,49 @@ class GoonetCarsService(SharedBaseService):
             headers["cookie"] = cookie
         return headers
 
+    def _sleep_seconds(self, env_name: str) -> None:
+        seconds = self._env_float(env_name, 0.0, minimum=0.0)
+        if seconds > 0:
+            time.sleep(seconds)
+
+    def _is_retryable_http_error(self, exc: Exception) -> bool:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return status_code in {403, 429, 500, 502, 503, 504}
+
+    def _backoff_seconds(self, attempt: int) -> float:
+        base = self._env_float("GOONET_BACKOFF_BASE_SECONDS", 2.0, minimum=0.0)
+        cap = self._env_float("GOONET_BACKOFF_MAX_SECONDS", 60.0, minimum=0.0)
+        seconds = base * (2 ** max(0, attempt - 1))
+        return min(seconds, cap) if cap > 0 else seconds
+
     def _request_goonet(self, method: str, url: str, **kwargs) -> requests.Response:
         timeout = self._env_float("GOONET_HTTP_TIMEOUT", 30.0, minimum=1.0)
-        proxies = self._http_proxies()
-        response = requests.request(method, url, timeout=timeout, proxies=proxies, **kwargs)
-        response.raise_for_status()
-        return response
+        retries = self._env_int("GOONET_HTTP_RETRIES", 3, minimum=1)
+        last_exc: Exception | None = None
+        for attempt in range(1, retries + 1):
+            proxies = self._http_proxies()
+            try:
+                response = requests.request(method, url, timeout=timeout, proxies=proxies, **kwargs)
+                response.raise_for_status()
+                return response
+            except requests.HTTPError as exc:
+                last_exc = exc
+                if not self._is_retryable_http_error(exc) or attempt >= retries:
+                    raise
+                reset_cached_proxy()
+                sleep_for = self._backoff_seconds(attempt)
+                self.logger.warning("Goonet HTTP %s retry %s/%s after status %s, sleeping %.1fs", method, attempt, retries, exc.response.status_code if exc.response else "?", sleep_for)
+                time.sleep(sleep_for)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= retries:
+                    raise
+                reset_cached_proxy()
+                sleep_for = self._backoff_seconds(attempt)
+                self.logger.warning("Goonet HTTP %s retry %s/%s after error %s, sleeping %.1fs", method, attempt, retries, exc, sleep_for)
+                time.sleep(sleep_for)
+        raise last_exc or RuntimeError("Goonet HTTP request failed")
 
     def _parse_master_name_count(self, value: object | None) -> tuple[str | None, int | None]:
         text = self._clean_text(value)
@@ -1541,6 +1596,8 @@ class GoonetCarsService(SharedBaseService):
                 url = str(url or "").strip()
                 if not url:
                     continue
+                if idx > 1:
+                    self._sleep_seconds("GOONET_DETAIL_DELAY_SECONDS")
                 self.logger.info("Detail %s/%s: %s", idx, len(links), url)
                 listing_id = listing_id_by_url.get(url) if listing_id_by_url else None
                 try:
@@ -1578,6 +1635,8 @@ class GoonetCarsService(SharedBaseService):
                     url = str(url or "").strip()
                     if not url:
                         continue
+                    if idx > 1:
+                        self._sleep_seconds("GOONET_DETAIL_DELAY_SECONDS")
                     self.logger.info("Detail %s/%s: %s", idx, len(data["links"]), url)
                     listing_id = listing_id_by_url.get(url) if listing_id_by_url else None
                     try:
