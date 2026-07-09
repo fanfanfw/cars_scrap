@@ -79,6 +79,49 @@ Script berikut didefinisikan di `pyproject.toml`:
 - `uv run serve-mobil123`
 - `uv run serve-carmudi`
 
+## Goonet catalog specification scraper
+
+Scraper catalog Goonet (`scrape-goonet-catalog` / `python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper`) terpisah dari scraper listing Goonet lama (`scrape-goonet` / `scrap_goonet_cars_botasaurus`). Catalog mengambil data spesifikasi dari `https://www.goo-net-exchange.com/catalog/`, bukan listing `/usedcars/`. Command di bawah mengasumsikan virtualenv aktif; jika tidak, prefix dengan `uv run`.
+
+Migrasi schema:
+
+```bash
+python -m cars_scrap_common.migrate_sql
+```
+
+Dry-run parser (tidak menulis ke DB):
+
+```bash
+python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-makes --dry-run --max-makes 5
+python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --detail-url https://www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/10163593/ --dry-run
+```
+
+Limited sync untuk cek DB write kecil:
+
+```bash
+python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-all --max-makes 1 --max-models 1 --max-specs 2
+```
+
+Full sync:
+
+```bash
+python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-all
+```
+
+Jalankan full sync berkala setiap 2 bulan. Contoh cron:
+
+```cron
+0 2 1 */2 * flock -n /tmp/cars_scrap_goonet_catalog.lock bash -c 'cd /path/to/cars_scrap && python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-all' >> /path/to/cars_scrap/logs/cron_goonet_catalog.log 2>&1
+```
+
+Contoh systemd timer:
+
+```ini
+[Timer]
+OnCalendar=*-01/2-01 02:00:00
+Persistent=true
+```
+
 ## Setup lokal
 
 ### 1. Clone dan siapkan env
