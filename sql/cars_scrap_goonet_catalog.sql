@@ -6,8 +6,19 @@ CREATE TABLE IF NOT EXISTS cars_scrap_goonet_catalog_runs (
   makes_count INTEGER NOT NULL DEFAULT 0,
   models_count INTEGER NOT NULL DEFAULT 0,
   specs_count INTEGER NOT NULL DEFAULT 0,
-  error TEXT
+  error TEXT,
+  phase TEXT,
+  current_make_slug TEXT,
+  current_model_slug TEXT,
+  heartbeat_at TIMESTAMPTZ,
+  resumed_from_run_id BIGINT
 );
+
+ALTER TABLE cars_scrap_goonet_catalog_runs ADD COLUMN IF NOT EXISTS phase TEXT;
+ALTER TABLE cars_scrap_goonet_catalog_runs ADD COLUMN IF NOT EXISTS current_make_slug TEXT;
+ALTER TABLE cars_scrap_goonet_catalog_runs ADD COLUMN IF NOT EXISTS current_model_slug TEXT;
+ALTER TABLE cars_scrap_goonet_catalog_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
+ALTER TABLE cars_scrap_goonet_catalog_runs ADD COLUMN IF NOT EXISTS resumed_from_run_id BIGINT;
 
 CREATE TABLE IF NOT EXISTS cars_scrap_goonet_catalog_makes (
   id BIGSERIAL PRIMARY KEY,

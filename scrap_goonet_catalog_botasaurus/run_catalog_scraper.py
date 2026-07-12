@@ -9,6 +9,9 @@ from scrap_goonet_catalog_botasaurus.catalog_service import BASE_CATALOG_URL, Go
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Scrape Goonet Exchange catalog specifications")
     parser.add_argument("--sync-all", action="store_true", help="Sync makes, models, spec links, and spec details")
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", action="store_true", help="Resume the latest resumable catalog run")
+    resume_group.add_argument("--resume-run-id", type=int, metavar="ID", help="Resume a specific resumable catalog run")
     parser.add_argument("--sync-makes", action="store_true", help="Sync catalog makes")
     parser.add_argument("--sync-models", action="store_true", help="Sync catalog models")
     parser.add_argument("--sync-spec-links", action="store_true", help="Sync catalog spec links")
@@ -30,6 +33,7 @@ def main() -> None:
 
     modes = [
         "sync_all" if args.sync_all else None,
+        "resume" if args.resume or args.resume_run_id is not None else None,
         "sync_makes" if args.sync_makes else None,
         "sync_models" if args.sync_models else None,
         "sync_spec_links" if args.sync_spec_links else None,
@@ -46,6 +50,22 @@ def main() -> None:
         parser.error("choose only one sync/debug mode")
 
     service = GoonetCatalogService()
+    if args.resume or args.resume_run_id is not None:
+        if args.dry_run:
+            parser.error("--resume does not support --dry-run")
+        try:
+            result = service.resume(
+                args.resume_run_id,
+                max_makes=args.max_makes,
+                max_models=args.max_models,
+                max_specs=args.max_specs,
+                delay_seconds=args.delay_seconds,
+            )
+        except RuntimeError as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
     if args.sync_all:
         if args.dry_run:
             parser.error("--sync-all --dry-run is not supported; use --make-url/--model-url/--detail-url dry-run checks")

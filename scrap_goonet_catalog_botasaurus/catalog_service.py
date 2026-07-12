@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
@@ -15,6 +16,10 @@ from cars_scrap_common.logging_utils import setup_logger
 
 
 BASE_CATALOG_URL = "https://www.goo-net-exchange.com/catalog/"
+
+
+class CatalogInterrupted(KeyboardInterrupt):
+    pass
 
 
 class GoonetCatalogService:
@@ -628,15 +633,58 @@ class GoonetCatalogService:
         finally:
             conn.close()
 
-    def _create_catalog_run(self) -> tuple[int, object]:
+    def _create_catalog_run(self, resumed_from_run_id: int | None = None) -> tuple[int, object]:
         from scrap_goonet_cars_botasaurus.database import get_connection
 
         conn = get_connection()
         try:
             with conn:
                 with conn.cursor() as cursor:
-                    cursor.execute("INSERT INTO cars_scrap_goonet_catalog_runs DEFAULT VALUES RETURNING id, started_at")
+                    cursor.execute(
+                        "INSERT INTO cars_scrap_goonet_catalog_runs (resumed_from_run_id, heartbeat_at) VALUES (%s, NOW()) RETURNING id, started_at",
+                        (resumed_from_run_id,),
+                    )
                     return cursor.fetchone()
+        finally:
+            conn.close()
+
+    def _resumable_run(self, run_id: int | None = None) -> dict:
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cursor:
+                where = "id = %s AND " if run_id is not None else ""
+                params = (run_id,) if run_id is not None else ()
+                cursor.execute(
+                    f"""SELECT id, current_make_slug, current_model_slug, status
+                        FROM cars_scrap_goonet_catalog_runs
+                        WHERE {where}status IN ('running', 'interrupted', 'partial', 'error')
+                        ORDER BY started_at DESC, id DESC LIMIT 1""",
+                    params,
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise RuntimeError(f"No resumable Goonet catalog run{' with id ' + str(run_id) if run_id is not None else ''} found")
+                return dict(zip(("id", "current_make_slug", "current_model_slug", "status"), row))
+        finally:
+            conn.close()
+
+    def _update_run(self, run_id: int, phase: str, make_slug: str | None = None, model_slug: str | None = None, checkpoint: bool = False) -> None:
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    if checkpoint:
+                        cursor.execute(
+                            "UPDATE cars_scrap_goonet_catalog_runs SET phase=%s, current_make_slug=%s, current_model_slug=%s, heartbeat_at=NOW() WHERE id=%s",
+                            (phase, make_slug, model_slug, run_id),
+                        )
+                        self.logger.info("Checkpoint updated run_id=%s make=%s model=%s", run_id, make_slug, model_slug)
+                    else:
+                        cursor.execute("UPDATE cars_scrap_goonet_catalog_runs SET phase=%s, heartbeat_at=NOW() WHERE id=%s", (phase, run_id))
         finally:
             conn.close()
 
@@ -652,20 +700,36 @@ class GoonetCatalogService:
             with conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        """
-                        UPDATE cars_scrap_goonet_catalog_runs
-                        SET finished_at = NOW(), status = %s, makes_count = %s, models_count = %s, specs_count = %s, error = %s
-                        WHERE id = %s
-                        """,
-                        (
-                            status,
-                            summary.get("makes", 0),
-                            summary.get("models", 0),
-                            summary.get("spec_summaries", 0),
-                            error_text,
-                            run_id,
-                        ),
+                        """UPDATE cars_scrap_goonet_catalog_runs
+                           SET finished_at=NOW(), status=%s, phase='finished', heartbeat_at=NOW(),
+                               makes_count=%s, models_count=%s, specs_count=%s, error=%s WHERE id=%s""",
+                        (status, summary.get("makes", 0), summary.get("models", 0), summary.get("spec_summaries", 0), error_text, run_id),
                     )
+        finally:
+            conn.close()
+
+    def _completed_spec_ids(self, model_slug: str) -> set[str]:
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT catalog_spec_id FROM cars_scrap_goonet_catalog_specs WHERE model_slug=%s AND data <> '{}'::jsonb AND content_hash IS NOT NULL",
+                    (model_slug,),
+                )
+                return {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def _pending_count(self) -> int:
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT count(*) FROM cars_scrap_goonet_catalog_specs WHERE status='active' AND (content_hash IS NULL OR data='{}'::jsonb)")
+                return cursor.fetchone()[0]
         finally:
             conn.close()
 
@@ -681,140 +745,203 @@ class GoonetCatalogService:
     def _record_sync_error(self, summary: dict, stage: str, url: str | None, error: Exception) -> None:
         summary["errors"].append({"stage": stage, "url": url, "error": str(error)})
 
-    def sync_all(
+    def _backfill_pending(self, summary: dict, run_id: int, max_specs: int, delay: float, attempted: set[str]) -> None:
+        pending = self.get_pending_spec_details()
+        self.logger.info("Pending detail backfill run_id=%s count=%s attempted=%s budget=%s", run_id, len(pending), len(attempted), max_specs or "unlimited")
+        for spec in pending:
+            spec_id = spec["catalog_spec_id"]
+            if spec_id in attempted:
+                continue
+            if max_specs > 0 and summary["detail_attempts"] >= max_specs:
+                break
+            attempted.add(spec_id)
+            summary["detail_attempts"] += 1
+            self._update_run(run_id, "pending_details")
+            try:
+                detail = self.parse_spec_detail(self.fetch_html(spec["spec_url"]), spec)
+                if self.upsert_spec_detail({"data": detail}, run_id):
+                    summary["details_changed"] += 1
+                summary["spec_details"] += 1
+            except Exception as exc:
+                self.logger.warning("Failed pending detail %s: %s", spec.get("spec_url"), exc)
+                self._record_sync_error(summary, "pending_details", spec.get("spec_url"), exc)
+            self._sleep_between_requests(delay)
+
+    def resume(self, run_id: int | None = None, **limits) -> dict:
+        source = self._resumable_run(run_id)
+        return self._sync(resume_from=source, **limits)
+
+    def sync_all(self, *, max_makes: int = 0, max_models: int = 0, max_specs: int = 0, delay_seconds: float | None = None) -> dict:
+        return self._sync(max_makes=max_makes, max_models=max_models, max_specs=max_specs, delay_seconds=delay_seconds)
+
+    def _sync(
         self,
         *,
         max_makes: int = 0,
         max_models: int = 0,
         max_specs: int = 0,
         delay_seconds: float | None = None,
+        resume_from: dict | None = None,
     ) -> dict:
-        summary = {
-            "run_id": None,
-            "status": "running",
-            "makes": 0,
-            "models": 0,
-            "spec_summaries": 0,
-            "spec_details": 0,
-            "details_changed": 0,
-            "missing_makes": 0,
-            "missing_models": 0,
-            "missing_specs": 0,
-            "errors": [],
-        }
-        run_id, run_started_at = self._create_catalog_run()
-        summary["run_id"] = run_id
-        delay = self._catalog_delay(delay_seconds)
-        self.logger.info(
-            "Starting Goonet catalog sync run_id=%s max_makes=%s max_models=%s max_specs=%s delay=%.2fs",
-            run_id,
-            max_makes,
-            max_models,
-            max_specs,
-            delay,
-        )
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        summary = {"run_id": None, "resumed_from_run_id": resume_from and resume_from["id"], "status": "running", "makes": 0,
+                   "models": 0, "spec_summaries": 0, "spec_details": 0, "detail_attempts": 0, "details_changed": 0,
+                   "details_skipped": 0, "pending_details": 0, "missing_makes": 0, "missing_models": 0,
+                   "missing_specs": 0, "errors": []}
+        run_id = None
+        lock_conn = None
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        sigterm_received = False
+        sigterm_installed = False
+
+        def interrupt_on_sigterm(_signum, _frame):
+            nonlocal sigterm_received
+            if sigterm_received:
+                return
+            sigterm_received = True
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            raise CatalogInterrupted("Received SIGTERM")
+
         try:
+            signal.signal(signal.SIGTERM, interrupt_on_sigterm)
+            sigterm_installed = True
+            lock_conn = get_connection()
+            with lock_conn.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", (7274, 19001))
+                if not cursor.fetchone()[0]:
+                    raise RuntimeError("Another Goonet catalog sync/resume job is already running")
+            run_id, run_started_at = self._create_catalog_run(summary["resumed_from_run_id"])
+            summary["run_id"] = run_id
+            delay = self._catalog_delay(delay_seconds)
+            checkpoint_make = resume_from and resume_from.get("current_make_slug")
+            checkpoint_model = resume_from and resume_from.get("current_model_slug")
+            if checkpoint_make or checkpoint_model:
+                self._update_run(run_id, "resuming", checkpoint_make, checkpoint_model, checkpoint=True)
+            self.logger.info("Starting catalog run_id=%s resume_source=%s checkpoint=%s/%s limits=%s/%s/%s",
+                             run_id, summary["resumed_from_run_id"], checkpoint_make, checkpoint_model, max_makes, max_models, max_specs)
+            attempted: set[str] = set()
+            self._backfill_pending(summary, run_id, max_specs, delay, attempted)
+            if max_specs > 0 and summary["detail_attempts"] >= max_specs:
+                summary["pending_details"] = self._pending_count()
+                summary["status"] = "partial"
+                self._finish_catalog_run(run_id, summary["status"], summary)
+                self.logger.info("Finished catalog run_id=%s after capped pending backfill pending=%s", run_id, summary["pending_details"])
+                return summary
+            self._update_run(run_id, "discovery")
             makes = self.parse_makes(self.fetch_html(BASE_CATALOG_URL), BASE_CATALOG_URL)
+            if checkpoint_make:
+                checkpoint_index = next((i for i, make in enumerate(makes) if make["make_slug"] == checkpoint_make), None)
+                if checkpoint_index is None:
+                    raise RuntimeError(f"Saved checkpoint make {checkpoint_make} is no longer present in catalog")
+                makes = makes[checkpoint_index:]
             if max_makes > 0:
                 makes = makes[:max_makes]
-            self.logger.info("Parsed %s makes.", len(makes))
             summary["makes"] = self.upsert_makes(makes, run_id)
-            self.logger.info("Upserted %s makes.", summary["makes"])
-            if max_makes <= 0 and makes:
-                summary["missing_makes"] = self.mark_missing_makes(run_started_at)
-                self.logger.info("Marked %s missing makes.", summary["missing_makes"])
             self._sleep_between_requests(delay)
 
-            for make_index, make in enumerate(makes, start=1):
+            for make in makes:
                 if max_models > 0 and summary["models"] >= max_models:
                     break
-                if max_specs > 0 and summary["spec_summaries"] >= max_specs:
-                    break
-                self.logger.info("Processing make %s/%s: %s", make_index, len(makes), make.get("make_slug"))
                 try:
+                    self._update_run(run_id, "models")
                     models = self.parse_models(self.fetch_html(make["make_url"]), make)
                 except Exception as exc:
-                    self.logger.warning("Failed to parse models for %s: %s", make.get("make_url"), exc)
                     self._record_sync_error(summary, "models", make.get("make_url"), exc)
-                    self._sleep_between_requests(delay)
+                    self.logger.warning("Failed models page %s: %s", make.get("make_url"), exc)
                     continue
                 for model in models:
                     model["make_name"] = make.get("make_name")
+                if make["make_slug"] == checkpoint_make and checkpoint_model:
+                    model_index = next((i for i, model in enumerate(models) if model["model_slug"] == checkpoint_model), None)
+                    if model_index is None:
+                        raise RuntimeError(f"Saved checkpoint model {checkpoint_model} is no longer present in catalog")
+                    models = models[model_index + 1:]
                 if max_models > 0:
-                    models = models[: max_models - summary["models"]]
-                self.logger.info("Parsed %s models for %s.", len(models), make.get("make_slug"))
+                    models = models[:max_models - summary["models"]]
                 if models:
                     summary["models"] += self.upsert_models(models, run_id)
-                    self.logger.info("Total models upserted so far: %s.", summary["models"])
                 self._sleep_between_requests(delay)
 
-                for model_index, model in enumerate(models, start=1):
-                    if max_specs > 0 and summary["spec_summaries"] >= max_specs:
-                        break
-                    self.logger.info("Processing model %s/%s: %s", model_index, len(models), model.get("model_slug"))
+                stop_discovery = False
+                for model in models:
                     try:
+                        self._update_run(run_id, "spec_summaries")
                         specs = self.parse_model_specs(self.fetch_html(model["model_url"]), model)
                     except Exception as exc:
-                        self.logger.warning("Failed to parse spec links for %s: %s", model.get("model_url"), exc)
                         self._record_sync_error(summary, "spec_summaries", model.get("model_url"), exc)
-                        self._sleep_between_requests(delay)
+                        self.logger.warning("Failed model page %s: %s", model.get("model_url"), exc)
                         continue
-                    if max_specs > 0:
-                        specs = specs[: max_specs - summary["spec_summaries"]]
-                    self.logger.info("Parsed %s spec links for %s.", len(specs), model.get("model_slug"))
-                    if specs:
-                        summary["spec_summaries"] += self.upsert_spec_summaries(specs, run_id)
-                        self.logger.info("Total spec links upserted so far: %s.", summary["spec_summaries"])
-                    self._sleep_between_requests(delay)
-
+                    # A checkpoint means every link on this model page was discovered and durably upserted.
+                    summary["spec_summaries"] += self.upsert_spec_summaries(specs, run_id)
+                    completed = self._completed_spec_ids(model["model_slug"])
+                    model_complete = True
                     for spec in specs:
-                        self.logger.info("Processing spec detail %s: %s", summary["spec_details"] + 1, spec.get("spec_url"))
+                        spec_id = spec["catalog_spec_id"]
+                        if spec_id in completed:
+                            summary["details_skipped"] += 1
+                            continue
+                        if spec_id in attempted:
+                            continue
+                        if max_specs > 0 and summary["detail_attempts"] >= max_specs:
+                            model_complete = False
+                            break
+                        attempted.add(spec_id)
+                        summary["detail_attempts"] += 1
+                        self._update_run(run_id, "spec_details")
                         try:
                             detail = self.parse_spec_detail(self.fetch_html(spec["spec_url"]), spec)
                             if self.upsert_spec_detail({"data": detail}, run_id):
                                 summary["details_changed"] += 1
                             summary["spec_details"] += 1
-                            self.logger.info(
-                                "Synced spec detail %s changed=%s.",
-                                summary["spec_details"],
-                                summary["details_changed"],
-                            )
                         except Exception as exc:
-                            self.logger.warning("Failed to sync spec detail %s: %s", spec.get("spec_url"), exc)
                             self._record_sync_error(summary, "spec_details", spec.get("spec_url"), exc)
+                            self.logger.warning("Failed spec detail %s: %s", spec.get("spec_url"), exc)
                         self._sleep_between_requests(delay)
+                    if model_complete:
+                        self.logger.info("Model fully enumerated; detail failures remain durably pending, checkpoint may advance model=%s", model["model_slug"])
+                        self._update_run(run_id, "model_complete", make["make_slug"], model["model_slug"], checkpoint=True)
+                    else:
+                        self.logger.info("Detail budget exhausted mid-model; retaining prior checkpoint model=%s", model["model_slug"])
+                        stop_discovery = True
+                        break
+                if stop_discovery:
+                    break
 
-            if (
-                max_makes <= 0
-                and max_models <= 0
-                and max_specs <= 0
-                and summary["models"]
-                and not any(error["stage"] == "models" for error in summary["errors"])
-            ):
-                summary["missing_models"] = self.mark_missing_models(run_started_at)
-                self.logger.info("Marked %s missing models.", summary["missing_models"])
-
-            if (
-                max_makes <= 0
-                and max_models <= 0
-                and max_specs <= 0
-                and summary["spec_summaries"]
-                and not any(error["stage"] == "spec_summaries" for error in summary["errors"])
-            ):
-                summary["missing_specs"] = self.mark_missing_specs(run_started_at)
-                self.logger.info("Marked %s missing specs.", summary["missing_specs"])
-
-            summary["status"] = "success"
-            self._finish_catalog_run(run_id, "success", summary)
-            self.logger.info("Finished Goonet catalog sync run_id=%s summary=%s", run_id, json.dumps(summary, ensure_ascii=False))
+            if not resume_from and max_makes <= 0 and max_models <= 0 and max_specs <= 0:
+                if not any(error["stage"] == "models" for error in summary["errors"]):
+                    summary["missing_makes"] = self.mark_missing_makes(run_started_at)
+                    summary["missing_models"] = self.mark_missing_models(run_started_at)
+                if not any(error["stage"] == "spec_summaries" for error in summary["errors"]):
+                    summary["missing_specs"] = self.mark_missing_specs(run_started_at)
+            if max_specs <= 0 or summary["detail_attempts"] < max_specs:
+                self._backfill_pending(summary, run_id, max_specs, delay, attempted)
+            summary["pending_details"] = self._pending_count()
+            limited = max_makes > 0 or max_models > 0 or max_specs > 0
+            summary["status"] = "partial" if limited or summary["errors"] or summary["pending_details"] else "success"
+            self._finish_catalog_run(run_id, summary["status"], summary)
+            self.logger.info("Finished catalog run_id=%s status=%s skipped=%s pending=%s", run_id, summary["status"], summary["details_skipped"], summary["pending_details"])
         except KeyboardInterrupt:
-            summary["status"] = "interrupted"
-            self.logger.warning("Goonet catalog sync interrupted run_id=%s summary=%s", run_id, json.dumps(summary, ensure_ascii=False))
-            self._finish_catalog_run(run_id, "interrupted", summary, "Interrupted by user")
+            if run_id is not None:
+                summary["status"] = "interrupted"
+                self._finish_catalog_run(run_id, "interrupted", summary, "Interrupted by user")
             raise
         except Exception as exc:
-            summary["status"] = "error"
-            self.logger.exception("Goonet catalog sync failed run_id=%s", run_id)
-            self._record_sync_error(summary, "fatal", None, exc)
-            self._finish_catalog_run(run_id, "error", summary, str(exc))
+            if run_id is not None:
+                summary["status"] = "error"
+                self._record_sync_error(summary, "fatal", None, exc)
+                self._finish_catalog_run(run_id, "error", summary, str(exc))
+            else:
+                raise
+        finally:
+            try:
+                if lock_conn is not None:
+                    try:
+                        with lock_conn.cursor() as cursor:
+                            cursor.execute("SELECT pg_advisory_unlock(%s, %s)", (7274, 19001))
+                    finally:
+                        lock_conn.close()
+            finally:
+                if sigterm_installed:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
         return summary

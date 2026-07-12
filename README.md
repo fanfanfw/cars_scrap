@@ -106,6 +106,8 @@ Full sync:
 
 ```bash
 python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-all
+# Continue after the latest saved checkpoint (or use --resume-run-id ID):
+python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --resume
 ```
 
 Jalankan full sync berkala setiap 2 bulan. Contoh cron:
