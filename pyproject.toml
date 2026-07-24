@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 scrape-mudahmy = "scrap_mudahmy_cars_botasaurus.run_scraper:main"
+scrape-mudahmy-models = "scrap_mudahmy_model_worker.run_worker:main"
 scrape-carlist = "scrap_carlist_cars_botasaurus.run_scraper:main"
 scrape-mobil123 = "scrap_mobil123_cars_botasaurus.run_scraper:main"
 scrape-carmudi = "scrap_carmudi_cars_botasaurus.run_scraper:main"
@@ -39,6 +40,7 @@ serve-goonet = "scrap_goonet_cars_botasaurus.app:main"
 packages = [
   "cars_scrap_common",
   "scrap_mudahmy_cars_botasaurus",
+  "scrap_mudahmy_model_worker",
   "scrap_carlist_cars_botasaurus",
   "scrap_mobil123_cars_botasaurus",
   "scrap_carmudi_cars_botasaurus",
