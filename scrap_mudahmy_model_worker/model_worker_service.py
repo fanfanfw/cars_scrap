@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-import re
 import time
 from urllib.parse import urlencode
 
 import requests
 from psycopg2.extras import Json, execute_values
 
+from cars_scrap_common.botasaurus_utils import load_botasaurus_config
 from scrap_mudahmy_cars_botasaurus.database import get_connection
 from scrap_mudahmy_cars_botasaurus.mudahmy_service import MudahMyCarsService
 
@@ -197,42 +197,74 @@ class MudahMyModelWorkerService:
             cursor.close()
             conn.close()
 
-    def _total_pages(self, url: str) -> int:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        pages = [int(value) for value in re.findall(r'Go to page (\d+)', response.text)]
-        return max(pages, default=1)
+    def _scrape_listing_pages(
+        self,
+        scraper: MudahMyCarsService,
+        base_url: str,
+        model_id: int,
+        worker_id: str,
+        max_pages: int,
+        page_retries: int,
+    ) -> tuple[list[str], int]:
+        from botasaurus.browser import Driver, browser
+
+        cfg = load_botasaurus_config(service_name="mudahmy")
+        scraper._maybe_log_proxy_and_ip(cfg)
+
+        @browser(**cfg.browser_kwargs)
+        def run(driver: Driver, data):
+            links = []
+            seen = set()
+            total_pages = 1
+            page = 1
+            while page <= total_pages:
+                url = data["base_url"] if page == 1 else f"{data['base_url']}?{urlencode({'o': page})}"
+                error = None
+                for attempt in range(1, data["page_retries"] + 1):
+                    try:
+                        scraper.logger.info("Model page %s: %s", page, url)
+                        scraper._navigate_botasaurus(driver, url, cfg)
+                        time.sleep(max(0.0, cfg.listing_wait_seconds))
+                        if page == 1:
+                            page_numbers = driver.run_js(
+                                """
+                                return Array.from(document.querySelectorAll('button[aria-label^="Go to page "]'))
+                                  .map((button) => Number((button.getAttribute('aria-label') || '').match(/\\d+/)?.[0]))
+                                  .filter(Number.isFinite);
+                                """
+                            ) or []
+                            total_pages = max([1, *[int(value) for value in page_numbers]])
+                            if data["max_pages"] > 0:
+                                total_pages = min(total_pages, data["max_pages"])
+                            self.update_progress(model_id, worker_id, total_pages, 0)
+                        page_links = scraper._extract_listing_urls_botasaurus(driver)
+                        break
+                    except Exception as exc:
+                        error = exc
+                        if attempt < data["page_retries"]:
+                            time.sleep(attempt * 2)
+                else:
+                    self.update_progress(model_id, worker_id, total_pages, page - 1, page)
+                    raise RuntimeError(f"Page {page} failed after {data['page_retries']} attempts: {error}")
+                for link in page_links:
+                    if link not in seen:
+                        seen.add(link)
+                        links.append(link)
+                self.update_progress(model_id, worker_id, total_pages, page)
+                page += 1
+            return {"links": links, "total_pages": total_pages}
+
+        result = run({"base_url": base_url, "max_pages": max_pages, "page_retries": page_retries}) or {}
+        return list(result.get("links") or []), int(result.get("total_pages") or 1)
 
     def scrape_claimed_model(self, model: dict, worker_id: str, max_pages: int, details: bool, page_retries: int = 3) -> dict:
         base_url = f"https://www.mudah.my/malaysia/cars-for-sale/{model['make_slug']}/{model['model_slug']}"
         scraper = MudahMyCarsService()
         links = []
-        seen = set()
         try:
-            total_pages = self._total_pages(base_url)
-            if max_pages > 0:
-                total_pages = min(total_pages, max_pages)
-            self.update_progress(model["id"], worker_id, total_pages, 0)
-            for page in range(1, total_pages + 1):
-                url = base_url if page == 1 else f"{base_url}?{urlencode({'o': page})}"
-                error = None
-                for attempt in range(1, page_retries + 1):
-                    try:
-                        page_links = scraper.scrape_all_from_main(start_url=url, max_pages=1)
-                        break
-                    except Exception as exc:
-                        error = exc
-                        if attempt < page_retries:
-                            time.sleep(attempt * 2)
-                else:
-                    self.update_progress(model["id"], worker_id, total_pages, page - 1, page)
-                    raise RuntimeError(f"Page {page} failed after {page_retries} attempts: {error}")
-                for link in page_links:
-                    if link not in seen:
-                        seen.add(link)
-                        links.append(link)
-                self.update_progress(model["id"], worker_id, total_pages, page)
-
+            links, total_pages = self._scrape_listing_pages(
+                scraper, base_url, model["id"], worker_id, max_pages, page_retries
+            )
             results = scraper.scrape_listing_details(links, allow_revive_sold=True, require_brand_model=True) if details and links else []
             detail_errors = sum(1 for result in results if result.get("error") or result.get("skipped_upsert"))
             if detail_errors:
