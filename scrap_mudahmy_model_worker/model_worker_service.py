@@ -93,6 +93,44 @@ class MudahMyModelWorkerService:
             conn.close()
         return {"matched_models": matched}
 
+    def get_status(self, status_filter: str | None = None, limit: int = 50) -> dict:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT COALESCE(last_listing_scrape_status, 'pending'), count(*)
+                FROM cars_scrap_mudahmy_models
+                WHERE status = 'active'
+                GROUP BY 1 ORDER BY 1
+            """)
+            summary = {status: count for status, count in cursor.fetchall()}
+            params: list[object] = []
+            where = "md.status = 'active'"
+            if status_filter:
+                where += " AND COALESCE(md.last_listing_scrape_status, 'pending') = %s"
+                params.append(status_filter)
+            params.append(limit)
+            cursor.execute(f"""
+                SELECT ma.make_name, md.model_name,
+                  COALESCE(md.last_listing_scrape_status, 'pending') AS scrape_status,
+                  md.last_listing_scrape_count, md.listing_last_page,
+                  md.listing_total_pages, md.listing_failed_page,
+                  md.listing_claimed_by, md.listing_lease_until,
+                  md.last_listing_scraped_at, md.last_listing_scrape_error
+                FROM cars_scrap_mudahmy_models md
+                JOIN cars_scrap_mudahmy_makes ma ON ma.make_id = md.make_id
+                WHERE {where}
+                ORDER BY md.last_listing_scraped_at DESC NULLS LAST,
+                  ma.make_name, md.model_name
+                LIMIT %s
+            """, params)
+            columns = [column[0] for column in cursor.description]
+            models = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+            conn.close()
+        return {"summary": summary, "filter": status_filter or "all", "models": models}
+
     def claim_model(self, worker_id: str, lease_minutes: int) -> dict | None:
         conn = get_connection()
         cursor = conn.cursor()
