@@ -467,7 +467,75 @@ Catatan:
 - pada mode detail, scraper memakai validasi tambahan agar data yang masuk lebih konsisten
 - untuk `mudah.my`, opsi `--print-links` tersedia bila ingin menampilkan daftar link yang dikumpulkan
 
-### C. Re-scrape data lama dari DB (tracking mode)
+### C. Scrape model Mudah.my yang belum ada
+
+Worker model memakai master brand/model Mudah dan queue PostgreSQL. Worker berbeda mengklaim model berbeda dengan lease, membaca seluruh pagination model, lalu memakai scraper detail Mudah existing. Listing tetap di-upsert ke `cars_scrap_mudahmy`, detail ke `cars_scrap_mudahmy_details`, dan perubahan harga tetap dicatat oleh trigger `price_history_scrap_mudahmy`.
+
+Setup awal setelah deploy:
+
+```bash
+uv run migrate-sql
+uv run scrape-mudahmy-models --sync-master-data
+uv run scrape-mudahmy-models --bootstrap-existing
+```
+
+Menjalankan satu worker untuk satu model:
+
+```bash
+BOTASAURUS_PROFILE=mudahmy_models_worker_1 \
+uv run scrape-mudahmy-models \
+  --claim-model \
+  --worker-id worker-1 \
+  --lease-minutes 360 \
+  --max-pages 0 \
+  --page-retries 3 \
+  --details
+```
+
+`--max-pages 0` memproses seluruh halaman. Model tanpa listing tetap ditandai `success` dengan `last_listing_scrape_count = 0`.
+
+Cek ringkasan dan daftar status:
+
+```bash
+uv run scrape-mudahmy-models --status
+uv run scrape-mudahmy-models --status --status-filter pending --status-limit 100
+uv run scrape-mudahmy-models --status --status-filter running
+uv run scrape-mudahmy-models --status --status-filter success
+uv run scrape-mudahmy-models --status --status-filter error
+uv run scrape-mudahmy-models --status --status-filter bootstrap_existing
+```
+
+Output status default berupa tabel terminal. Gunakan `--json` bila output akan diproses script:
+
+```bash
+uv run scrape-mudahmy-models --status --status-filter pending --status-limit 100 --json
+```
+
+Arti status:
+
+- `pending`: model belum ditemukan di listing existing dan belum diperiksa worker
+- `bootstrap_existing`: brand/model sudah ditemukan di `cars_scrap_mudahmy`
+- `running`: model sedang diproses worker
+- `success`: seluruh halaman selesai; count dapat `0` bila tidak ada listing
+- `error`: proses gagal dan dapat diklaim ulang setelah lease habis
+
+Contoh tiga worker setiap lima menit:
+
+```cron
+*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_model_worker_1.lock bash -c 'cd /home/ifcon/ff/cars_scrap && BOTASAURUS_PROFILE=mudahmy_models_worker_1 uv run scrape-mudahmy-models --claim-model --worker-id worker-1 --lease-minutes 360 --max-pages 0 --page-retries 3 --details' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_worker_1.log 2>&1
+*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_model_worker_2.lock bash -c 'cd /home/ifcon/ff/cars_scrap && BOTASAURUS_PROFILE=mudahmy_models_worker_2 uv run scrape-mudahmy-models --claim-model --worker-id worker-2 --lease-minutes 360 --max-pages 0 --page-retries 3 --details' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_worker_2.log 2>&1
+*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_model_worker_3.lock bash -c 'cd /home/ifcon/ff/cars_scrap && BOTASAURUS_PROFILE=mudahmy_models_worker_3 uv run scrape-mudahmy-models --claim-model --worker-id worker-3 --lease-minutes 360 --max-pages 0 --page-retries 3 --details' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_worker_3.log 2>&1
+```
+
+Sinkronisasi katalog mingguan, Minggu pukul 02:10:
+
+```cron
+10 2 * * 0 flock -n /tmp/cars_scrap_mudahmy_model_sync.lock bash -c 'cd /home/ifcon/ff/cars_scrap && uv run scrape-mudahmy-models --sync-master-data && uv run scrape-mudahmy-models --bootstrap-existing' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_sync.log 2>&1
+```
+
+Gunakan lock dan `BOTASAURUS_PROFILE` berbeda dari scraper Mudah reguler. Duplikat listing dicegah oleh constraint unik `listing_id` dan `ON CONFLICT DO UPDATE`.
+
+### D. Re-scrape data lama dari DB (tracking mode)
 
 Tracking mode membaca listing `active` dari DB, lalu scrape ulang detail listing berdasarkan cutoff umur iklan.
 Urutan proses memprioritaskan `last_scraped_at` yang paling lama, lalu `information_ads_date` yang paling lama sebagai tie-breaker.
@@ -522,7 +590,7 @@ Batasan tracking mode:
 - tidak bisa digabung dengan `--debug-detail-url`
 - tracking selalu bekerja dari data yang sudah ada di DB
 
-### D. Debug satu detail URL
+### E. Debug satu detail URL
 
 Berguna untuk validasi parser satu halaman detail. Command ini:
 
