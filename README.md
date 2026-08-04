@@ -1,477 +1,327 @@
 # cars_scrap
 
-Repo scraping listing mobil untuk empat source:
+Internal vehicle-data scraping services for Malaysia, Indonesia, and Japan. Repository provides listing discovery, detail extraction, PostgreSQL persistence, price tracking, catalog synchronization, model-based workers, and simple HTTP wrappers.
 
-- `mudah.my`
-- `carlist.my`
-- `mobil123.com`
-- `carmudi.co.id`
+## Supported sources
 
-Project ini memakai:
+| Source | Listing CLI | Detail storage | Tracking | HTTP service | Notes |
+|---|---:|---:|---:|---:|---|
+| Mudah.my | Yes | Yes | Yes | `5201` | Model-based worker available |
+| Carlist.my | Yes | Yes | Yes | `5202` | Cloudflare retries and circuit breaker |
+| Mobil123 | Yes | Yes | Yes | `5203` | Cloudflare retries and circuit breaker |
+| Carmudi | Yes | Yes | Yes | `5204` | Cloudflare retries and circuit breaker |
+| OLX Indonesia | Yes | Yes | No | `5205` | Browser-based detail extraction |
+| Carsome Indonesia | Yes | Yes | No | `5206` | All-pages mode and detail API |
+| Goonet Exchange | Yes | Yes | Yes | `5207` | Maker/model/grade master data |
+| Goonet Catalog | Catalog sync | Specification storage | Checkpoint/resume | No | `requests` and BeautifulSoup |
 
-- Python `>=3.10`
-- `uv` untuk environment dan dependency management
-- Botasaurus untuk browser automation
-- PostgreSQL untuk penyimpanan hasil scrape dan histori harga
-- Flask untuk HTTP wrapper sederhana di atas scraper
-
-README ini merangkum cara setup, struktur repo, mode scraping, schema database, sampai endpoint service yang tersedia.
-
-## Ringkasan cara kerja
-
-Secara umum ada dua mode utama:
-
-1. Scrape halaman listing untuk mengumpulkan `listing_url`.
-2. Scrape halaman detail untuk mengambil data lengkap lalu `upsert` ke PostgreSQL.
-
-Semua source (`mudah.my`, `carlist.my`, `mobil123.com`, dan `carmudi.co.id`) punya pola yang sama:
-
-- service class untuk logic scraping
-- CLI entrypoint untuk eksekusi manual
-- Flask app untuk expose HTTP endpoint
-- tabel utama + tabel detail + tabel histori harga di Postgres
-
-Tracking/re-scrape juga tersedia. Mode ini membaca data `active` dari database, lalu scrape ulang detail listing yang sudah cukup lama berdasarkan `information_ads_date` dan opsional `last_scraped_at`.
-
-## Struktur repo
+## How it works
 
 ```text
-.
-├── cars_scrap_common/                    # shared utilities (env, logging, proxy, duration)
-├── scrap_mudahmy_cars_botasaurus/       # scraper mudah.my
-│   ├── app.py                           # HTTP service (Flask)
-│   ├── database.py                      # koneksi Postgres
-│   ├── mudahmy_service.py               # logic scraping utama
-│   └── run_scraper.py                   # CLI entrypoint
-├── scrap_carlist_cars_botasaurus/       # scraper carlist.my
-│   ├── app.py
-│   ├── database.py
-│   ├── carlist_service.py
-│   └── run_scraper.py
-├── scrap_mobil123_cars_botasaurus/      # scraper mobil123.com
-│   ├── app.py
-│   ├── database.py
-│   ├── mobil123_service.py
-│   └── run_scraper.py
-├── scrap_carmudi_cars_botasaurus/       # scraper carmudi.co.id
-│   ├── app.py
-│   ├── database.py
-│   ├── carmudi_service.py
-│   └── run_scraper.py
-├── sql/                                 # schema tabel dan price history trigger
-├── scripts/                             # script migrasi dari DB lama
-├── profiles/                            # profile Botasaurus + state proxy rotation
-├── logs/                                # log runtime
-├── error_logs/                          # error artifacts
-└── output/                              # output runtime / hasil scrape sementara
+CLI, HTTP request, or scheduled job
+                |
+                v
+        source-specific service
+        - discover listing URLs
+        - extract listing/detail data
+        - retry anti-bot/network failures
+                |
+                v
+             PostgreSQL
+        - source listing tables
+        - source detail tables
+        - price-history tables
+        - master/catalog/checkpoint tables
 ```
 
-## Entry point yang tersedia
+Normal listing mode returns discovered URLs. `--details` opens each detail page and upserts normalized data. Tracking mode loads stale active records from PostgreSQL and scrapes their details again. Database triggers record price changes.
 
-Script berikut didefinisikan di `pyproject.toml`:
+Goonet Catalog is separate from Goonet used-car listings. It synchronizes catalog makes, models, specification links, and specification details using direct HTTP requests. Mudah Model Worker atomically claims make/model work through a PostgreSQL lease, then reuses the Mudah detail scraper.
 
-- `uv run scrape-mudahmy`
-- `uv run scrape-carlist`
-- `uv run scrape-mobil123`
-- `uv run scrape-carmudi`
-- `uv run serve-mudahmy`
-- `uv run serve-carlist`
-- `uv run serve-mobil123`
-- `uv run serve-carmudi`
+## Requirements
 
-## Goonet catalog specification scraper
+- Python `>=3.10`
+- [`uv`](https://docs.astral.sh/uv/)
+- PostgreSQL server
+- PostgreSQL `psql` client on `PATH`
+- Browser/runtime dependencies required by Botasaurus
+- X11 display or Xvfb for browser scrapers
+- Network access to target websites
+- Optional proxy access
 
-Scraper catalog Goonet (`scrape-goonet-catalog` / `python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper`) terpisah dari scraper listing Goonet lama (`scrape-goonet` / `scrap_goonet_cars_botasaurus`). Catalog mengambil data spesifikasi dari `https://www.goo-net-exchange.com/catalog/`, bukan listing `/usedcars/`. Command di bawah mengasumsikan virtualenv aktif; jika tidak, prefix dengan `uv run`.
+Optional operational tools: `cron`, `flock`, `lsof`, and `systemd`.
 
-Migrasi schema:
+## Installation
 
 ```bash
-python -m cars_scrap_common.migrate_sql
-```
-
-Dry-run parser (tidak menulis ke DB):
-
-```bash
-python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-makes --dry-run --max-makes 5
-python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --detail-url https://www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/10163593/ --dry-run
-```
-
-Limited sync untuk cek DB write kecil:
-
-```bash
-python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-all --max-makes 1 --max-models 1 --max-specs 2
-```
-
-Full sync:
-
-```bash
-python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-all
-# Continue after the latest saved checkpoint (or use --resume-run-id ID):
-python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --resume
-```
-
-Jalankan full sync berkala setiap 2 bulan. Contoh cron:
-
-```cron
-0 2 1 */2 * flock -n /tmp/cars_scrap_goonet_catalog.lock bash -c 'cd /path/to/cars_scrap && python -m scrap_goonet_catalog_botasaurus.run_catalog_scraper --sync-all' >> /path/to/cars_scrap/logs/cron_goonet_catalog.log 2>&1
-```
-
-Contoh systemd timer:
-
-```ini
-[Timer]
-OnCalendar=*-01/2-01 02:00:00
-Persistent=true
-```
-
-## Setup lokal
-
-### 1. Clone dan siapkan env
-
-```bash
+git clone <internal-repository-url>
+cd cars_scrap
 cp .env.example .env
-```
-
-Lalu isi minimal:
-
-- `DB_NAME`
-- `DB_USER`
-- `DB_PASSWORD`
-- opsional `MUDAHMY_CARS_LISTING_URL`
-- opsional `CARLIST_CARS_LISTING_URL`
-- opsional `MOBIL123_CARS_LISTING_URL`
-- opsional `CARMUDI_CARS_LISTING_URL`
-
-### 2. Install dependency
-
-```bash
-uv venv
 uv sync
 ```
 
-Kalau ingin menjalankan command lewat virtualenv aktif:
+Optional virtual environment activation:
 
 ```bash
 source .venv/bin/activate
 ```
 
-## Setup PostgreSQL
+Configure `.env` before running migrations or scrapers. Most entrypoints load `.env` with override enabled, so repository `.env` values can replace exported process variables.
 
-Project ini menyimpan data ke 12 tabel:
+## Database setup
 
-- `cars_scrap_mudahmy`
-- `cars_scrap_mudahmy_details`
-- `price_history_scrap_mudahmy`
-- `cars_scrap_carlistmy`
-- `cars_scrap_carlistmy_details`
-- `price_history_scrap_carlistmy`
-- `cars_scrap_mobil123`
-- `cars_scrap_mobil123_details`
-- `price_history_scrap_mobil123`
-- `cars_scrap_carmudi`
-- `cars_scrap_carmudi_details`
-- `price_history_scrap_carmudi`
+Create PostgreSQL database and user through internal infrastructure, then configure at least:
 
-File SQL yang tersedia:
-
-- `sql/cars_scrap_mudahmy.sql`
-- `sql/cars_scrap_mudahmy_details.sql`
-- `sql/price_history_scrap_mudahmy.sql`
-- `sql/cars_scrap_carlist.sql`
-- `sql/cars_scrap_carlistmy_details.sql`
-- `sql/price_history_scrap_carlist.sql`
-- `sql/cars_scrap_mobil123.sql`
-- `sql/cars_scrap_mobil123_details.sql`
-- `sql/price_history_scrap_mobil123.sql`
-- `sql/cars_scrap_carmudi.sql`
-- `sql/cars_scrap_carmudi_details.sql`
-- `sql/price_history_scrap_carmudi.sql`
-
-Contoh bootstrap schema:
-
-```bash
-./scripts/migrate_sql.sh
+```env
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=cars_scrap
+DB_USER=
+DB_PASSWORD=
+DB_BATCH_SIZE=100
 ```
 
-Jika package sudah terinstall sebagai command project, bisa juga menjalankan:
+Inspect migration order without changing database:
 
 ```bash
-migrate-sql
+uv run migrate-sql --dry-run
 ```
 
-Catatan:
+Apply every SQL file under `sql/`:
 
-- file SQL bersifat idempotent karena memakai `CREATE TABLE IF NOT EXISTS` dan `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
-- `scripts/migrate_sql.sh` otomatis menjalankan semua file `sql/*.sql`; jika ada source baru, cukup tambah file SQL dengan pola nama yang sama
-- urutan migrasi otomatis: tabel utama `cars_scrap_*`, tabel details `cars_scrap_*_details`, lalu price history `price_history_scrap_*`
-- cek urutan tanpa menyentuh DB dengan `./scripts/migrate_sql.sh --dry-run`
-- tabel `price_history_*` memakai trigger untuk mencatat perubahan `price`
-- tabel `*_details` menyimpan field ekstra dari halaman detail
+```bash
+uv run migrate-sql
+```
 
-## Konfigurasi environment
+Migration notes:
 
-Berikut variabel penting dari `.env.example`.
+- `psql` must exist on `PATH`.
+- Migration requires `DB_NAME` and `DB_USER`; source-specific database names do not replace `DB_NAME` here.
+- SQL files run sequentially as separate `psql` processes. Failure does not globally roll back files already applied.
+- New `sql/*.sql` files are discovered automatically.
+- `scripts/migrate_sql.sh` uses system `python3`; prefer `uv run migrate-sql` unless system Python has project dependencies.
 
-### Listing URL
+Database currently includes seven main listing tables, seven detail tables, seven price-history tables, Goonet maker/model/grade tables, Goonet catalog/run tables, and Mudah make/model worker tables.
 
-- `MUDAHMY_CARS_LISTING_URL`: default URL listing mudah.my, bisa dioverride lewat `--start-url` atau body HTTP request
-- `CARLIST_CARS_LISTING_URL`: default URL listing carlist.my, bisa dioverride lewat `--start-url` atau body HTTP request
-- `MOBIL123_CARS_LISTING_URL`: default URL listing mobil123.com, bisa dioverride lewat `--start-url` atau body HTTP request
-- `CARMUDI_CARS_LISTING_URL`: default URL listing carmudi.co.id, bisa dioverride lewat `--start-url` atau body HTTP request
+## Configuration
 
-### Database
+### Listing URLs
 
-- `DB_HOST`
-- `DB_PORT`
-- `DB_NAME`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_BATCH_SIZE`: ukuran batch upsert ke Postgres
+```env
+MUDAHMY_CARS_LISTING_URL=
+CARLIST_CARS_LISTING_URL=
+MOBIL123_CARS_LISTING_URL=
+CARMUDI_CARS_LISTING_URL=
+CARSOMEID_CARS_LISTING_URL=
+OLX_CARS_LISTING_URL=
+GOONET_CARS_LISTING_URL=
+```
 
-Catatan kompatibilitas:
+URLs can usually be overridden with `--start-url` or HTTP `start_url`. Mudah and Carlist require either configured URL or explicit `--start-url`.
 
-- scraper mudah.my juga menerima fallback `DB_NAME_MUDAH_CARS`
-- scraper carlist juga menerima fallback `DB_NAME_CARLIST_CARS`
-- scraper mobil123.com juga menerima fallback `DB_NAME_MOBIL123_CARS`
-- scraper carmudi.co.id juga menerima fallback `DB_NAME_CARMUDI_CARS`
+### Source-specific database names
 
-### Logging dan Flask
+Scrapers support these fallback names where configured:
 
-- `LOG_LEVEL`
-- `HOST` untuk Flask bind address
-- `PORT` untuk Flask port
-- `FLASK_DEBUG`
+```env
+DB_NAME_MUDAH_CARS=
+DB_NAME_CARLIST_CARS=
+DB_NAME_MOBIL123_CARS=
+DB_NAME_CARMUDI_CARS=
+DB_NAME_CARSOMEID_CARS=
+DB_NAME_OLX_CARS=
+DB_NAME_GOONET_CARS=
+```
 
-Default port:
+### Botasaurus
 
-- `serve-mudahmy` -> `5201`
-- `serve-carlist` -> `5202`
-- `serve-mobil123` -> `5203`
-- `serve-carmudi` -> `5204`
+Important variables:
 
-### Botasaurus runtime
+```env
+BOTASAURUS_PROFILE=
+BOTASAURUS_TINY_PROFILE=true
+BOTASAURUS_BYPASS_CLOUDFLARE=true
+BOTASAURUS_HUMAN_MODE=true
+BOTASAURUS_CLOSE_ON_CRASH=true
+BOTASAURUS_PROMPT_ON_CLOUDFLARE=false
+BOTASAURUS_SAVE_HTML_ON_EMPTY=false
+BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY=false
+BOTASAURUS_LISTING_WAIT_SECONDS=8
+BOTASAURUS_DETAIL_WAIT_SECONDS=12
+BOTASAURUS_POLL_INTERVAL_SECONDS=0.25
+```
 
-- `BOTASAURUS_PROFILE`
-- `BOTASAURUS_TINY_PROFILE`
-- `BOTASAURUS_BYPASS_CLOUDFLARE`
-- `BOTASAURUS_HUMAN_MODE`
-- `BOTASAURUS_CLOSE_ON_CRASH`
-- `BOTASAURUS_PROMPT_ON_CLOUDFLARE`
-- `BOTASAURUS_SAVE_HTML_ON_EMPTY`
-- `BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY`
-- `BOTASAURUS_LISTING_WAIT_SECONDS`
-- `BOTASAURUS_DETAIL_WAIT_SECONDS`
-- `BOTASAURUS_POLL_INTERVAL_SECONDS`
+Browser jobs use `headless=False`. On displayless Linux servers, enable:
 
-Catatan operasional:
+```env
+BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY=true
+```
 
-- default scraper berjalan `headful`, ini biasanya lebih stabil untuk halaman yang punya challenge/anti-bot
-- untuk server tanpa display, set `BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY=true`
-- profile browser disimpan di bawah `profiles/`
+Browser profiles and proxy rotation state are stored under `profiles/`. Concurrent jobs must use different profile names.
 
 ### Proxy
 
-- `PROXY_ENABLED`
-- `PROXY_SERVER`
-- `PROXY_SERVERS`
-- `PROXY_SERVER_ID`
-- `PROXY_SERVER_MY`
-- `PROXY_POOL_<SERVICE>`
-- `PROXY_SCHEME`
-- `PROXY_SCHEME_<POOL>`
-- `PROXY_USERNAME`
-- `PROXY_PASSWORD`
-- `PROXY_STATE_FILE`
-- `PROXY_STATE_FILE_<POOL>`
-- `PROXY_CHECK_IP`
-- `PROXY_CHECK_URL`
-
-Catatan:
-
-- `PROXY_SERVERS` bisa berisi daftar proxy dipisah koma
-- format yang didukung: URL penuh, `HOST:PORT`, atau `HOST:PORT:USER:PASS`
-- proxy pool per service bisa memakai `PROXY_SERVER_<POOL>` atau `PROXY_SERVERS_<POOL>`, misalnya `PROXY_SERVER_ID` dan `PROXY_SERVER_MY`
-- default pool: `mudahmy` dan `carlist` memakai `MY`; source lain memakai `ID`
-- override pool per source dengan `PROXY_POOL_<SERVICE>`, misalnya `PROXY_POOL_OLX=ID` atau `PROXY_POOL_CARLIST=MY`
-- `PROXY_POOL_*` menerima `IND` sebagai alias untuk `ID`
-- jika pool-specific proxy kosong, scraper fallback ke `PROXY_SERVER` atau `PROXY_SERVERS`
-- jika lebih dari satu proxy diberikan, repo ini melakukan rotasi round-robin dan menyimpan state di `profiles/proxy_state.json`; pool-specific proxy memakai state terpisah seperti `profiles/proxy_state_id.json` dan `profiles/proxy_state_my.json`
-
-Contoh proxy pool:
+Supported variables:
 
 ```env
-PROXY_ENABLED=true
+PROXY_ENABLED=false
+PROXY_SERVER=
+PROXY_SERVERS=
+PROXY_SERVER_ID=
+PROXY_SERVERS_ID=
+PROXY_SERVER_MY=
+PROXY_SERVERS_MY=
+PROXY_SERVER_JP=
+PROXY_SERVERS_JP=
 PROXY_SCHEME=http
-PROXY_CHECK_IP=true
-
-PROXY_SERVER_ID=ip:port:user:pass,ip:port:user:pass
-PROXY_SERVER_MY=ip:port:user:pass,ip:port:user:pass
-
+PROXY_SCHEME_ID=http
+PROXY_SCHEME_MY=http
+PROXY_SCHEME_JP=http
 PROXY_POOL_MUDAHMY=MY
 PROXY_POOL_CARLIST=MY
-PROXY_POOL_OLX=ID
 PROXY_POOL_MOBIL123=ID
 PROXY_POOL_CARMUDI=ID
 PROXY_POOL_CARSOMEID=ID
+PROXY_POOL_OLX=ID
+PROXY_POOL_GOONET=JP
+PROXY_CHECK_IP=false
+PROXY_CHECK_URL=
 ```
 
-### Cloudflare fallback khusus carlist, mobil123, dan carmudi
+Accepted proxy formats:
 
-- `CARLIST_AUTO_ATTEMPT_CLOUDFLARE`
-- `CARLIST_CLOUDFLARE_MAX_ATTEMPTS`
-- `CARLIST_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
-- `MOBIL123_AUTO_ATTEMPT_CLOUDFLARE`
-- `MOBIL123_CLOUDFLARE_MAX_ATTEMPTS`
-- `MOBIL123_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
-- `CARMUDI_AUTO_ATTEMPT_CLOUDFLARE`
-- `CARMUDI_CLOUDFLARE_MAX_ATTEMPTS`
-- `CARMUDI_CLOUDFLARE_POST_SOLVE_WAIT_SECONDS`
-
-### Retry dan proteksi tambahan khusus carlist, mobil123, dan carmudi
-
-- `CARLIST_STICKY_BROWSER_RETRIES`: retry di browser session yang sama sebelum ganti proxy/profile
-- `CARLIST_STICKY_BROWSER_RETRY_WAIT_SECONDS`
-- `CARLIST_HTTP_400_RETRY_ENABLED`
-- `CARLIST_HTTP_400_MAX_RETRIES`: retry dengan session/profile baru setelah sticky retry habis
-- `CARLIST_RUN_MAX_ATTEMPTS`: retry satu batch detail dengan profile baru jika banyak URL gagal
-- `CARLIST_RUN_RETRY_WAIT_SECONDS`
-- `CARLIST_DETAIL_CIRCUIT_BREAKER_ENABLED`
-- `CARLIST_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
-- `CARLIST_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
-- `CARLIST_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
-- `MOBIL123_STICKY_BROWSER_RETRIES`
-- `MOBIL123_STICKY_BROWSER_RETRY_WAIT_SECONDS`
-- `MOBIL123_HTTP_400_RETRY_ENABLED`
-- `MOBIL123_HTTP_400_MAX_RETRIES`
-- `MOBIL123_RUN_MAX_ATTEMPTS`
-- `MOBIL123_RUN_RETRY_WAIT_SECONDS`
-- `MOBIL123_DETAIL_CIRCUIT_BREAKER_ENABLED`
-- `MOBIL123_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
-- `MOBIL123_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
-- `MOBIL123_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
-- `CARMUDI_STICKY_BROWSER_RETRIES`
-- `CARMUDI_STICKY_BROWSER_RETRY_WAIT_SECONDS`
-- `CARMUDI_HTTP_400_RETRY_ENABLED`
-- `CARMUDI_HTTP_400_MAX_RETRIES`
-- `CARMUDI_RUN_MAX_ATTEMPTS`
-- `CARMUDI_RUN_RETRY_WAIT_SECONDS`
-- `CARMUDI_DETAIL_CIRCUIT_BREAKER_ENABLED`
-- `CARMUDI_DETAIL_CIRCUIT_BREAKER_MIN_SAMPLES`
-- `CARMUDI_DETAIL_CIRCUIT_BREAKER_ERROR_RATE`
-- `CARMUDI_DETAIL_CIRCUIT_BREAKER_CONSECUTIVE_ERRORS`
-
-Catatan:
-
-- default `CARLIST_RUN_MAX_ATTEMPTS`, `MOBIL123_RUN_MAX_ATTEMPTS`, dan `CARMUDI_RUN_MAX_ATTEMPTS` sekarang `2`
-- saat halaman listing carlist, mobil123, atau carmudi kosong/terlihat seperti soft-block, scraper akan menyimpan artefak debug ke `botasaurus_test/output/*_debug/`
-
-### Cleanup profile Botasaurus per job
-
-Jika profile base seperti `carlist_scrape`, `carlist_track`, `mudahmy_scrape`, atau `mudahmy_track` terlalu lama dipakai, cookie bisa menumpuk dan memicu error seperti `400 Request Header Or Cookie Too Large`.
-
-Script cleanup yang tersedia:
-
-```bash
-./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape --dry-run
-./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape
+```text
+scheme://user:password@host:port
+host:port
+host:port:user:password
 ```
 
-Catatan:
+Comma-separated pools rotate round-robin. Default pools are MY for Mudah and Carlist, JP for Goonet, and ID for other services. Pool-specific settings fall back to global proxy settings.
 
-- walau nama file script masih `cleanup_carlist_profiles.sh`, sekarang script ini bisa dipakai untuk prefix profile apa pun
-- script akan menghapus semua direktori profile dengan prefix yang sama, misalnya `carlist_scrape*` atau `mudahmy_track*`
-- jika profile sedang dipakai proses aktif, script akan skip kecuali dipanggil dengan `--force`
-- fallback prefix tetap bisa diambil dari `PROFILE_CLEANUP_PREFIX`, `CARLIST_PROFILE_CLEANUP_PREFIX`, atau `BOTASAURUS_PROFILE`
+### HTTP wrappers
 
-Rekomendasi profile per job:
-
-- `mudahmy_scrape`
-- `mudahmy_track`
-- `carlist_scrape`
-- `carlist_track`
-- `mobil123_scrape`
-- `mobil123_track`
-- `carmudi_scrape`
-- `carmudi_track`
-
-Contoh cron dengan profile terpisah per job:
-
-```cron
-*/15 * * * * flock -n /tmp/cars_scrap_mudahmy_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && uv run scrape-mudahmy --details --profile mudahmy_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy.log 2>&1
-*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && DB_BATCH_SIZE=1 uv run scrape-mudahmy --track-older-than 2m --track-last-scraped-older-than 1d --track-limit 15 --profile mudahmy_track' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_track.log 2>&1
-*/15 * * * * flock -n /tmp/cars_scrap_carlist_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && uv run scrape-carlist --details --profile carlist_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist.log 2>&1
-*/5 * * * * flock -n /tmp/cars_scrap_carlist_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && DB_BATCH_SIZE=1 uv run scrape-carlist --track-older-than 3m --track-last-scraped-older-than 1d --track-limit 15 --profile carlist_track' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist_track.log 2>&1
+```env
+HOST=0.0.0.0
+PORT=
+FLASK_DEBUG=false
+LOG_LEVEL=INFO
 ```
 
-Contoh cron cleanup per job tiap 1 menit:
+Each service has its own default port. Setting global `PORT` overrides it for launched process.
 
-```cron
-* * * * * flock -n /tmp/cars_scrap_mudahmy_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix mudahmy_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_scrape_cleanup.log 2>&1
-* * * * * flock -n /tmp/cars_scrap_mudahmy_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix mudahmy_track' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_track_cleanup.log 2>&1
-* * * * * flock -n /tmp/cars_scrap_carlist_scrape.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist_scrape_cleanup.log 2>&1
-* * * * * flock -n /tmp/cars_scrap_carlist_track.lock bash -c 'cd /home/ifcon/ff/cars_scrap && ./scripts/cleanup_carlist_profiles.sh --prefix carlist_track' >> /home/ifcon/ff/cars_scrap/logs/cron_carlist_track_cleanup.log 2>&1
+Retry, Cloudflare, timing, and circuit-breaker controls are source-prefixed, including `CARLIST_*`, `MOBIL123_*`, `CARMUDI_*`, `MUDAHMY_*`, `CARSOMEID_*`, `OLX_*`, `GOONET_*`, and `GOONET_CATALOG_*`. See `.env.example` and source defaults before tuning production jobs.
+
+## CLI entrypoints
+
+```text
+scrape-mudahmy
+scrape-mudahmy-models
+scrape-carlist
+scrape-mobil123
+scrape-carmudi
+scrape-carsomeid
+scrape-olx
+scrape-goonet
+scrape-goonet-catalog
+migrate-sql
+serve-mudahmy
+serve-carlist
+serve-mobil123
+serve-carmudi
+serve-carsomeid
+serve-olx
+serve-goonet
 ```
 
-## Menjalankan scraper via CLI
+Use `uv run <command> --help` for current command-specific options.
 
-### A. Ambil listing links saja
+## Listing and detail scraping
 
-Mode ini hanya mengembalikan daftar `listing_url`, belum menyimpan detail ke Postgres.
+Discover listing links only:
 
 ```bash
 uv run scrape-mudahmy --max-pages 1
 uv run scrape-carlist --max-pages 1
 uv run scrape-mobil123 --max-pages 1
 uv run scrape-carmudi --max-pages 1
+uv run scrape-carsomeid --max-pages 1
+uv run scrape-olx --max-pages 1
+uv run scrape-goonet --max-pages 1
 ```
 
-Override halaman awal:
-
-```bash
-uv run scrape-mudahmy --start-url "https://www.mudah.my/malaysia/cars-for-sale"
-uv run scrape-carlist --start-url "https://www.carlist.my/cars-for-sale/malaysia"
-uv run scrape-mobil123 --start-url "https://www.mobil123.com/mobil-bekas-dijual/indonesia?sort=modification_date_search.desc"
-uv run scrape-carmudi --start-url "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia?sort=modification_date_search.desc"
-```
-
-### B. Ambil detail dan simpan ke Postgres
-
-Mode ini:
-
-- scrape halaman listing
-- buka halaman detail per listing
-- `upsert` ke tabel utama
-- `upsert` data ekstra ke tabel detail
-- menandai listing `sold` bila terdeteksi
+Fetch details and write to PostgreSQL:
 
 ```bash
 uv run scrape-mudahmy --max-pages 1 --details
 uv run scrape-carlist --max-pages 1 --details
 uv run scrape-mobil123 --max-pages 1 --details
 uv run scrape-carmudi --max-pages 1 --details
+uv run scrape-carsomeid --max-pages 1 --details
+uv run scrape-olx --max-pages 1 --details
+uv run scrape-goonet --max-pages 1 --details
 ```
 
-Output CLI berupa JSON ringkasan seperti:
+Override listing URL and isolate browser profile:
 
-- `count`
-- `scraped`
-- `upserted`
-- `skipped`
-- `errors`
-- `sold_detected`
-- `skip_reasons`
-- `stored_to_db`
+```bash
+uv run scrape-carlist \
+  --start-url "https://www.carlist.my/cars-for-sale/malaysia" \
+  --profile carlist_manual \
+  --max-pages 1 \
+  --details
+```
 
-Catatan:
+Carsome can traverse all pages up to its configured safety cap:
 
-- pada mode detail, scraper memakai validasi tambahan agar data yang masuk lebih konsisten
-- untuk `mudah.my`, opsi `--print-links` tersedia bila ingin menampilkan daftar link yang dikumpulkan
+```bash
+uv run scrape-carsomeid --all-pages --details
+```
 
-### C. Scrape model Mudah.my yang belum ada
+Debug one detail URL:
 
-Worker model memakai master brand/model Mudah dan queue PostgreSQL. Worker berbeda mengklaim model berbeda dengan lease, membaca seluruh pagination model, lalu memakai scraper detail Mudah existing. Listing tetap di-upsert ke `cars_scrap_mudahmy`, detail ke `cars_scrap_mudahmy_details`, dan perubahan harga tetap dicatat oleh trigger `price_history_scrap_mudahmy`.
+```bash
+uv run scrape-mudahmy --debug-detail-url "<detail-url>"
+uv run scrape-carlist --debug-detail-url "<detail-url>"
+uv run scrape-mobil123 --debug-detail-url "<detail-url>"
+uv run scrape-carmudi --debug-detail-url "<detail-url>"
+uv run scrape-carsomeid --debug-detail-url "<detail-url>"
+uv run scrape-olx --debug-detail-url "<detail-url>"
+uv run scrape-goonet --debug-detail-url "<detail-url>"
+```
 
-Setup awal setelah deploy:
+## Tracking stale listings
+
+Tracking is available for Mudah, Carlist, Mobil123, Carmudi, and Goonet. It selects active records, prioritizing oldest `last_scraped_at`, then oldest advertisement date.
+
+```bash
+uv run scrape-mudahmy --track-older-than 1w
+uv run scrape-carlist --track-older-than 1w
+uv run scrape-mobil123 --track-older-than 1w
+uv run scrape-carmudi --track-older-than 1w
+uv run scrape-goonet --track-older-than 1w
+```
+
+Preview or count without scraping:
+
+```bash
+uv run scrape-carlist --track-older-than 3m --track-dry-run
+uv run scrape-carlist --track-older-than 3m --track-count
+```
+
+Limit work and exclude recently scraped records:
+
+```bash
+uv run scrape-carlist \
+  --track-older-than 3m \
+  --track-last-scraped-older-than 1d \
+  --track-limit 15
+```
+
+Duration units: `d` days, `w` weeks, `m` months, `y` years. Tracking cannot be combined with listing/detail/debug modes.
+
+## Mudah model worker
+
+Initial setup:
 
 ```bash
 uv run migrate-sql
@@ -479,7 +329,14 @@ uv run scrape-mudahmy-models --sync-master-data
 uv run scrape-mudahmy-models --bootstrap-existing
 ```
 
-Menjalankan satu worker untuk satu model:
+Inspect queue status:
+
+```bash
+uv run scrape-mudahmy-models --status
+uv run scrape-mudahmy-models --status --status-filter pending --status-limit 100 --json
+```
+
+Claim and process one model:
 
 ```bash
 BOTASAURUS_PROFILE=mudahmy_models_worker_1 \
@@ -492,182 +349,73 @@ uv run scrape-mudahmy-models \
   --details
 ```
 
-`--max-pages 0` memproses seluruh halaman. Model tanpa listing tetap ditandai `success` dengan `last_listing_scrape_count = 0`.
+`--max-pages 0` processes all available pages. Multiple workers require unique `--worker-id` and `BOTASAURUS_PROFILE` values. PostgreSQL lease claims prevent workers from processing same model concurrently.
 
-Cek ringkasan dan daftar status:
-
-```bash
-uv run scrape-mudahmy-models --status
-uv run scrape-mudahmy-models --status --status-filter pending --status-limit 100
-uv run scrape-mudahmy-models --status --status-filter running
-uv run scrape-mudahmy-models --status --status-filter success
-uv run scrape-mudahmy-models --status --status-filter error
-uv run scrape-mudahmy-models --status --status-filter bootstrap_existing
-```
-
-Output status default berupa tabel terminal. Gunakan `--json` bila output akan diproses script:
+## Goonet listing and master data
 
 ```bash
-uv run scrape-mudahmy-models --status --status-filter pending --status-limit 100 --json
+uv run scrape-goonet --sync-master-data
+uv run scrape-goonet --sync-missing-master-grades
+uv run scrape-goonet --listing --maker TOYOTA --model ALLION --max-pages 1
+uv run scrape-goonet --listing-batch --batch-limit 5 --listing-older-than 60d
+uv run scrape-goonet --listing-batch --batch-limit 5 --details
 ```
 
-Arti status:
+## Goonet catalog
 
-- `pending`: model belum ditemukan di listing existing dan belum diperiksa worker
-- `bootstrap_existing`: brand/model sudah ditemukan di `cars_scrap_mudahmy`
-- `running`: model sedang diproses worker
-- `success`: seluruh halaman selesai; count dapat `0` bila tidak ada listing
-- `error`: proses gagal dan dapat diklaim ulang setelah lease habis
-
-Contoh tiga worker setiap lima menit:
-
-```cron
-*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_model_worker_1.lock bash -c 'cd /home/ifcon/ff/cars_scrap && BOTASAURUS_PROFILE=mudahmy_models_worker_1 uv run scrape-mudahmy-models --claim-model --worker-id worker-1 --lease-minutes 360 --max-pages 0 --page-retries 3 --details' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_worker_1.log 2>&1
-*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_model_worker_2.lock bash -c 'cd /home/ifcon/ff/cars_scrap && BOTASAURUS_PROFILE=mudahmy_models_worker_2 uv run scrape-mudahmy-models --claim-model --worker-id worker-2 --lease-minutes 360 --max-pages 0 --page-retries 3 --details' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_worker_2.log 2>&1
-*/5 * * * * flock -n /tmp/cars_scrap_mudahmy_model_worker_3.lock bash -c 'cd /home/ifcon/ff/cars_scrap && BOTASAURUS_PROFILE=mudahmy_models_worker_3 uv run scrape-mudahmy-models --claim-model --worker-id worker-3 --lease-minutes 360 --max-pages 0 --page-retries 3 --details' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_worker_3.log 2>&1
-```
-
-Sinkronisasi katalog mingguan, Minggu pukul 02:10:
-
-```cron
-10 2 * * 0 flock -n /tmp/cars_scrap_mudahmy_model_sync.lock bash -c 'cd /home/ifcon/ff/cars_scrap && uv run scrape-mudahmy-models --sync-master-data && uv run scrape-mudahmy-models --bootstrap-existing' >> /home/ifcon/ff/cars_scrap/logs/cron_mudahmy_model_sync.log 2>&1
-```
-
-Gunakan lock dan `BOTASAURUS_PROFILE` berbeda dari scraper Mudah reguler. Duplikat listing dicegah oleh constraint unik `listing_id` dan `ON CONFLICT DO UPDATE`.
-
-### D. Re-scrape data lama dari DB (tracking mode)
-
-Tracking mode membaca listing `active` dari DB, lalu scrape ulang detail listing berdasarkan cutoff umur iklan.
-Urutan proses memprioritaskan `last_scraped_at` yang paling lama, lalu `information_ads_date` yang paling lama sebagai tie-breaker.
-
-Contoh dasar:
+Parser dry-runs do not write to database:
 
 ```bash
-uv run scrape-mudahmy --track-older-than 1w
-uv run scrape-carlist --track-older-than 1w
-uv run scrape-mobil123 --track-older-than 1w
-uv run scrape-carmudi --track-older-than 1w
+uv run scrape-goonet-catalog --sync-makes --dry-run --max-makes 5
+uv run scrape-goonet-catalog --make-url "<catalog-make-url>" --dry-run --max-models 5
+uv run scrape-goonet-catalog --model-url "<catalog-model-url>" --dry-run --max-specs 5
+uv run scrape-goonet-catalog --detail-url "<catalog-detail-url>" --dry-run
 ```
 
-Contoh dengan filter `last_scraped_at` supaya listing yang baru diproses tidak terkena lagi:
+Synchronize catalog:
 
 ```bash
-uv run scrape-mudahmy --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
-uv run scrape-carlist --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
-uv run scrape-mobil123 --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
-uv run scrape-carmudi --track-older-than 3m --track-last-scraped-older-than 90d --track-limit 200
+uv run scrape-goonet-catalog --sync-all
+uv run scrape-goonet-catalog --resume
+uv run scrape-goonet-catalog --resume-run-id <run-id>
+uv run scrape-goonet-catalog --sync-spec-details
 ```
 
-Mode hitung saja:
+Current limitation: standalone `--sync-models`, standalone `--sync-spec-links`, and non-dry-run URL modes return `not_implemented`.
 
-```bash
-uv run scrape-mudahmy --track-older-than 1w --track-count
-uv run scrape-carlist --track-older-than 1w --track-count
-uv run scrape-mobil123 --track-older-than 1w --track-count
-uv run scrape-carmudi --track-older-than 1w --track-count
-```
+## HTTP services
 
-Mode preview tanpa scrape:
-
-```bash
-uv run scrape-mudahmy --track-older-than 1w --track-dry-run
-uv run scrape-carlist --track-older-than 1w --track-dry-run
-uv run scrape-mobil123 --track-older-than 1w --track-dry-run
-uv run scrape-carmudi --track-older-than 1w --track-dry-run
-```
-
-Format durasi yang didukung:
-
-- `d` = hari, contoh `7d`
-- `w` = minggu, contoh `1w`
-- `m` = bulan, contoh `3m`
-- `y` = tahun, contoh `1y`
-
-Batasan tracking mode:
-
-- tidak bisa digabung dengan `--details`
-- tidak bisa digabung dengan `--start-url`
-- tidak bisa digabung dengan `--debug-detail-url`
-- tracking selalu bekerja dari data yang sudah ada di DB
-
-### E. Debug satu detail URL
-
-Berguna untuk validasi parser satu halaman detail. Command ini:
-
-- scrape satu URL
-- coba simpan ke DB
-- cetak hasil scrape dan row DB sebagai JSON
-
-```bash
-uv run scrape-mudahmy --debug-detail-url "https://www.mudah.my/view?ad_id=..."
-uv run scrape-carlist --debug-detail-url "https://www.carlist.my/used-cars/..."
-uv run scrape-mobil123 --debug-detail-url "https://www.mobil123.com/..."
-uv run scrape-carmudi --debug-detail-url "https://www.carmudi.co.id/..."
-```
-
-## Menjalankan HTTP service
-
-Service Flask tersedia untuk masing-masing source.
-
-### Mudah.my service
-
-Jalankan:
+Start one service:
 
 ```bash
 uv run serve-mudahmy
-```
-
-Default:
-
-- host `0.0.0.0`
-- port `5201`
-
-Endpoint:
-
-- `GET /health`
-- `POST /scrape/mudahmy-cars`
-- `POST /scrape/mudahmy-cars-details`
-
-Contoh request:
-
-```bash
-curl http://localhost:5201/health
-
-curl -X POST http://localhost:5201/scrape/mudahmy-cars \
-  -H "Content-Type: application/json" \
-  -d '{"max_pages": 1}'
-
-curl -X POST http://localhost:5201/scrape/mudahmy-cars-details \
-  -H "Content-Type: application/json" \
-  -d '{"max_pages": 1}'
-```
-
-Field body yang didukung:
-
-- `start_url`
-- `max_pages`
-- `links` untuk endpoint detail jika ingin bypass scrape listing
-
-### Carlist service
-
-Jalankan:
-
-```bash
 uv run serve-carlist
+uv run serve-mobil123
+uv run serve-carmudi
+uv run serve-olx
+uv run serve-carsomeid
+uv run serve-goonet
 ```
 
-Default:
+| Service | Port | Source path segment |
+|---|---:|---|
+| Mudah | 5201 | `mudahmy` |
+| Carlist | 5202 | `carlist` |
+| Mobil123 | 5203 | `mobil123` |
+| Carmudi | 5204 | `carmudi` |
+| OLX | 5205 | `olx` |
+| Carsome ID | 5206 | `carsomeid` |
+| Goonet | 5207 | `goonet` |
 
-- host `0.0.0.0`
-- port `5202`
+Common endpoints:
 
-Endpoint:
+```text
+GET  /health
+POST /scrape/<source>-cars
+POST /scrape/<source>-cars-details
+```
 
-- `GET /health`
-- `POST /scrape/carlist-cars`
-- `POST /scrape/carlist-cars-details`
-
-Contoh request:
+Example:
 
 ```bash
 curl http://localhost:5202/health
@@ -678,155 +426,108 @@ curl -X POST http://localhost:5202/scrape/carlist-cars \
 
 curl -X POST http://localhost:5202/scrape/carlist-cars-details \
   -H "Content-Type: application/json" \
-  -d '{"max_pages": 1}'
+  -d '{"max_pages": 1, "links": ["<detail-url>"]}'
 ```
 
-### Mobil123 service
+Carsome requests additionally accept `"all_pages": true`.
 
-Jalankan:
+These wrappers use Flask's built-in development server and execute scraping synchronously. They provide no authentication, job queue, rate limiting, production WSGI server, or request timeout. Keep them on trusted internal networks; do not expose them directly to public internet.
 
-```bash
-uv run serve-mobil123
+## Output behavior
+
+Listing-only CLI output normally contains full discovered links:
+
+```json
+{
+  "count": 1,
+  "links": ["<detail-url>"]
+}
 ```
 
-Default:
+Detail output varies slightly by source and can include `scraped`, `upserted`, `skipped`, `errors`, `sold_marked`, `skip_reasons`, and `stored_to_db` fields.
 
-- host `0.0.0.0`
-- port `5203`
+HTTP listing endpoints return capped `sample` data rather than every URL. Detail endpoints also return capped samples. Treat per-record errors and database counts as authoritative; `stored_to_db` is not a transaction guarantee across every source.
 
-Endpoint:
+## Operations
 
-- `GET /health`
-- `POST /scrape/mobil123-cars`
-- `POST /scrape/mobil123-cars-details`
+Use one browser profile and one lock per concurrent job:
 
-Contoh request:
-
-```bash
-curl http://localhost:5203/health
-
-curl -X POST http://localhost:5203/scrape/mobil123-cars \
-  -H "Content-Type: application/json" \
-  -d '{"max_pages": 1}'
-
-curl -X POST http://localhost:5203/scrape/mobil123-cars-details \
-  -H "Content-Type: application/json" \
-  -d '{"max_pages": 1}'
+```cron
+*/15 * * * * flock -n /tmp/cars_scrap_carlist.lock bash -c 'cd /path/to/cars_scrap && uv run scrape-carlist --details --profile carlist_scrape' >> /path/to/cars_scrap/logs/cron_carlist.log 2>&1
+*/5 * * * * flock -n /tmp/cars_scrap_carlist_track.lock bash -c 'cd /path/to/cars_scrap && DB_BATCH_SIZE=1 uv run scrape-carlist --track-older-than 3m --track-last-scraped-older-than 1d --track-limit 15 --profile carlist_track' >> /path/to/cars_scrap/logs/cron_carlist_track.log 2>&1
 ```
 
-### Carmudi service
-
-Jalankan:
+Inspect profile cleanup first:
 
 ```bash
-uv run serve-carmudi
+./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape --dry-run
 ```
 
-Default:
-
-- host `0.0.0.0`
-- port `5204`
-
-Endpoint:
-
-- `GET /health`
-- `POST /scrape/carmudi-cars`
-- `POST /scrape/carmudi-cars-details`
-
-Contoh request:
+Delete matching inactive profiles:
 
 ```bash
-curl http://localhost:5204/health
-
-curl -X POST http://localhost:5204/scrape/carmudi-cars \
-  -H "Content-Type: application/json" \
-  -d '{"max_pages": 1}'
-
-curl -X POST http://localhost:5204/scrape/carmudi-cars-details \
-  -H "Content-Type: application/json" \
-  -d '{"max_pages": 1}'
+./scripts/cleanup_carlist_profiles.sh --prefix carlist_scrape
 ```
 
-## Migrasi data dari DB lama
+Cleanup recursively deletes matching profile directories. Active-profile detection requires `lsof`; install it before relying on automatic skip behavior.
 
-Repo ini menyediakan dua script migrasi:
+Monitor `logs/`, `error_logs/`, generated debug artifacts, database growth, skipped/error counts, sold detections, and proxy health. Respect target-site policies, traffic limits, and internal legal/compliance requirements.
 
-- `scripts/migrate_mudahmy_db_scrap_new_to_db_cars_scrap.sh`
-- `scripts/migrate_carlistmy_db_scrap_new_to_db_cars_scrap.sh`
+## Checks
 
-Tujuan script:
-
-- migrasi dari DB lama (default `db_scrap_new`)
-- merge data tabel utama + `_archive` ke tabel utama di DB baru
-- migrasi data `price_history`
-- abort bila tabel target sudah berisi data, agar tidak duplikat
-
-Contoh penggunaan:
+Current repository-owned parser check:
 
 ```bash
-./scripts/migrate_mudahmy_db_scrap_new_to_db_cars_scrap.sh
-./scripts/migrate_carlistmy_db_scrap_new_to_db_cars_scrap.sh
+uv run python scripts/check_goonet_catalog_parser.py
 ```
 
-Variabel yang relevan:
+Expected output:
 
-- `OLD_DB`
-- `NEW_DB`
-- `OUT_DIR`
-- `DB_HOST`
-- `DB_PORT`
-- `DB_USER`
-- `DB_PASSWORD`
+```text
+goonet catalog parser checks passed
+```
 
-Catatan:
+No repository-configured lint command, typecheck command, pytest suite, coverage command, or CI workflow currently exists.
 
-- `.env` wajib ada karena script melakukan `source .env`
-- target table harus kosong sebelum migrasi dijalankan
+## Troubleshooting
 
-## Catatan perilaku data
+### Browser fails on server
 
-- kolom `listing_id` bersifat unik dan dipakai untuk `upsert`
-- status listing utama umumnya `active` atau `sold`
-- `last_scraped_at` dipakai untuk mendukung tracking/re-scrape
-- perubahan harga dicatat ke tabel `price_history_*` lewat trigger database
-- detail page disimpan terpisah agar struktur field fleksibel
+Set `BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY=true`, verify Xvfb/browser runtime dependencies, and use unique profile names.
 
-## Masalah umum
+### Empty listing or detail result
 
-### Challenge / anti-bot
+Check listing URL, source HTML changes, proxy health, Botasaurus wait settings, and files under `logs/`, `error_logs/`, or generated debug directories.
 
-Kalau scraping macet karena challenge browser:
+### Cloudflare or anti-bot challenge
 
-- jalankan mode non-headless/default dulu
-- pakai `BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY=true` bila server tidak punya display
-- pertimbangkan pakai proxy
+Use headful/default browser mode, a stable profile, conservative request frequency, source retry controls, and approved proxy pool.
 
-### Hasil scrape kosong
+### Migration fails
 
-Cek:
+Verify `psql`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and database privileges. Run `uv run migrate-sql --dry-run` to inspect file order.
 
-- `MUDAHMY_CARS_LISTING_URL`, `CARLIST_CARS_LISTING_URL`, atau `MOBIL123_CARS_LISTING_URL`
-- timeout Botasaurus (`BOTASAURUS_LISTING_WAIT_SECONDS`, `BOTASAURUS_DETAIL_WAIT_SECONDS`)
-- `logs/` dan `error_logs/`
+### `uv run` fails
 
-### `uv run` bermasalah
+Verify Python `>=3.10`, rerun `uv sync`, and confirm project virtual environment is valid.
 
-Pastikan:
+## Repository layout
 
-- `uv sync` sudah sukses
-- Python version sesuai (`>=3.10`)
-- virtual environment project valid
-
-## Pengembangan cepat
-
-Command yang paling sering dipakai:
-
-```bash
-uv sync
-uv run scrape-mudahmy --max-pages 1 --details
-uv run scrape-carlist --max-pages 1 --details
-uv run scrape-mobil123 --max-pages 1 --details
-uv run serve-mudahmy
-uv run serve-carlist
-uv run serve-mobil123
+```text
+cars_scrap_common/                     Shared browser, proxy, logging, duration, and migration utilities
+scrap_mudahmy_cars_botasaurus/        Mudah listing/detail scraper and Flask service
+scrap_mudahmy_model_worker/            Lease-based Mudah make/model worker
+scrap_carlist_cars_botasaurus/        Carlist scraper and Flask service
+scrap_mobil123_cars_botasaurus/       Mobil123 scraper and Flask service
+scrap_carmudi_cars_botasaurus/        Carmudi scraper and Flask service
+scrap_carsomeid_cars_botasaurus/      Carsome ID scraper and Flask service
+scrap_olx_cars_botasaurus/            OLX scraper and Flask service
+scrap_goonet_cars_botasaurus/         Goonet listing scraper, master data, and Flask service
+scrap_goonet_catalog_botasaurus/      Goonet catalog/specification synchronization
+sql/                                   PostgreSQL schemas, indexes, and price-history triggers
+scripts/                               Migration wrapper, parser check, and profile cleanup
+profiles/                              Runtime browser profiles and proxy state
+logs/                                  Runtime logs
+error_logs/                            Error artifacts
+output/                                Temporary/runtime output
 ```
