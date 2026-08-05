@@ -626,10 +626,9 @@ class CarlistCarsService(SharedBaseService):
                 return
 
     def _extract_numeric_listing_id(self, url: str) -> str | None:
-        match = re.search(r"(?:-|/)(\d{5,})(?:[/?#.]|$)", url)
-        if match:
-            return match.group(1)
-        return None
+        final_segment = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+        match = re.fullmatch(r"\d{5,}", final_segment)
+        return match.group(0) if match else None
 
     def _get_attr_by_xpath_botasaurus(self, driver, xpath: str, attr: str) -> str | None:
         try:
