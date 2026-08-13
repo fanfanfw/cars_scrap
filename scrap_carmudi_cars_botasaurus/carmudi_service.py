@@ -211,7 +211,7 @@ class CarmudiCarsService(SharedBaseService):
         try:
             driver.run_js(
                 """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                 const click = (el) => {
                   if (!el) return false;
                   try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
@@ -752,7 +752,7 @@ class CarmudiCarsService(SharedBaseService):
         try:
             urls = driver.run_js(
                 """
-                const isValid = (url) => /^https?:\/\//i.test(String(url || '').trim());
+                const isValid = (url) => /^https?:\\/\\//i.test(String(url || '').trim());
                 const root = document.evaluate(
                   args.xpath,
                   document,
@@ -810,7 +810,7 @@ class CarmudiCarsService(SharedBaseService):
             return driver.run_js(
                 """
                 const labels = args.labels.map((s) => String(s || '').toLowerCase());
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 const nodes = Array.from(document.querySelectorAll('span, div, li, dt, dd'));
                 const isLabel = (text) => labels.some((label) => text === label || text.includes(label));
                 for (const el of nodes) {
@@ -838,8 +838,8 @@ class CarmudiCarsService(SharedBaseService):
         try:
             return driver.run_js(
                 """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-                const mileageRe = /\b\d[\d.,\s]*(?:-\s*\d[\d.,\s]*k?)?\s*km\b/i;
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                const mileageRe = /\\b\\d[\\d.,\\s]*(?:-\\s*\\d[\\d.,\\s]*k?)?\\s*km\\b/i;
                 const nodes = Array.from(document.querySelectorAll('span.u-text-bold.u-block, span.u-text-bold, .u-text-bold'));
                 for (const el of nodes) {
                   const text = norm(el.textContent || el.innerText);
@@ -855,11 +855,11 @@ class CarmudiCarsService(SharedBaseService):
         try:
             return driver.run_js(
                 """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 const normalizePhone = (value) => {
                   const text = norm(value);
                   if (!text) return null;
-                  const digits = text.replace(/\D+/g, '');
+                  const digits = text.replace(/\\D+/g, '');
                   if (digits.length < 8) return null;
                   return text;
                 };
@@ -885,7 +885,7 @@ class CarmudiCarsService(SharedBaseService):
             return bool(
                 driver.run_js(
                     """
-                    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                     const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
                     const candidates = nodes.map((el) => {
                       const text = norm(el.textContent || el.innerText);
@@ -956,7 +956,7 @@ class CarmudiCarsService(SharedBaseService):
                   null
                 ).singleNodeValue;
                 if (!el) return null;
-                const raw = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                const raw = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
                 return raw || null;
                 """,
                 {"xpath": xpath},
@@ -995,7 +995,7 @@ class CarmudiCarsService(SharedBaseService):
                 ).singleNodeValue;
                 if (!root) return [];
                 return Array.from(root.querySelectorAll('span'))
-                  .map((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())
+                  .map((el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim())
                   .filter(Boolean);
                 """,
                 {"xpath": INFORMATION_ADS_DATE_CONTAINER_XPATH},
@@ -1064,7 +1064,7 @@ class CarmudiCarsService(SharedBaseService):
                   null
                 ).singleNodeValue;
                 if (!root) return [];
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 return Array.from(root.querySelectorAll('span.c-chip, span'))
                   .map((el) => norm(el.innerText || el.textContent))
                   .filter(Boolean);
@@ -1086,7 +1086,7 @@ class CarmudiCarsService(SharedBaseService):
         try:
             rows = driver.run_js(
                 """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 const tab = document.querySelector(args.selector);
                 if (!tab) return [];
                 const out = [];
@@ -1139,13 +1139,13 @@ class CarmudiCarsService(SharedBaseService):
         try:
             items = driver.run_js(
                 """
-                const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 const out = [];
                 const nodes = Array.from(document.querySelectorAll('li, dl, tr, div, span'));
                 for (const el of nodes) {
                   const text = norm(el.innerText || el.textContent);
                   if (!text || text.length > 180) continue;
-                  let m = text.match(/^([^:\n]{2,40})\s*:\s*(.{1,120})$/);
+                  let m = text.match(/^([^:\n]{2,40})\\s*:\\s*(.{1,120})$/);
                   if (m) {
                     out.push({label: m[1], value: m[2]});
                     continue;
@@ -1248,7 +1248,7 @@ class CarmudiCarsService(SharedBaseService):
         try:
             urls = driver.run_js(
                 """
-                const isValid = (url) => /^https?:\/\//i.test(String(url || '').trim());
+                const isValid = (url) => /^https?:\\/\\//i.test(String(url || '').trim());
                 const root = document.evaluate(
                   args.xpath,
                   document,
