@@ -218,6 +218,9 @@ class CarmudiCarsService(SharedBaseService):
                   try { el.click(); return true; } catch (e) { return false; }
                 };
 
+                const consent = document.querySelector('.fc-cta-consent');
+                if (click(consent)) return true;
+
                 const candidates = Array.from(document.querySelectorAll(
                   'button, a, [role="button"], [aria-label], [class*="close"], [class*="Close"], h3, span, div'
                 ));
@@ -226,6 +229,9 @@ class CarmudiCarsService(SharedBaseService):
                   const aria = norm(el.getAttribute('aria-label'));
                   const title = norm(el.getAttribute('title'));
                   const cls = norm(String(el.className || ''));
+                  if (text === 'consent' || text === 'setuju') {
+                    if (click(el)) return true;
+                  }
                   if (
                     text === 'x' || text === '×' || text === 'close' || text === 'tutup' ||
                     aria.includes('close') || aria.includes('tutup') ||
