@@ -29,7 +29,12 @@ def load_botasaurus_config(*, service_name: str) -> BotasaurusRuntimeConfig:
 
     `service_name` is used to pick a default profile name and proxy pool.
     """
-    enable_xvfb = env_bool("BOTASAURUS_ENABLE_XVFB_VIRTUAL_DISPLAY", False)
+    xvfb_sources = {
+        value.strip().lower()
+        for value in os.getenv("BOTASAURUS_XVFB_ENABLED_SOURCES", "").split(",")
+        if value.strip()
+    }
+    enable_xvfb = service_name.lower() in xvfb_sources
     headless = False
 
     profile = (os.getenv("BOTASAURUS_PROFILE") or "").strip() or service_name
