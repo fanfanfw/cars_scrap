@@ -28,6 +28,19 @@ load_dotenv(override=True)
 DEFAULT_LISTING_URL = "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia?sort=modification_date_search.desc"
 WHATSAPP_PHONE_RE = re.compile(r"(?:wa\.me/|phone=|tel:)(\+?\d+)", re.IGNORECASE)
 
+# Exhausted listing-level failure types (AS-CARFAIL-01).
+# Classification is message-text based so it is deterministic offline.
+LISTING_FAILURE_TYPES = ("cloudflare_challenge", "upstream_error", "empty_listing_page")
+
+
+def classify_listing_failure(message: object) -> str:
+    text = str(message or "").lower()
+    if "cloudflare turnstile" in text:
+        return "cloudflare_challenge"
+    if "no_listing_links" in text:
+        return "empty_listing_page"
+    return "upstream_error"
+
 LISTING_ID_META_XPATH = "/html/head/meta[47]"
 CONDITION_META_XPATH = "/html/head/meta[46]"
 BRAND_META_XPATH = "/html/head/meta[57]"
@@ -75,6 +88,7 @@ class CarmudiCarsService(SharedBaseService):
         self.stop_flag = False
         self._logged_proxy_ip = False
         self._logged_listing_id_meta_mismatch = False
+        self._listing_capture_fingerprints: set[str] = set()
         self.listing_url = os.getenv("CARMUDI_CARS_LISTING_URL", DEFAULT_LISTING_URL).strip()
 
     def _carmudi_env_int(self, key: str, default: int, *, minimum: int | None = None) -> int:
@@ -136,8 +150,21 @@ class CarmudiCarsService(SharedBaseService):
         else:
             self.logger.warning("Failed to probe outbound IP via %s.", "proxy" if proxy_url else "direct")
 
+    def _capture_fingerprint_allowed(self, fingerprint: str) -> bool:
+        key = str(fingerprint or "").strip() or "default"
+        if key in self._listing_capture_fingerprints:
+            return False
+        self._listing_capture_fingerprints.add(key)
+        return True
+
     def _save_debug_capture_botasaurus(self, driver, *, slug: str, reason: str, url: str) -> None:
         try:
+            current_url = str(getattr(driver, "current_url", "") or "")
+            fingerprint = sha1(f"{slug}|{reason}|{current_url}".encode("utf-8")).hexdigest()[:16]
+            if not self._capture_fingerprint_allowed(fingerprint):
+                self.logger.info("Skipping duplicate carmudi debug capture (fingerprint=%s).", fingerprint)
+                return
+
             from botasaurus import bt
 
             out_dir = "botasaurus_test/output/carmudi_debug"
@@ -159,7 +186,7 @@ class CarmudiCarsService(SharedBaseService):
                 "captured_at": datetime.now().isoformat(),
                 "reason": reason,
                 "target_url": url,
-                "current_url": str(getattr(driver, "current_url", "") or ""),
+                "current_url": current_url,
                 "title": self._get_page_title_botasaurus(driver),
                 "text_excerpt": self._get_page_text_botasaurus(driver)[:4000],
             }

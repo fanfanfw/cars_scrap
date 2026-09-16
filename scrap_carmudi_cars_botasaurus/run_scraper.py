@@ -8,12 +8,32 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from cars_scrap_common.duration_utils import cutoff_date
-from scrap_carmudi_cars_botasaurus.carmudi_service import CarmudiCarsService
+from scrap_carmudi_cars_botasaurus.carmudi_service import CarmudiCarsService, classify_listing_failure
 
 load_dotenv(override=True)
 
 
-def main() -> None:
+def _fail_listing_stage(failure_type: str) -> int:
+    print(
+        json.dumps(
+            {
+                "run_status": "failed",
+                "failure_stage": "listing",
+                "failure_type": failure_type,
+                "listing_count": 0,
+                "upserted_count": 0,
+                "errors_count": 0,
+                "upserted": [],
+                "errors": [],
+                "stored_to_db": False,
+            },
+            indent=2,
+        )
+    )
+    return 1
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Scrape car listings from carmudi (Botasaurus)")
     parser.add_argument("--start-url", default=None, help="Override listing URL (optional)")
     parser.add_argument(
@@ -208,10 +228,10 @@ def main() -> None:
             }
             if args.track_count_only:
                 print(f"total_data: {len(links)} listing")
-                return
+                return 0
             if args.track_dry_run:
                 print(json.dumps(summary, indent=2, default=str))
-                return
+                return 0
 
             results = scraper.scrape_listing_details_with_run_retries(links, listing_id_by_url=listing_id_by_url)
             metrics = summarize_results(results)
@@ -235,7 +255,7 @@ def main() -> None:
                     default=str,
                 )
             )
-            return
+            return 0
 
         if args.debug_detail_url:
             from scrap_carmudi_cars_botasaurus.database import get_connection
@@ -291,9 +311,14 @@ def main() -> None:
                     default=str,
                 )
             )
-            return
+            return 0
 
-        links = scraper.scrape_all_from_main(start_url=args.start_url, max_pages=args.max_pages)
+        try:
+            links = scraper.scrape_all_from_main(start_url=args.start_url, max_pages=args.max_pages)
+        except Exception as exc:
+            return _fail_listing_stage(classify_listing_failure(exc))
+        if not links:
+            return _fail_listing_stage("empty_listing_page")
         if args.details:
             details = scraper.scrape_listing_details_with_run_retries(
                 links,
@@ -311,7 +336,9 @@ def main() -> None:
             print(json.dumps({"count": len(links), "links": links}, indent=2))
     finally:
         scraper.close()
+    # Success output callers rely on the JSON above; main also returns an int exit code.
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

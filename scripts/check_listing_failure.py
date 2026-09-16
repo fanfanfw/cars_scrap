@@ -1,0 +1,307 @@
+"""Offline deterministic checks for listing failure classification (AS-CARFAIL-01..03).
+
+No network, no real filesystem/DB writes: fake inline/sanitized drivers, patched
+writers. Plain assert-based script following scripts/check_goonet_catalog_parser.py style.
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import sys
+import unittest.mock
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from scrap_carmudi_cars_botasaurus.carmudi_service import (
+    CarmudiCarsService,
+    classify_listing_failure as classify_carmudi_listing_failure,
+)
+from scrap_carlist_cars_botasaurus.carlist_service import (
+    CarlistCarsService,
+    classify_listing_failure as classify_carlist_listing_failure,
+)
+import scrap_carlist_cars_botasaurus.run_scraper as carlist_run
+import scrap_carmudi_cars_botasaurus.run_scraper as carmudi_run
+
+TURNSTILE_SNIPPET = 'iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js"'
+
+
+class _ExceptionOnlyDriver:
+    """run_js always raises -> token checks fall back to page_html (offline)."""
+
+    def run_js(self, *args, **kwargs):  # pragma: no cover - trivial stub
+        raise RuntimeError("offline fixture: no JS runtime")
+
+    page_html = ""
+    current_url = ""
+
+
+class _HrefDriver:
+    def __init__(self, hrefs):
+        self._hrefs = list(hrefs)
+
+    def run_js(self, script, args=None):
+        if "a[href]" in str(script):
+            return self._hrefs
+        raise RuntimeError("offline fixture: only anchors supported")
+
+
+def test_carlist_turnstile_classification():
+    svc = CarlistCarsService()
+    html = (
+        '<html><body><h2>Just a moment...</h2>'
+        f'<{TURNSTILE_SNIPPET}></iframe></body></html>'
+    )
+    driver = _ExceptionOnlyDriver()
+    driver.page_html = html
+    driver.current_url = "https://www.carlist.my/used-cars-for-sale"
+    from cars_scrap_common.botasaurus_utils import is_cloudflare_challenge
+
+    assert is_cloudflare_challenge(driver) is True
+    exc = RuntimeError(
+        "Blocked by Cloudflare Turnstile while scraping carlist. "
+        "target_url='https://www.carlist.my/used-cars-for-sale' current_url='https://www.carlist.my/used-cars-for-sale'. "
+        "Run with BOTASAURUS_PROMPT_ON_CLOUDFLARE=true to solve it manually (headful), "
+        "or switch to a residential proxy / different IP."
+    )
+    assert classify_carlist_listing_failure(exc) == "cloudflare_challenge"
+
+
+def test_carlist_73_byte_upstream_error_classification():
+    svc = CarlistCarsService()
+    message = "ERR_TUNNEL_CONNECTION_FAILED"
+    body = f"<html><body>{message}</body></html>"
+    # pad with a trailing space so the sanitized fixture body is exactly 73 bytes
+    body = body + " " * max(0, 73 - len(body))
+    assert len(body.encode("utf-8")) == 73
+    driver = _ExceptionOnlyDriver()
+    driver.page_html = body
+    assert svc._is_http_error_page_botasaurus(driver) is True
+    exc = RuntimeError(
+        "Retryable error page while scraping carlist listing: "
+        "current_url='https://www.carlist.my/used-cars-for-sale'"
+    )
+    assert classify_carlist_listing_failure(exc) == "upstream_error"
+
+
+def test_carlist_exhausted_empty_listing():
+    exc = RuntimeError(
+        "Retryable soft block page while scraping carlist listing: "
+        "current_url='https://www.carlist.my/used-cars-for-sale' reason='no_listing_links'"
+    )
+    assert classify_carlist_listing_failure(exc) == "empty_listing_page"
+
+
+def test_carmudi_challenge_classification():
+    svc = CarmudiCarsService()
+    html = (
+        '<html><body><h2>Just a moment...</h2><span>Verify you are human</span>'
+        f'<{TURNSTILE_SNIPPET}></iframe></body></html>'
+    )
+    driver = _ExceptionOnlyDriver()
+    driver.page_html = html
+    driver.current_url = "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia"
+    from cars_scrap_common.botasaurus_utils import is_cloudflare_challenge
+
+    assert is_cloudflare_challenge(driver) is True
+    exc = RuntimeError(
+        "Blocked by Cloudflare Turnstile while scraping carmudi. "
+        "target_url='https://www.carmudi.co.id/mobil-bekas-dijual/indonesia' current_url='https://www.carmudi.co.id/mobil-bekas-dijual/indonesia'. "
+        "Run with BOTASAURUS_PROMPT_ON_CLOUDFLARE=true to solve it manually (headful), "
+        "or switch to a residential proxy / different IP."
+    )
+    assert classify_carmudi_listing_failure(exc) == "cloudflare_challenge"
+
+
+def test_carlist_valid_anchors():
+    svc = CarlistCarsService()
+    hrefs = [
+        "https://www.carlist.my/used-cars-for-sale/12345",
+        "https://www.carlist.my/no-numeric-here",
+        "https://example.com/other-domain/99999",
+    ]
+    driver = _HrefDriver(hrefs)
+    assert svc._extract_listing_urls_botasaurus(driver) == [
+        "https://www.carlist.my/used-cars-for-sale/12345"
+    ]
+
+
+def test_carmudi_valid_anchors():
+    svc = CarmudiCarsService()
+    hrefs = [
+        "https://www.carmudi.co.id/dijual/toyota-avanza-nunggal/335110",
+        "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia",
+        "https://example.com/other/99999",
+    ]
+    driver = _HrefDriver(hrefs)
+    anchors = svc._extract_listing_urls_botasaurus(driver)
+    assert all(
+        svc._is_listing_detail_url(url) for url in anchors
+    ), anchors
+    assert anchors == [
+        "https://www.carmudi.co.id/dijual/toyota-avanza-nunggal/335110"
+    ]
+
+
+def _run_cli_failure(run_module, service_cls, *, failure_message, db_modules):
+    def raise_failure(self, start_url=None, max_pages=1):
+        raise failure_message
+
+    original = service_cls.scrape_all_from_main
+    service_cls.scrape_all_from_main = raise_failure
+
+    def db_guard(*args, **kwargs):
+        raise AssertionError("DB access attempted on listing failure")
+
+    patched: list[tuple[object, object]] = []
+    original_argv = sys.argv
+    try:
+        for module in db_modules:
+            get_connection = getattr(module, "get_connection", None)
+            if get_connection is not None:
+                setattr(module, "get_connection", db_guard)
+                patched.append((module, get_connection))
+        sys.argv = ["run_scraper", "--start-url", "https://fixture.invalid/used-cars"]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_module.main()
+        return rc, buf.getvalue()
+    finally:
+        sys.argv = original_argv
+        for module, get_connection in patched:
+            setattr(module, "get_connection", get_connection)
+        service_cls.scrape_all_from_main = original
+
+
+def test_carlist_cli_nonzero_no_db():
+    import scrap_carlist_cars_botasaurus.database as carlist_db
+    import scrap_carlist_cars_botasaurus.carlist_service as carlist_service_module
+
+    rc, out = _run_cli_failure(
+        carlist_run,
+        CarlistCarsService,
+        failure_message=RuntimeError(
+            "Retryable soft block page while scraping carlist listing: "
+            "current_url='https://www.carlist.my/used-cars-for-sale' reason='no_listing_links'"
+        ),
+        db_modules=[carlist_db, carlist_service_module],
+    )
+    assert rc == 1
+    payload = json.loads(out)
+    assert payload["run_status"] == "failed"
+    assert payload["failure_stage"] == "listing"
+    assert payload["failure_type"] == "empty_listing_page"
+    assert payload["listing_count"] == 0
+    assert payload["stored_to_db"] is False
+
+
+def test_carmudi_cli_nonzero_no_db():
+    import scrap_carmudi_cars_botasaurus.database as carmudi_db
+    import scrap_carmudi_cars_botasaurus.carmudi_service as carmudi_service_module
+
+    rc, out = _run_cli_failure(
+        carmudi_run,
+        CarmudiCarsService,
+        failure_message=RuntimeError(
+            "Retryable soft block page while scraping carmudi listing: "
+            "current_url='https://www.carmudi.co.id/mobil-bekas-dijual/indonesia' reason='no_listing_links'"
+        ),
+        db_modules=[carmudi_db, carmudi_service_module],
+    )
+    assert rc == 1
+    payload = json.loads(out)
+    assert payload["run_status"] == "failed"
+    assert payload["failure_stage"] == "listing"
+    assert payload["failure_type"] == "empty_listing_page"
+    assert payload["listing_count"] == 0
+    assert payload["stored_to_db"] is False
+
+
+class _FakeFileHandle:
+    def write(self, data):
+        return len(str(data))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _capture_write_guards():
+    """Patch bt writers + file/dir writes so captures never hit the filesystem."""
+    return (
+        unittest.mock.patch("botasaurus.bt.write_html"),
+        unittest.mock.patch("botasaurus.bt.write_json"),
+        unittest.mock.patch("os.makedirs"),
+        unittest.mock.patch("builtins.open", return_value=_FakeFileHandle()),
+    )
+
+
+def _run_capture_checks(svc_class, slug):
+    svc = svc_class()
+    html = "<html><body>offline fixture</body></html>"
+
+    def fresh_driver(current_url):
+        driver = _ExceptionOnlyDriver()
+        driver.page_html = html
+        driver.current_url = current_url
+        return driver
+
+    payload = dict(slug=slug, reason="reason_from_fixture", url="fixture.invalid/used-cars")
+    with contextlib.ExitStack() as stack:
+        write_html, _write_json, _makedirs, _open = (
+            stack.enter_context(guard) for guard in _capture_write_guards()
+        )
+        # same fingerprint twice -> exactly one HTML write + one snapshot write
+        svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/used-cars"), **payload)
+        svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/used-cars"), **payload)
+        assert write_html.call_count == 1, f"write_html={write_html.call_count}"
+        assert _open.call_count == 1, f"snapshot_open={_open.call_count}"
+        # distinct fingerprint (different current_url) -> one more full capture
+        svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/other"), **payload)
+        assert write_html.call_count == 2, f"write_html={write_html.call_count}"
+        assert _open.call_count == 2, f"snapshot_open={_open.call_count}"
+    return True
+
+
+def test_capture_ceiling_carlist():
+    assert _run_capture_checks(CarlistCarsService, "carlist_listing_soft_block")
+
+
+def test_capture_ceiling_carmudi():
+    assert _run_capture_checks(CarmudiCarsService, "carmudi_listing_soft_block")
+
+
+def main() -> int:
+    checks = (
+        test_carlist_turnstile_classification,
+        test_carlist_73_byte_upstream_error_classification,
+        test_carlist_exhausted_empty_listing,
+        test_carmudi_challenge_classification,
+        test_carlist_valid_anchors,
+        test_carmudi_valid_anchors,
+        test_capture_ceiling_carlist,
+        test_capture_ceiling_carmudi,
+        test_carlist_cli_nonzero_no_db,
+        test_carmudi_cli_nonzero_no_db,
+    )
+    failed = 0
+    for check in checks:
+        try:
+            check()
+        except Exception as exc:  # noqa: BLE001 - surface failure, stay offline
+            failed += 1
+            print(f"FAIL {check.__name__}: {exc}")
+        else:
+            print(f"PASS {check.__name__}")
+    print("network_access: never_performed; db_access: guarded_and_never_invoked")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
