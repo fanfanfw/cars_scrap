@@ -8,7 +8,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import pathlib
 import sys
+import tempfile
+import time
 import unittest.mock
 from pathlib import Path
 
@@ -220,30 +224,18 @@ def test_carmudi_cli_nonzero_no_db():
     assert payload["stored_to_db"] is False
 
 
-class _FakeFileHandle:
-    def write(self, data):
-        return len(str(data))
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+def _debug_dir_files(kind: str) -> int:
+    """Count real files in the production debug capture dir (repo-relative)."""
+    base = REPO_ROOT / "botasaurus_test" / "output" / f"{kind}_debug"
+    if not base.is_dir():
+        return 0
+    return sum(1 for path in base.iterdir() if path.is_file())
 
 
-def _capture_write_guards():
-    """Patch bt writers + file/dir writes so captures never hit the filesystem."""
-    return (
-        unittest.mock.patch("botasaurus.bt.write_html"),
-        unittest.mock.patch("botasaurus.bt.write_json"),
-        unittest.mock.patch("os.makedirs"),
-        unittest.mock.patch("builtins.open", return_value=_FakeFileHandle()),
-    )
-
-
-def _run_capture_checks(svc_class, slug):
+def _run_capture_checks(svc_class, kind: str) -> bool:
     svc = svc_class()
     html = "<html><body>offline fixture</body></html>"
+    slug = f"{kind}_listing_soft_block"
 
     def fresh_driver(current_url):
         driver = _ExceptionOnlyDriver()
@@ -251,29 +243,46 @@ def _run_capture_checks(svc_class, slug):
         driver.current_url = current_url
         return driver
 
+    real_before = _debug_dir_files("carlist") + _debug_dir_files("carmudi")
+
     payload = dict(slug=slug, reason="reason_from_fixture", url="fixture.invalid/used-cars")
-    with contextlib.ExitStack() as stack:
-        write_html, _write_json, _makedirs, _open = (
-            stack.enter_context(guard) for guard in _capture_write_guards()
-        )
-        # same fingerprint twice -> exactly one HTML write + one snapshot write
-        svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/used-cars"), **payload)
-        svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/used-cars"), **payload)
-        assert write_html.call_count == 1, f"write_html={write_html.call_count}"
-        assert _open.call_count == 1, f"snapshot_open={_open.call_count}"
-        # distinct fingerprint (different current_url) -> one more full capture
-        svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/other"), **payload)
-        assert write_html.call_count == 2, f"write_html={write_html.call_count}"
-        assert _open.call_count == 2, f"snapshot_open={_open.call_count}"
+    with tempfile.TemporaryDirectory(prefix="clf_check_") as tmp:
+        tmp_path = pathlib.Path(tmp).resolve()
+        original_cwd = os.getcwd()
+        try:
+            # Production out_dir is relative ("botasaurus_test/output/<svc>_debug");
+            # chdir makes actual write paths land inside the temp dir only.
+            os.chdir(tmp_path)
+            # same fingerprint (sha1(slug|reason|current_url)) twice -> one HTML+JSON pair
+            svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/used-cars"), **payload)
+            svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/used-cars"), **payload)
+            # distinct fingerprint (different current_url) -> another full pair
+            time.sleep(1.05)  # production filenames are second-resolution timestamped
+            svc._save_debug_capture_botasaurus(fresh_driver("https://fixture.invalid/other"), **payload)
+            out_dir = tmp_path / "botasaurus_test" / "output" / f"{kind}_debug"
+            files = sorted(path.name for path in out_dir.iterdir())
+            assert len(files) == 4, files
+            html_files = [name for name in files if not name.endswith(".json")]
+            json_files = [name for name in files if name.endswith(".json")]
+            assert len(html_files) == 2, files
+            assert len(json_files) == 2, files
+            assert all(path.is_file() for path in out_dir.iterdir()), files
+        finally:
+            os.chdir(original_cwd)
+    # TemporaryDirectory cleanup removes the whole tree
+    assert not pathlib.Path(tmp).exists(), "temp capture dir not cleaned up"
+    # no writes under real repo debug dirs
+    real_after = _debug_dir_files("carlist") + _debug_dir_files("carmudi")
+    assert real_after == real_before, (real_before, real_after)
     return True
 
 
 def test_capture_ceiling_carlist():
-    assert _run_capture_checks(CarlistCarsService, "carlist_listing_soft_block")
+    assert _run_capture_checks(CarlistCarsService, "carlist")
 
 
 def test_capture_ceiling_carmudi():
-    assert _run_capture_checks(CarmudiCarsService, "carmudi_listing_soft_block")
+    assert _run_capture_checks(CarmudiCarsService, "carmudi")
 
 
 def main() -> int:
@@ -304,4 +313,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
