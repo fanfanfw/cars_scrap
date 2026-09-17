@@ -581,6 +581,8 @@ class Mobil123CarsService(SharedBaseService):
         return None
 
     def _parse_rupiah_price(self, text: object | None) -> int | None:
+        if isinstance(text, str) and text.lstrip().startswith("-"):
+            return None
         return super()._parse_rupiah_price(text)
 
     def _parse_mileage(self, mileage_str: str | None) -> int:
@@ -1445,7 +1447,7 @@ class Mobil123CarsService(SharedBaseService):
             self._extract_legacy_location_botasaurus(driver)
             or self._extract_location_botasaurus(driver)
         )
-        price_value = self._parse_int_from_text(
+        price_value = self._parse_rupiah_price(
             self._first_meta_content_botasaurus(driver, ["ga:cad:details:price", "WT.z_price"])
             or self._get_attr_by_xpath_botasaurus(driver, PRICE_META_XPATH, "content")
         )
