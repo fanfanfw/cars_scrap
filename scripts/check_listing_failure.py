@@ -150,6 +150,29 @@ def test_carmudi_valid_anchors():
     ]
 
 
+# CARMUDI-TRACK-01C: sold-page marker regression (offline, no browser/network/DB).
+def test_carmudi_sold_markers_and_branch_contract():
+    svc = CarmudiCarsService()
+
+    def sold(html: str) -> bool:
+        driver = _ExceptionOnlyDriver()
+        driver.page_html = html
+        return svc._is_sold_page_botasaurus(driver)
+
+    # normalized exact sentence (upper-cased + trailing period) and existing terjual
+    assert sold("<h1>MOBIL INI SAAT INI TIDAK TERSEDIA.</h1>") is True
+    assert sold("<p>Mobil ini telah terjual</p>") is True
+    # generic 404, redirect-ish, and normal pages must never be sold
+    assert sold("<h1>404 Not Found</h1><p>Page not found</p>") is False
+    assert sold("<p>Redirected elsewhere</p>") is False
+    assert sold("<h1>Toyota Avanza 2019</h1><p>Rp 180.000.000</p>") is False
+
+    # CARMUDI-TRACK-01B source contract: sold only when explicit sold page
+    source = (REPO_ROOT / "scrap_carmudi_cars_botasaurus" / "carmudi_service.py").read_text()
+    assert "should_mark_sold = bool(is_sold_page)" in source
+    assert "tracking_mode and (is_not_found_page or redirected_off_detail)" not in source
+
+
 def _run_cli_failure(run_module, service_cls, *, failure_message, db_modules):
     def raise_failure(self, start_url=None, max_pages=1):
         raise failure_message
@@ -293,6 +316,7 @@ def main() -> int:
         test_carmudi_challenge_classification,
         test_carlist_valid_anchors,
         test_carmudi_valid_anchors,
+        test_carmudi_sold_markers_and_branch_contract,
         test_capture_ceiling_carlist,
         test_capture_ceiling_carmudi,
         test_carlist_cli_nonzero_no_db,

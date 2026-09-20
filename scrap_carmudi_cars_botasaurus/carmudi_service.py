@@ -306,6 +306,7 @@ class CarmudiCarsService(SharedBaseService):
                 "already been sold",
                 "sudah terjual",
                 "mobil ini telah terjual",
+                "mobil ini saat ini tidak tersedia",
                 "iklan tidak tersedia",
             ),
         )
@@ -1423,7 +1424,9 @@ class CarmudiCarsService(SharedBaseService):
 
         if is_not_found_page or is_sold_page or redirected_off_detail:
             if expected_id:
-                should_mark_sold = bool(is_sold_page) or (tracking_mode and (is_not_found_page or redirected_off_detail))
+                # CARMUDI-TRACK-01B: only an explicit sold page may mark sold.
+                # not_found / redirected pages must never be treated as sold.
+                should_mark_sold = bool(is_sold_page)
                 if not should_mark_sold:
                     raise RuntimeError(
                         "Detail page unavailable but not confidently sold. "
