@@ -269,6 +269,7 @@ class Mobil123CarsService(SharedBaseService):
                 "sudah terjual",
                 "mobil ini telah terjual",
                 "iklan tidak tersedia",
+                "mobil ini saat ini tidak tersedia",
             ),
         )
 
@@ -1372,7 +1373,9 @@ class Mobil123CarsService(SharedBaseService):
 
         if is_not_found_page or is_sold_page or redirected_off_detail:
             if expected_id:
-                should_mark_sold = bool(is_sold_page) or (tracking_mode and (is_not_found_page or redirected_off_detail))
+                # MOBIL123-TRACK-02: only an explicit sold page may mark sold.
+                # not_found / redirected pages must never be treated as sold.
+                should_mark_sold = bool(is_sold_page)
                 if not should_mark_sold:
                     raise RuntimeError(
                         "Detail page unavailable but not confidently sold. "

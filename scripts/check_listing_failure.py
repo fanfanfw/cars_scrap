@@ -27,6 +27,7 @@ from scrap_carlist_cars_botasaurus.carlist_service import (
     CarlistCarsService,
     classify_listing_failure as classify_carlist_listing_failure,
 )
+from scrap_mobil123_cars_botasaurus.mobil123_service import Mobil123CarsService
 import scrap_carlist_cars_botasaurus.run_scraper as carlist_run
 import scrap_carmudi_cars_botasaurus.run_scraper as carmudi_run
 
@@ -169,6 +170,31 @@ def test_carmudi_sold_markers_and_branch_contract():
 
     # CARMUDI-TRACK-01B source contract: sold only when explicit sold page
     source = (REPO_ROOT / "scrap_carmudi_cars_botasaurus" / "carmudi_service.py").read_text()
+    assert "should_mark_sold = bool(is_sold_page)" in source
+    assert "tracking_mode and (is_not_found_page or redirected_off_detail)" not in source
+
+
+# MOBIL123-TRACK-02: sold-page marker regression (offline, no browser/network/DB).
+def test_mobil123_sold_markers_and_branch_contract():
+    svc = Mobil123CarsService()
+
+    def sold(html: str) -> bool:
+        driver = _ExceptionOnlyDriver()
+        driver.page_html = html
+        return svc._is_sold_page_botasaurus(driver)
+
+    # existing explicit Mobil123 sold markers must stay true
+    assert sold("<p>Mobil ini telah terjual</p>") is True
+    assert sold("<p>Iklan tidak tersedia</p>") is True
+    # MOBIL123-TRACK-02B: live evidence phrase, case-insensitive + punctuation.
+    assert sold("<p>MOBIL INI SAAT INI TIDAK TERSEDIA.</p>") is True
+    # generic 404, redirect-ish, and normal pages must never be sold
+    assert sold("<h1>404 Not Found</h1><p>Page not found</p>") is False
+    assert sold("<p>Redirected elsewhere</p>") is False
+    assert sold("<h1>Toyota Avanza 2019</h1><p>Rp 180.000.000</p>") is False
+
+    # MOBIL123-TRACK-02 source contract: sold only when explicit sold page
+    source = (REPO_ROOT / "scrap_mobil123_cars_botasaurus" / "mobil123_service.py").read_text()
     assert "should_mark_sold = bool(is_sold_page)" in source
     assert "tracking_mode and (is_not_found_page or redirected_off_detail)" not in source
 
@@ -317,6 +343,7 @@ def main() -> int:
         test_carlist_valid_anchors,
         test_carmudi_valid_anchors,
         test_carmudi_sold_markers_and_branch_contract,
+        test_mobil123_sold_markers_and_branch_contract,
         test_capture_ceiling_carlist,
         test_capture_ceiling_carmudi,
         test_carlist_cli_nonzero_no_db,
