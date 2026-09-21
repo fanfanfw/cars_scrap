@@ -199,6 +199,108 @@ def test_mobil123_sold_markers_and_branch_contract():
     assert "tracking_mode and (is_not_found_page or redirected_off_detail)" not in source
 
 
+# OLX-TRACK-02: explicit sold marker + dedicated status-only persistence (offline).
+def test_olx_sold_marker_and_persistence_contract():
+    import types
+    from scrap_olx_cars_botasaurus.olx_service import OlxCarsService
+
+    svc = OlxCarsService()
+    svc_source = (REPO_ROOT / "scrap_olx_cars_botasaurus" / "olx_service.py").read_text()
+
+    def make_driver(html: str, current_url: str = "https://www.olx.co.id/item/x-iid-1"):
+        driver = _ExceptionOnlyDriver()
+        driver.page_html = html
+        driver.current_url = current_url
+        driver.get_via = lambda *a, **k: None
+        driver.google_get = lambda *a, **k: None
+        return driver
+
+    def sold(html: str) -> bool:
+        return svc._is_sold_page_botasaurus(make_driver(html))
+
+    MARKER = "kami tidak menemukan apa pun yang cocok dengan pencarian ini"
+    SEARCH_URL = "https://www.olx.co.id/indonesia_g1000001/mobil-bekas_c198"
+    # exact marker: mixed case, wrapped/newline whitespace, trailing punctuation
+    assert sold("<h1>Kami Tidak Menemukan\n  Apa Pun   Yang Cocok Dengan Pencarian Ini.</h1>") is True
+    # generic 404 / redirect / normal pages must never be sold
+    assert sold("<h1>404 Not Found</h1><p>Halaman tidak ditemukan</p>") is False
+    assert sold("<p>Redirected elsewhere</p>") is False
+    assert sold("<h1>Toyota Raize 2025</h1><p>Rp 228.000.000</p>") is False
+    # separation: marker is not part of the generic not-found tokens
+    assert svc._is_listing_not_found_botasaurus(make_driver(MARKER)) is False
+
+    # source order: marker detected after navigation and before the detail waits
+    body = svc_source[svc_source.index("def _scrape_single_detail_botasaurus"):]
+    assert body.index("is_sold_page = self._is_sold_page_botasaurus(driver)") < body.index("wait_for_css(")
+    # same-domain non-detail current_url counts as redirected_off_detail
+    assert "not self._is_listing_detail_url(current_url)" in body
+    assert "not self._is_on_target_domain(current_url)" not in body
+
+    # branch contract: fresh marker errors, tracking marker returns sold
+    cfg = types.SimpleNamespace(
+        bypass_cloudflare=False, prompt_on_cloudflare=False, detail_wait_seconds=0.01, poll_interval_seconds=0.01
+    )
+    try:
+        svc._scrape_single_detail_botasaurus(
+            make_driver(MARKER), url="https://www.olx.co.id/item/x-iid-1", cfg=cfg, listing_id="1", tracking_mode=False
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("fresh marker must raise, not mark sold")
+    tracked = svc._scrape_single_detail_botasaurus(
+        make_driver(MARKER), url="https://www.olx.co.id/item/x-iid-1", cfg=cfg, listing_id="1", tracking_mode=True
+    )
+    assert tracked.get("status") == "sold" and tracked.get("listing_id") == "1"
+
+    # same-domain search/notfound redirect (no marker) -> ambiguous error, never sold
+    try:
+        svc._scrape_single_detail_botasaurus(
+            make_driver("<h1>Cari mobil bekas</h1>", SEARCH_URL),
+            url="https://www.olx.co.id/item/x-iid-1",
+            cfg=cfg,
+            listing_id="1",
+            tracking_mode=True,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("same-domain non-detail redirect must error, not sell")
+    # exact marker on same-domain non-detail still wins (priority) -> sold
+    same_domain_marker = svc._scrape_single_detail_botasaurus(
+        make_driver(MARKER, SEARCH_URL), url="https://www.olx.co.id/item/x-iid-1", cfg=cfg, listing_id="1", tracking_mode=True
+    )
+    assert same_domain_marker.get("status") == "sold"
+
+    # dedicated sold UPDATE only touches listing_url/status/version/last_scraped_at
+    sold_sql = svc_source.split("sold_update_sql = ", 1)[1].split('"""', 2)[1]
+    assert "status = 'sold'" in sold_sql and "listing_id = %s" in sold_sql
+    for field in ("variant", "transmission", "fuel_type"):
+        assert field not in sold_sql, field
+
+
+# OLX-TRACK-04B: tracking image-shrink safeguard (offline, no browser/network/DB).
+def test_olx_tracking_images_no_shrink_contract():
+    from scrap_olx_cars_botasaurus.olx_service import olx_images_upsert_expression
+
+    # regular scrape: historical behavior must stay byte-identical
+    assert olx_images_upsert_expression(tracking_mode=False) == "COALESCE(EXCLUDED.images, cars_scrap_olx.images)"
+    tracking = olx_images_upsert_expression(tracking_mode=True)
+    # real text[] cardinality guard: equal-or-more accepts new, else keeps stored old
+    for token in (
+        "cardinality(cars_scrap_olx.images)",
+        "cardinality(EXCLUDED.images) >= cardinality(cars_scrap_olx.images)",
+        "ELSE cars_scrap_olx.images END",
+    ):
+        assert token in tracking, token
+    # null/empty stored old -> accept the newly extracted list
+    assert "cars_scrap_olx.images IS NULL OR cardinality(cars_scrap_olx.images) = 0" in tracking
+    # wired into the upsert, keyed by the tracking variant (no extra DB fetch)
+    svc_source = (REPO_ROOT / "scrap_olx_cars_botasaurus" / "olx_service.py").read_text()
+    assert "images = {images_update_sql}," in svc_source
+    assert "images_update_sql = olx_images_upsert_expression(tracking_mode=bool(listing_id_by_url))" in svc_source
+
+
 def _run_cli_failure(run_module, service_cls, *, failure_message, db_modules):
     def raise_failure(self, start_url=None, max_pages=1):
         raise failure_message
@@ -344,6 +446,8 @@ def main() -> int:
         test_carmudi_valid_anchors,
         test_carmudi_sold_markers_and_branch_contract,
         test_mobil123_sold_markers_and_branch_contract,
+        test_olx_sold_marker_and_persistence_contract,
+        test_olx_tracking_images_no_shrink_contract,
         test_capture_ceiling_carlist,
         test_capture_ceiling_carmudi,
         test_carlist_cli_nonzero_no_db,

@@ -28,6 +28,33 @@ SELLER_NAME_SELECTOR = "div.HtnZ6"
 DETAIL_ROOT_SELECTOR = "#main_content"
 
 
+def olx_images_upsert_expression(*, tracking_mode: bool) -> str:
+    """Return the SQL right-hand side assigned to `images` in the OLX upsert.
+
+    Regular scrapes keep the historical behavior: ``COALESCE(EXCLUDED.images,
+    cars_scrap_olx.images)`` (a non-NULL extraction always wins).
+
+    OLX-TRACK-04B: tracking re-scrapes may transiently extract fewer gallery
+    images than the stored list (live listing 945678447: 19 -> 1 while price,
+    location and mileage were legitimately newer). Tracking must therefore never
+    shrink a stored non-empty gallery: keep the existing array unless the newly
+    extracted one has at least as many items (or the old one is null/empty).
+    ``images`` is a real PostgreSQL ``text[]`` column, so ``cardinality`` is the
+    exact array-length predicate (no guessed json/text cardinality).
+    """
+    if not tracking_mode:
+        return "COALESCE(EXCLUDED.images, cars_scrap_olx.images)"
+    return (
+        "CASE "
+        "WHEN cars_scrap_olx.images IS NULL OR cardinality(cars_scrap_olx.images) = 0 "
+        "THEN COALESCE(EXCLUDED.images, cars_scrap_olx.images) "
+        "WHEN EXCLUDED.images IS NOT NULL "
+        "AND cardinality(EXCLUDED.images) >= cardinality(cars_scrap_olx.images) "
+        "THEN EXCLUDED.images "
+        "ELSE cars_scrap_olx.images END"
+    )
+
+
 class OlxCarsService(SharedBaseService):
     def __init__(self):
         self.logger = setup_logger("scrape_olx_cars")
@@ -671,6 +698,16 @@ class OlxCarsService(SharedBaseService):
             ),
         )
 
+    def _is_sold_page_botasaurus(self, driver) -> bool:
+        # OLX-TRACK-02: exact explicit sold marker only (whitespace/case robust);
+        # never inferred from generic not-found tokens.
+        try:
+            text = self._get_page_text_botasaurus(driver)
+        except Exception:
+            text = ""
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+        return "kami tidak menemukan apa pun yang cocok dengan pencarian ini" in normalized
+
     def _extract_listing_cards_botasaurus(self, driver) -> list[dict]:
         try:
             items = driver.run_js(
@@ -735,6 +772,26 @@ class OlxCarsService(SharedBaseService):
         tracking_mode: bool = False,
     ) -> dict:
         self._navigate_botasaurus(driver, url, cfg)
+
+        current_url = str(getattr(driver, "current_url", "") or "")
+        listing_id_final = (listing_id or self._extract_listing_id(url) or "").strip()
+        # OLX-TRACK-02: a stale detail may redirect same-domain to a search/notfound
+        # page; require the intended detail URL shape, not just the target domain.
+        redirected_off_detail = bool(current_url) and (not self._is_listing_detail_url(current_url))
+        is_sold_page = self._is_sold_page_botasaurus(driver)
+        is_generic_not_found = self._is_listing_not_found_botasaurus(driver)
+
+        if is_sold_page:
+            if tracking_mode:
+                return self._build_sold_result(url=url, listing_id=listing_id_final)
+            raise RuntimeError("OLX listing sold during fresh scrape; not marking sold")
+        if is_generic_not_found or redirected_off_detail:
+            raise RuntimeError(
+                "OLX detail page unavailable but not confidently sold. "
+                f"current_url={current_url!r} redirected_off_detail={redirected_off_detail} "
+                f"is_generic_not_found={is_generic_not_found} is_sold_page={is_sold_page}"
+            )
+
         wait_for_css(
             driver,
             DETAIL_ROOT_SELECTOR,
@@ -747,12 +804,6 @@ class OlxCarsService(SharedBaseService):
             timeout_seconds=cfg.detail_wait_seconds,
             poll_interval_seconds=cfg.poll_interval_seconds,
         )
-
-        listing_id_final = (listing_id or self._extract_listing_id(url) or "").strip()
-        if self._is_listing_not_found_botasaurus(driver):
-            if not tracking_mode:
-                raise RuntimeError("OLX listing unavailable/not-found during fresh scrape; not marking sold")
-            return self._build_sold_result(url=url, listing_id=listing_id_final)
 
         title_value = self._text_by_css_botasaurus(driver, ITEM_TITLE_SELECTOR)
         brand_value, model_value, year_value = self._parse_title(title_value)
@@ -962,6 +1013,14 @@ class OlxCarsService(SharedBaseService):
             ELSE COALESCE(EXCLUDED.status, cars_scrap_olx.status)
           END"""
         )
+
+        # OLX-TRACK-04B: tracking re-scrapes may transiently extract fewer gallery
+        # images than the historically stored list (observed 19 -> 1 on live
+        # listing 945678447 while price/location/mileage were legitimately newer).
+        # Tracking upserts are identified by the presence of listing_id_by_url.
+        # Regular (non-tracking) scrape keeps the existing COALESCE behavior.
+        images_update_sql = olx_images_upsert_expression(tracking_mode=bool(listing_id_by_url))
+
         upsert_sql = f"""
         INSERT INTO cars_scrap_olx ({", ".join(columns)})
         VALUES %s
@@ -983,7 +1042,7 @@ class OlxCarsService(SharedBaseService):
           fuel_type = EXCLUDED.fuel_type,
           series = COALESCE(EXCLUDED.series, cars_scrap_olx.series),
           type = COALESCE(EXCLUDED.type, cars_scrap_olx.type),
-          images = COALESCE(EXCLUDED.images, cars_scrap_olx.images),
+          images = {images_update_sql},
           whatsapp_number = COALESCE(EXCLUDED.whatsapp_number, cars_scrap_olx.whatsapp_number),
           contact_seller = COALESCE(EXCLUDED.contact_seller, cars_scrap_olx.contact_seller),
           seller_name = COALESCE(EXCLUDED.seller_name, cars_scrap_olx.seller_name),
@@ -1000,10 +1059,25 @@ class OlxCarsService(SharedBaseService):
           raw_detail = COALESCE(EXCLUDED.raw_detail, cars_scrap_olx_details.raw_detail)
         """
 
+        # OLX-TRACK-02: sold results use a dedicated status-only UPDATE so historical
+        # fields (variant/transmission/fuel_type/details) are never nulled and no new
+        # row is ever inserted for a sold-only marker.
+        sold_update_sql = """
+        UPDATE cars_scrap_olx
+        SET
+          listing_url = COALESCE(%s, listing_url),
+          status = 'sold',
+          version = COALESCE(version, 0) + 1,
+          last_scraped_at = NOW()
+        WHERE listing_id = %s
+        """
+
         conn = get_connection()
         cursor = conn.cursor()
         rows: list[tuple] = []
         details_rows: list[tuple] = []
+        sold_rows: list[tuple] = []
+        sold_result_by_id: dict[str, dict] = {}
 
         def flush_rows() -> None:
             if (not rows) and (not details_rows):
@@ -1019,6 +1093,32 @@ class OlxCarsService(SharedBaseService):
                 raise
             rows.clear()
             details_rows.clear()
+
+        def flush_sold_rows() -> None:
+            if not sold_rows:
+                return
+            missing: list[str] = []
+            try:
+                # OLX-TRACK-02: per-row execute so a missing target row is detected;
+                # executemany rowcount does not map per listing_id.
+                for url_value, listing_id_value in sold_rows:
+                    cursor.execute(sold_update_sql, (url_value, listing_id_value))
+                    if cursor.rowcount == 0:
+                        missing.append(listing_id_value)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            for listing_id_value in missing:
+                # Never claim stored when the UPDATE matched no existing row.
+                result = sold_result_by_id.get(listing_id_value)
+                if result is not None:
+                    result["status"] = "active"
+                    result["error"] = "sold_update_missing_row"
+                self.logger.warning(
+                    "OLX sold update matched no row for listing_id=%s; not stored.", listing_id_value
+                )
+            sold_rows.clear()
 
         from botasaurus.browser import Driver, browser
 
@@ -1065,6 +1165,15 @@ class OlxCarsService(SharedBaseService):
                 results.append(result)
                 row_listing_id = result.get("listing_id")
                 if row_listing_id and not result.get("error"):
+                    if str(result.get("status") or "active") != "active":
+                        # OLX-TRACK-02: sold marker -> status-only update, never the
+                        # generic upsert (which would null historical fields/insert).
+                        if tracking_mode:
+                            sold_rows.append((result.get("listing_url"), str(row_listing_id)))
+                            sold_result_by_id[str(row_listing_id)] = result
+                            if len(sold_rows) >= batch_size:
+                                flush_sold_rows()
+                        continue
                     rows.append(
                         (
                             str(row_listing_id),
@@ -1104,6 +1213,7 @@ class OlxCarsService(SharedBaseService):
                         flush_rows()
 
             flush_rows()
+            flush_sold_rows()
             return results
 
         try:
