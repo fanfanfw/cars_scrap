@@ -1227,3 +1227,104 @@ class OlxCarsService(SharedBaseService):
                 conn.close()
             except Exception:
                 pass
+
+    def scrape_listing_details_with_run_retries(
+        self,
+        links: list[str],
+        *,
+        listing_id_by_url: dict[str, str] | None = None,
+        listing_meta_by_url: dict[str, dict] | None = None,
+        allow_revive_sold: bool = False,
+    ) -> list[dict]:
+        """Scrape OLX details with whole-run retries over only the error URLs.
+
+        Attempt 1 covers every URL; any later attempt re-runs only the URLs that
+        returned an error (a success or a ``sold`` marker is never retried). Each
+        retry attempt gets a unique profile (``<base>_run_r<attempt>_<unique>``)
+        and the cached proxy is reset before/after so a fresh proxy is possible.
+        Output order always follows the original ``links`` order.
+        """
+        original_urls = [str(url or "").strip() for url in links if str(url or "").strip()]
+        if not original_urls:
+            return []
+
+        max_attempts = self._env_int("OLX_RUN_MAX_ATTEMPTS", 2, minimum=1)
+        retry_wait_seconds = self._env_float("OLX_RUN_RETRY_WAIT_SECONDS", 10.0, minimum=0.0)
+
+        initial_profile = (os.getenv("BOTASAURUS_PROFILE") or "").strip()
+        results_by_url: dict[str, dict] = {}
+        pending_urls = list(original_urls)
+
+        for attempt in range(1, max_attempts + 1):
+            if not pending_urls:
+                break
+
+            previous_profile = os.getenv("BOTASAURUS_PROFILE")
+            if attempt > 1:
+                base_profile = initial_profile or "olx"
+                retry_profile = f"{base_profile}_run_r{attempt}_{str(time.time_ns())[-8:]}"
+                os.environ["BOTASAURUS_PROFILE"] = retry_profile
+                self._logged_proxy_ip = False
+                self.logger.warning(
+                    "Retrying OLX run for %s error listing(s). attempt=%s/%s profile=%s",
+                    len(pending_urls),
+                    attempt,
+                    max_attempts,
+                    retry_profile,
+                )
+
+            try:
+                reset_cached_proxy()
+                subset_ids = None
+                if listing_id_by_url:
+                    subset_ids = {url: listing_id_by_url[url] for url in pending_urls if url in listing_id_by_url}
+                subset_meta = None
+                if listing_meta_by_url:
+                    subset_meta = {url: listing_meta_by_url[url] for url in pending_urls if url in listing_meta_by_url}
+
+                attempt_results = self.scrape_listing_details(
+                    pending_urls,
+                    listing_id_by_url=subset_ids,
+                    listing_meta_by_url=subset_meta,
+                    allow_revive_sold=allow_revive_sold,
+                )
+            finally:
+                reset_cached_proxy()
+                if previous_profile is None:
+                    os.environ.pop("BOTASAURUS_PROFILE", None)
+                else:
+                    os.environ["BOTASAURUS_PROFILE"] = previous_profile
+
+            indexed_results: dict[str, dict] = {}
+            for row in attempt_results or []:
+                item = row or {}
+                url = str(item.get("listing_url") or "").strip()
+                if url:
+                    indexed_results[url] = item
+
+            next_pending: list[str] = []
+            for url in pending_urls:
+                row = indexed_results.get(url)
+                if row is None:
+                    row = self._build_error_result(
+                        url,
+                        listing_id=listing_id_by_url.get(url) if listing_id_by_url else None,
+                        error_message="missing_result_from_run",
+                    )
+                results_by_url[url] = row
+                if row.get("error"):
+                    next_pending.append(url)
+
+            pending_urls = next_pending
+            if pending_urls and attempt < max_attempts and retry_wait_seconds:
+                time.sleep(retry_wait_seconds)
+
+        for url in original_urls:
+            if url not in results_by_url:
+                results_by_url[url] = self._build_error_result(
+                    url,
+                    listing_id=listing_id_by_url.get(url) if listing_id_by_url else None,
+                    error_message="missing_result_after_all_attempts",
+                )
+
+        return [results_by_url[url] for url in original_urls]

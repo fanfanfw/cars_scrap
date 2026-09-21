@@ -190,7 +190,7 @@ def main() -> int:
                 print(json.dumps(summary, indent=2, default=str))
                 return 0
 
-            results = scraper.scrape_listing_details(
+            results = scraper.scrape_listing_details_with_run_retries(
                 links,
                 listing_id_by_url=listing_id_by_url,
                 allow_revive_sold=False,

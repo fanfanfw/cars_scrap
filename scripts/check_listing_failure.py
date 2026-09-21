@@ -301,6 +301,55 @@ def test_olx_tracking_images_no_shrink_contract():
     assert "images_update_sql = olx_images_upsert_expression(tracking_mode=bool(listing_id_by_url))" in svc_source
 
 
+# OLX-RETRY-02: whole-run retry wrapper over only erred URLs (offline, no browser/network/DB).
+def test_olx_run_retry_wrapper_contract():
+    import scrap_olx_cars_botasaurus.olx_service as olx_module
+
+    svc = olx_module.OlxCarsService()
+    svc._logged_proxy_ip = True
+    A, B, C = (f"https://www.olx.co.id/item/{tag}-iid-{idx}" for tag, idx in (("a", 1), ("b", 2), ("c", 3)))
+    calls: list[tuple[list[str], str]] = []
+    resets: list[int] = []
+
+    def fake_details(links, *, listing_id_by_url=None, listing_meta_by_url=None, allow_revive_sold=False):
+        calls.append((list(links), os.environ.get("BOTASAURUS_PROFILE", "")))
+        out = []
+        for url in links:
+            base = svc._build_error_result(url, listing_id=listing_id_by_url.get(url) if listing_id_by_url else None)
+            if url == A:
+                out.append({**base, "error": None, "status": "active", "brand": "Toyota"})
+            elif url == C:
+                out.append({**base, "error": None, "status": "sold"})
+            else:
+                out.append({**base, "error": "boom_b"})  # B keeps failing across attempts
+        return out
+
+    svc.scrape_listing_details = fake_details  # fake method, no class binding
+    env = {"OLX_RUN_MAX_ATTEMPTS": "2", "OLX_RUN_RETRY_WAIT_SECONDS": "0", "BOTASAURUS_PROFILE": "olx_track"}
+    with unittest.mock.patch.dict(os.environ, env, clear=False), unittest.mock.patch.object(
+        olx_module, "reset_cached_proxy", lambda: resets.append(1)
+    ):
+        results = svc.scrape_listing_details_with_run_retries(
+            [A, B, C], listing_id_by_url={A: "1", B: "2", C: "3"}, listing_meta_by_url={B: {"information_ads": "x"}}
+        )
+
+    assert [c[0] for c in calls] == [[A, B, C], [B]], calls  # attempt1 all, attempt2 only errors
+    assert calls[1][1].startswith("olx_track_run_r2_"), calls[1][1]  # attempt2 fresh unique profile
+    assert len(resets) == 4 and svc._logged_proxy_ip is False  # reset before/after each attempt
+    assert [r["listing_url"] for r in results] == [A, B, C]  # original order preserved
+    assert results[0]["brand"] == "Toyota" and results[0]["error"] is None
+    assert results[2]["status"] == "sold" and results[2]["error"] is None  # sold never retried
+    assert results[1]["error"] == "boom_b"  # failed twice -> final error wins
+
+    # a missing result becomes an error, and attempts are capped (no infinite loop)
+    svc.scrape_listing_details = lambda links, **kwargs: []
+    with unittest.mock.patch.dict(os.environ, env, clear=False), unittest.mock.patch.object(
+        olx_module, "reset_cached_proxy", lambda: None
+    ):
+        missing = svc.scrape_listing_details_with_run_retries([A, B], listing_id_by_url={A: "1", B: "2"})
+    assert [r["error"] for r in missing] == ["missing_result_from_run", "missing_result_from_run"]
+
+
 def _run_cli_failure(run_module, service_cls, *, failure_message, db_modules):
     def raise_failure(self, start_url=None, max_pages=1):
         raise failure_message
@@ -448,6 +497,7 @@ def main() -> int:
         test_mobil123_sold_markers_and_branch_contract,
         test_olx_sold_marker_and_persistence_contract,
         test_olx_tracking_images_no_shrink_contract,
+        test_olx_run_retry_wrapper_contract,
         test_capture_ceiling_carlist,
         test_capture_ceiling_carmudi,
         test_carlist_cli_nonzero_no_db,
