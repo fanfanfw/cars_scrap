@@ -23,6 +23,50 @@ DEFAULT_LISTING_URL = "https://www.carsome.id/beli-mobil-bekas?sortKey=2"
 BASE_URL = "https://www.carsome.id"
 CARSOMEID_DETAIL_API_URL = "https://www.carsome.id/website/CarList/CarListDetail/v2"
 
+# CARSOME-TRACK-02: explicit status enum. Anything else is unknown -> error/DB untouched.
+CARSOMEID_ACTIVE_STATUS_NAMES = frozenset({"listed", "prelisted"})
+CARSOMEID_SOLD_STATUS_NAMES = frozenset({"unlisted"})
+CARSOMEID_SOLD_STATUS_MARKERS = ("sold", "unavailable")
+
+
+def normalize_carsomeid_status_token(value: object) -> str:
+    """Normalize a CarsomeID status field to a comparable token.
+
+    Lowercases, strips and removes any non-alphanumeric characters so variants
+    like ``PreListed``, ``Pre-Listed`` and ``pre listed`` compare equal.
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def classify_carsomeid_status(*, sale_status_name: object, car_status_label: object) -> str:
+    """Map CarsomeID detail status fields to ``active`` or ``sold``.
+
+    ``Listed``/``PreListed`` are active and ``Unlisted`` is sold. An explicit
+    ``sold``/``unavailable`` status name/label is also sold. An empty or unknown
+    enum raises ``RuntimeError`` so the caller records an error result and never
+    silently marks an unknown listing active (DB untouched).
+    """
+    name = normalize_carsomeid_status_token(sale_status_name)
+    label = normalize_carsomeid_status_token(car_status_label)
+
+    # Explicit sold status name (e.g. "Sold"/"Unavailable") is always sold.
+    if any(marker in name for marker in CARSOMEID_SOLD_STATUS_MARKERS):
+        return "sold"
+    # Unknown non-empty enum must never be silently classified as active.
+    if name and name not in CARSOMEID_ACTIVE_STATUS_NAMES and name not in CARSOMEID_SOLD_STATUS_NAMES:
+        raise RuntimeError(f"CarsomeID detail returned unknown saleStatusName: {sale_status_name!r}")
+    if name in CARSOMEID_SOLD_STATUS_NAMES:
+        return "sold"
+    # Explicit sold/unavailable label is sold when the status name is absent/known.
+    if any(marker in label for marker in CARSOMEID_SOLD_STATUS_MARKERS):
+        return "sold"
+    if name in CARSOMEID_ACTIVE_STATUS_NAMES:
+        return "active"
+    raise RuntimeError(
+        "CarsomeID detail returned empty/unknown status "
+        f"(saleStatusName={sale_status_name!r}, carStatusLabel={car_status_label!r})"
+    )
+
 
 class CarsomeIdCarsService(SharedBaseService):
     def __init__(self):
@@ -285,13 +329,10 @@ class CarsomeIdCarsService(SharedBaseService):
 
     def _status_from_detail(self, payload: dict) -> str:
         car = ((payload or {}).get("data") or {}).get("car") or {}
-        sale_status_name = str(car.get("saleStatusName") or "").strip().lower()
-        car_status_label = str(car.get("carStatusLabel") or "").strip().lower()
-        if sale_status_name and sale_status_name not in {"listed"}:
-            return "sold"
-        if "sold" in car_status_label or "unavailable" in car_status_label:
-            return "sold"
-        return "active"
+        return classify_carsomeid_status(
+            sale_status_name=car.get("saleStatusName"),
+            car_status_label=car.get("carStatusLabel"),
+        )
 
     def _extract_detail_fields(self, *, url: str, payload: dict) -> dict:
         listing_id = self._extract_listing_id(url)
@@ -349,10 +390,22 @@ class CarsomeIdCarsService(SharedBaseService):
             "error_message": error_message,
         }
 
+    def _is_retryable_detail_error(self, exc: Exception) -> bool:
+        """CARSOME-TRACK-03: only Timeout/ConnectionError, HTTP 429 and HTTP 5xx retry."""
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(exc, requests.HTTPError):
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code is not None and (status_code == 429 or 500 <= status_code < 600):
+                return True
+        return False
+
     def fetch_detail_api(self, url: str) -> dict:
         listing_id = self._extract_listing_id(url)
         car_no = self._listing_id_to_car_no(listing_id)
         timeout = self._carsomeid_env_float("DETAIL_API_TIMEOUT_SECONDS", 30.0, minimum=1.0)
+        max_attempts = self._carsomeid_env_int("DETAIL_MAX_ATTEMPTS", 2, minimum=1)
+        retry_wait_seconds = self._carsomeid_env_float("DETAIL_RETRY_WAIT_SECONDS", 3.0, minimum=0.0)
         headers = {
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
@@ -366,19 +419,36 @@ class CarsomeIdCarsService(SharedBaseService):
             "x-language": "id",
             "x-platform": "web",
         }
-        response = requests.post(
-            CARSOMEID_DETAIL_API_URL,
-            headers=headers,
-            json={"recommendCount": 6, "carNo": car_no, "token": ""},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise RuntimeError("CarsomeID detail API returned non-object JSON")
-        if payload.get("code") != "0000" or not (((payload.get("data") or {}).get("car") or {})):
-            raise RuntimeError(f"CarsomeID detail API returned invalid payload for {car_no}: {payload.get('msg')}")
-        return payload
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(
+                    CARSOMEID_DETAIL_API_URL,
+                    headers=headers,
+                    json={"recommendCount": 6, "carNo": car_no, "token": ""},
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise RuntimeError("CarsomeID detail API returned non-object JSON")
+                if payload.get("code") != "0000" or not (((payload.get("data") or {}).get("car") or {})):
+                    raise RuntimeError(
+                        f"CarsomeID detail API returned invalid payload for {car_no}: {payload.get('msg')}"
+                    )
+                return payload
+            except Exception as exc:
+                if attempt >= max_attempts or not self._is_retryable_detail_error(exc):
+                    raise
+                self.logger.warning(
+                    "CarsomeID detail retry %s/%s for %s after error: %s",
+                    attempt,
+                    max_attempts,
+                    car_no,
+                    exc,
+                )
+                if retry_wait_seconds:
+                    time.sleep(retry_wait_seconds)
+        raise RuntimeError(f"CarsomeID detail API retry exhausted for {car_no}")
 
     def _load_listing_urls_by_pages(self, driver, *, url: str, cfg, max_pages: int, all_pages: bool) -> list[str]:
         collected: list[str] = []

@@ -350,6 +350,89 @@ def test_olx_run_retry_wrapper_contract():
     assert [r["error"] for r in missing] == ["missing_result_from_run", "missing_result_from_run"]
 
 
+# CARSOME-TRACK-02/03: status enum + bounded retry + track count/dry-run (offline, no DB writes).
+def test_carsomeid_status_retry_and_track_cli_contract():
+    import types
+    import requests
+    import scrap_carsomeid_cars_botasaurus.carsomeid_service as cs
+    import scrap_carsomeid_cars_botasaurus.database as cs_db
+    import scrap_carsomeid_cars_botasaurus.run_scraper as cs_run
+    c = cs.classify_carsomeid_status
+    for name, label, expected in (
+        ("Listed", "In Transaction", "active"), ("PreListed", "In Reconditioning", "active"),
+        ("Unlisted", None, "sold"), (None, "Sold", "sold"), ("Listed", "Unavailable", "sold"),
+    ):
+        assert c(sale_status_name=name, car_status_label=label) == expected, (name, label)
+    for name, label in ((None, None), ("", ""), ("Weird", None), ("Weird", "Whatever")):
+        try:
+            c(sale_status_name=name, car_status_label=label)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError((name, label))
+    svc = cs.CarsomeIdCarsService()
+    svc.logger.setLevel(50)
+    URL = "https://www.carsome.id/beli-mobil-bekas/a/b/c/x"
+    VALID = {"code": "0000", "data": {"car": {"carNo": "X", "saleStatusName": "Listed"}}}
+    ns = lambda code: types.SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: code)
+    err = lambda s: requests.HTTPError(response=types.SimpleNamespace(status_code=s))
+
+    def attempts(seq):
+        box = list(seq)
+
+        def fake(*_a, **_k):
+            item = box.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with unittest.mock.patch.object(cs.requests, "post", fake), unittest.mock.patch.dict(
+            os.environ, {"CARSOMEID_DETAIL_RETRY_WAIT_SECONDS": "0"}, clear=False
+        ):
+            try:
+                svc.fetch_detail_api(URL)
+                raised = False
+            except Exception:
+                raised = True
+        return len(seq) - len(box), raised
+
+    assert attempts([requests.Timeout(), ns(VALID)]) == (2, False)  # timeout then success
+    assert (attempts([err(429), ns(VALID)]), attempts([err(503), ns(VALID)])) == ((2, False), (2, False))
+    assert (attempts([err(400), ns(VALID)]), attempts([ns({"code": "9999", "data": {}}), ns(VALID)])) == ((1, True), (1, True))
+
+    class Conn:
+        def cursor(self): return self
+        def execute(self, sql, params=None): self.sql = " ".join(str(sql).split()).upper(); self.params = params
+        def fetchone(self): return (5,)
+        def fetchall(self): return [("1", URL), ("2", URL + "2")]
+        def close(self): pass
+
+    conn, base = Conn(), ["run_scraper", "--track-last-scraped-older-than", "7d"]
+
+    def cli(*extra):
+        sys.argv = [*base, *extra]
+        buf = io.StringIO()
+        with unittest.mock.patch.object(cs_db, "get_connection", lambda: conn), contextlib.redirect_stdout(buf):
+            rc = cs_run.main()
+        return rc, buf.getvalue(), conn
+
+    original = sys.argv
+    try:
+        rc, out, c1 = cli("--track-count-only")
+        assert rc == 0 and out.strip() == "total_data: 5 listing" and "COUNT(*)" in c1.sql and "LIMIT" not in c1.sql
+        rc, out, c2 = cli("--track-limit", "3", "--track-dry-run")
+        assert rc == 0 and "LIMIT" in c2.sql and c2.params[-1] == 3 and json.loads(out)["count"] == 2
+        for extra in (["--start-url", "x"], ["--details"], ["--all-pages"], ["--max-pages", "2"], ["--debug-detail-url", "x"]):
+            try:
+                cli(*extra)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(extra)
+    finally:
+        sys.argv = original
+
+
 def _run_cli_failure(run_module, service_cls, *, failure_message, db_modules):
     def raise_failure(self, start_url=None, max_pages=1):
         raise failure_message
@@ -498,6 +581,7 @@ def main() -> int:
         test_olx_sold_marker_and_persistence_contract,
         test_olx_tracking_images_no_shrink_contract,
         test_olx_run_retry_wrapper_contract,
+        test_carsomeid_status_retry_and_track_cli_contract,
         test_capture_ceiling_carlist,
         test_capture_ceiling_carmudi,
         test_carlist_cli_nonzero_no_db,
