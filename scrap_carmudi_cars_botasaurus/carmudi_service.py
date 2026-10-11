@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from psycopg2.extras import Json, execute_values
 
 from cars_scrap_common.botasaurus_utils import (
+    attempt_solve_cloudflare_in_session,
     is_cloudflare_challenge,
     load_botasaurus_config,
     raise_if_cloudflare_challenge,
@@ -352,27 +353,36 @@ class CarmudiCarsService(SharedBaseService):
 
         max_attempts = self._carmudi_env_int("CLOUDFLARE_MAX_ATTEMPTS", 2, minimum=1)
         post_wait_seconds = self._carmudi_env_float("CLOUDFLARE_POST_SOLVE_WAIT_SECONDS", 4.0, minimum=0.0)
+        # Per-attempt wall-clock deadline: the installed detect_and_bypass_cloudflare()
+        # can block in its own iframe/watch loops, so cap a single invocation. 0 disables.
+        attempt_timeout_seconds = self._carmudi_env_float("CLOUDFLARE_SOLVE_TIMEOUT_SECONDS", 60.0, minimum=0.0)
+        # CARMUDI-CF-04A: one controlled same-session refresh when the first bounded
+        # solver attempt is still challenged (manual evidence: a single refresh let
+        # the run collect 25 links). Bounded wait/re-detect; never a refresh loop.
+        refresh_enabled = self._carmudi_env_bool("CLOUDFLARE_REFRESH_ENABLED", True)
+        refresh_wait_seconds = self._carmudi_env_float("CLOUDFLARE_REFRESH_WAIT_SECONDS", 25.0, minimum=0.0)
+        refresh_timeout_seconds = self._carmudi_env_float("CLOUDFLARE_REFRESH_TIMEOUT_SECONDS", 60.0, minimum=0.0)
 
-        for attempt in range(1, max_attempts + 1):
-            current_url = str(getattr(driver, "current_url", "") or "")
-            self.logger.warning(
-                "Cloudflare challenge detected on carmudi. Auto-solve attempt %s/%s. target_url=%r current_url=%r",
-                attempt,
-                max_attempts,
-                target_url,
-                current_url,
-            )
-            try:
-                driver.detect_and_bypass_cloudflare()
-            except Exception as exc:
-                self.logger.warning("Botasaurus auto-solve attempt %s failed: %s", attempt, exc)
+        # CARMUDI-CF-02/04A: single bounded, sanitized solver path shared with the
+        # detector so a real Carmudi interstitial is actually acted on. No unbounded
+        # loop; the attempt ceiling comes from CLOUDFLARE_MAX_ATTEMPTS, each attempt
+        # is wall-clock bounded, and at most one refresh is issued per navigation.
+        refresh_callable = None
+        if refresh_enabled and hasattr(driver, "reload"):
+            refresh_callable = driver.reload
 
-            if post_wait_seconds:
-                time.sleep(post_wait_seconds)
-
-            if not is_cloudflare_challenge(driver):
-                self.logger.info("Cloudflare challenge cleared after auto-solve attempt %s.", attempt)
-                return
+        attempt_solve_cloudflare_in_session(
+            driver,
+            target_url=target_url,
+            logger=self.logger,
+            service_label="carmudi",
+            max_attempts=max_attempts,
+            post_wait_seconds=post_wait_seconds,
+            attempt_timeout_seconds=attempt_timeout_seconds,
+            refresh=refresh_callable,
+            refresh_wait_seconds=refresh_wait_seconds,
+            refresh_timeout_seconds=refresh_timeout_seconds,
+        )
 
     def _navigate_botasaurus(self, driver, url: str, cfg) -> None:
         try:

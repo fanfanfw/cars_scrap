@@ -121,6 +121,472 @@ def test_carmudi_challenge_classification():
     assert classify_carmudi_listing_failure(exc) == "cloudflare_challenge"
 
 
+# CARMUDI-CF-02: detector must recognize the real Carmudi interstitial signals
+# (title-only, hidden cf-turnstile-response control, "Performing security
+# verification") and keep the legacy signals (offline, no browser/network/DB).
+def test_carmudi_cf02_detector_signals():
+    from cars_scrap_common.botasaurus_utils import (
+        _detect_cloudflare_signals,
+        cloudflare_signals_from_facts,
+        is_cloudflare_challenge,
+    )
+
+    # title-only challenge (no iframe, no body token)
+    title_only = _ExceptionOnlyDriver()
+    title_only.page_html = "<html><head><title>Just a moment...</title></head><body></body></html>"
+    assert is_cloudflare_challenge(title_only) is True
+    assert "title:just a moment" in _detect_cloudflare_signals(title_only)
+
+    # hidden cf-turnstile-response control only (the live Carmudi shape: no iframe)
+    control_only = _ExceptionOnlyDriver()
+    control_only.page_html = (
+        '<html><body><div style="display: grid;">'
+        '<input type="hidden" name="cf-turnstile-response" id="cf-chl-widget-x_response">'
+        "</div></body></html>"
+    )
+    assert is_cloudflare_challenge(control_only) is True
+    assert "control:cf-turnstile-response" in _detect_cloudflare_signals(control_only)
+
+    # new body copy
+    new_copy = _ExceptionOnlyDriver()
+    new_copy.page_html = "<html><body><h2>Performing security verification</h2></body></html>"
+    assert is_cloudflare_challenge(new_copy) is True
+    assert "text:performing security verification" in _detect_cloudflare_signals(new_copy)
+
+    # legacy signals retained: "Verify you are human" + Turnstile iframe
+    legacy = _ExceptionOnlyDriver()
+    legacy.page_html = (
+        f"<html><body><span>Verify you are human</span><{TURNSTILE_SNIPPET}></iframe></body></html>"
+    )
+    assert is_cloudflare_challenge(legacy) is True
+    assert "text:verify you are human" in _detect_cloudflare_signals(legacy)
+    assert "iframe:turnstile" in _detect_cloudflare_signals(legacy)
+
+    # normal page must never be flagged
+    normal = _ExceptionOnlyDriver()
+    normal.page_html = "<html><head><title>Toyota Avanza 2019</title></head><body>Rp 180.000.000</body></html>"
+    assert is_cloudflare_challenge(normal) is False
+    assert _detect_cloudflare_signals(normal) == ()
+
+    # the live DOM facts path (dict from run_js) yields the same labels
+    facts = cloudflare_signals_from_facts(
+        title="Just a moment...",
+        text="Performing security verification",
+        has_control=True,
+        has_iframe=False,
+    )
+    assert "title:just a moment" in facts
+    assert "text:performing security verification" in facts
+    assert "control:cf-turnstile-response" in facts
+    assert cloudflare_signals_from_facts() == ()
+
+
+def test_cf02_sanitizer_drops_url_secrets():
+    from cars_scrap_common.botasaurus_utils import sanitize_text_for_log, sanitize_url_for_log
+
+    dirty = "https://user:pass@www.carmudi.co.id/path?a=1&token=SECRET#frag"
+    clean = sanitize_url_for_log(dirty)
+    assert clean == "https://www.carmudi.co.id/path"
+    assert "SECRET" not in clean and "token" not in clean and "pass" not in clean
+    assert sanitize_url_for_log("") == ""
+    # malformed/out-of-range ports must not raise while building a log line,
+    # and must not leave the bogus port fragment in the output
+    for bad in ("https://host:notaport/p?x=1", "https://host:99999/p?x=1"):
+        safe = sanitize_url_for_log(bad)
+        assert "notaport" not in safe and "99999" not in safe, safe
+        assert "x=1" not in safe, safe
+    # embedded URLs inside error text are redacted too
+    redacted = sanitize_text_for_log("boom at https://x/y?secret=1 more")
+    assert "secret=1" not in redacted
+
+
+def test_cf02_bounded_solver_semantics():
+    import logging
+    import types
+    from cars_scrap_common.botasaurus_utils import attempt_solve_cloudflare_in_session
+
+    # driver whose page always looks challenged; we record solver invocations
+    class _ChallengedDriver:
+        current_url = "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia?token=SECRET"
+        page_html = "<html><head><title>Just a moment...</title></head><body></body></html>"
+
+        def __init__(self):
+            self.calls = 0
+
+        def run_js(self, *a, **k):
+            raise RuntimeError("offline fixture: no JS runtime")
+
+        def detect_and_bypass_cloudflare(self):
+            self.calls += 1
+
+    logger = logging.getLogger("cf02_test")
+    logger.addHandler(logging.NullHandler())
+
+    # never clears -> exactly max_attempts solver invocations, then False
+    driver = _ChallengedDriver()
+    sleep_calls: list[float] = []
+    resolved = attempt_solve_cloudflare_in_session(
+        driver,
+        target_url="https://www.carmudi.co.id/x?token=SECRET",
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=3,
+        post_wait_seconds=0.5,
+        sleeper=sleep_calls.append,
+    )
+    assert resolved is False
+    assert driver.calls == 3, driver.calls
+    assert sleep_calls == [0.5, 0.5, 0.5], sleep_calls
+
+    # a solver that clears the challenge on the first call returns True after 1
+    class _ClearingDriver(_ChallengedDriver):
+        challenged = True
+
+        @property
+        def page_html(self):
+            return (
+                "<html><head><title>Just a moment...</title></head><body></body></html>"
+                if self.challenged
+                else "<html><head><title>Carmudi</title></head><body>Rp 1</body></html>"
+            )
+
+    clearing = _ClearingDriver()
+    invocations: list[int] = []
+
+    def solve():
+        invocations.append(1)
+        clearing.challenged = False
+
+    assert attempt_solve_cloudflare_in_session(
+        clearing,
+        target_url="https://www.carmudi.co.id/x?token=SECRET",
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=3,
+        post_wait_seconds=0.0,
+        sleeper=sleep_calls.append,
+        solver=solve,
+    ) is True
+    assert len(invocations) == 1
+
+    # no-op when there is no challenge: solver never called (bounded, no loop)
+    clean = _ExceptionOnlyDriver()
+    clean.page_html = "<html><body>Rp 1.000.000</body></html>"
+    never = types.SimpleNamespace(calls=0)
+    assert attempt_solve_cloudflare_in_session(
+        clean,
+        target_url="https://www.carmudi.co.id/x",
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=5,
+        post_wait_seconds=0.0,
+        solver=lambda: setattr(never, "calls", never.calls + 1),
+        sleeper=sleep_calls.append,
+    ) is True
+    assert never.calls == 0
+
+
+def test_cf02_per_attempt_deadline():
+    """Offline proof that a per-attempt wall-clock deadline interrupts a blocking
+    solver, restores any prior SIGALRM handler/timer exactly, keeps attempt counts
+    exact, and leaks no alarm (no browser/network/DB)."""
+    import logging
+    import signal
+    import threading
+    import time as _time
+
+    from cars_scrap_common.botasaurus_utils import (
+        CloudflareSolveTimeoutError,
+        _arm_attempt_deadline,
+        attempt_solve_cloudflare_in_session,
+    )
+
+    # This test requires POSIX SIGALRM + main-thread execution (Linux runtime).
+    assert hasattr(signal, "SIGALRM"), "SIGALRM required for CARMUDI-CF-02 deadline test"
+    assert threading.current_thread() is threading.main_thread()
+
+    class _ChallengedDriver:
+        current_url = "https://www.carmudi.co.id/x?token=SECRET"
+        page_html = "<html><head><title>Just a moment...</title></head><body></body></html>"
+
+        def run_js(self, *a, **k):
+            raise RuntimeError("offline fixture: no JS runtime")
+
+    logger = logging.getLogger("cf02_deadline_test")
+    logger.addHandler(logging.NullHandler())
+
+    # (1) blocking solver is interrupted by the deadline; attempts stay exact.
+    calls: list[int] = []
+
+    def blocking_solver():
+        calls.append(1)
+        _time.sleep(30)  # would hang without the deadline; SIGALRM interrupts
+
+    started = _time.monotonic()
+    resolved = attempt_solve_cloudflare_in_session(
+        _ChallengedDriver(),
+        target_url="https://www.carmudi.co.id/x?token=SECRET",
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=2,
+        post_wait_seconds=0.0,
+        attempt_timeout_seconds=0.25,
+        sleeper=lambda _s: None,
+        solver=blocking_solver,
+    )
+    elapsed = _time.monotonic() - started
+    assert resolved is False
+    assert len(calls) == 2, calls  # interrupted twice, never a 3rd (no unbounded loop)
+    assert elapsed < 10, elapsed  # deadline actually fired (far below the 30s sleep)
+
+    # (2) timeout raises the dedicated exception type for callers that prefer it.
+    raised: list[str] = []
+    try:
+        with _arm_attempt_deadline(0.1) as armed:
+            assert armed is True
+            _time.sleep(5)
+    except CloudflareSolveTimeoutError:
+        raised.append("timeout")
+    assert raised == ["timeout"], raised
+
+    # (3) prior SIGALRM handler and timer are preserved and restored exactly.
+    def prior_handler(signum, frame):  # pragma: no cover - never invoked
+        pass
+
+    prior = signal.signal(signal.SIGALRM, prior_handler)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 20.0, 0.0)
+        with _arm_attempt_deadline(0.1) as armed:
+            assert armed is True
+            # our deadline replaced the timer while inside the scope
+            active_delay, _ = signal.getitimer(signal.ITIMER_REAL)
+            assert 0 < active_delay <= 0.1, active_delay
+        assert signal.getsignal(signal.SIGALRM) is prior_handler
+        restored_delay, restored_interval = signal.getitimer(signal.ITIMER_REAL)
+        assert restored_delay > 0, restored_delay  # prior 20s timer restored
+        assert restored_interval == 0.0, restored_interval
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, prior)
+
+    # (4) no alarm leaks when there was no prior timer.
+    with _arm_attempt_deadline(0.1) as armed:
+        assert armed is True
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    assert signal.getsignal(signal.SIGALRM) is prior
+
+    # (5) non-positive budget disables the deadline (no signal, no arm).
+    with _arm_attempt_deadline(0.0) as armed:
+        assert armed is False
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+    # (6) off-main-thread: no SIGALRM armed (signal.setitimer would raise there),
+    # and the context degrades to a harmless no-op instead of leaking a timer.
+    thread_armed: list[bool] = []
+
+    def _worker():
+        with _arm_attempt_deadline(0.1) as armed_:
+            thread_armed.append(armed_)
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join()
+    assert thread_armed == [False], thread_armed
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_cf04a_single_refresh_semantics():
+    """Offline proof for CARMUDI-CF-04A: exactly one same-session refresh when the
+    first bounded solver attempt is still challenged; zero when it clears or there
+    is no challenge; never a second refresh even if the challenge persists; and the
+    refresh call is deadline-bound with no alarm leak (no browser/network/DB)."""
+    import logging
+    import signal
+    import time as _time
+
+    from cars_scrap_common.botasaurus_utils import (
+        attempt_solve_cloudflare_in_session,
+    )
+
+    logger = logging.getLogger("cf04a_refresh_test")
+    logger.addHandler(logging.NullHandler())
+
+    class _Driver:
+        """page_html stays challenged unless `cleared` is set to True."""
+
+        def __init__(self):
+            self.cleared = False
+            self.refreshes = 0
+
+        @property
+        def page_html(self):
+            if self.cleared:
+                return "<html><head><title>Carmudi</title></head><body>Rp 1</body></html>"
+            return "<html><head><title>Just a moment...</title></head><body></body></html>"
+
+        @property
+        def current_url(self):
+            return "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia?token=SECRET"
+
+        def run_js(self, *a, **k):
+            raise RuntimeError("offline fixture: no JS runtime")
+
+        def reload(self):
+            self.refreshes += 1
+
+    target = "https://www.carmudi.co.id/mobil-bekas-dijual/indonesia?token=SECRET"
+
+    # (1) first attempt remains challenged -> exactly one refresh, then clears.
+    d = _Driver()
+    solver_calls: list[int] = []
+
+    def solver_then_clear():
+        solver_calls.append(1)
+
+    def refresh_then_clear():
+        d.refreshes += 1
+        d.cleared = True
+
+    result = attempt_solve_cloudflare_in_session(
+        d,
+        target_url=target,
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=3,
+        post_wait_seconds=0.0,
+        refresh=refresh_then_clear,
+        refresh_wait_seconds=0.0,
+        sleeper=lambda _s: None,
+        solver=solver_then_clear,
+    )
+    assert result is True
+    assert d.refreshes == 1, d.refreshes
+    assert len(solver_calls) == 1, solver_calls  # cleared after refresh, no more attempts
+
+    # (2) challenge persists -> exactly ONE refresh total (no refresh loop), and
+    # remaining solver attempts still run (bounded by max_attempts).
+    d2 = _Driver()
+    solver_calls2: list[int] = []
+
+    def persistent_solver():
+        solver_calls2.append(1)
+
+    def persistent_refresh():
+        d2.refreshes += 1
+
+    result2 = attempt_solve_cloudflare_in_session(
+        d2,
+        target_url=target,
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=3,
+        post_wait_seconds=0.0,
+        refresh=persistent_refresh,
+        refresh_wait_seconds=0.0,
+        sleeper=lambda _s: None,
+        solver=persistent_solver,
+    )
+    assert result2 is False
+    assert d2.refreshes == 1, d2.refreshes  # never a second refresh
+    assert len(solver_calls2) == 3, solver_calls2  # all bounded attempts ran
+
+    # (3) challenge clears on the first solver attempt -> zero refresh.
+    d3 = _Driver()
+    refresh_calls3: list[int] = []
+
+    def clearing_solver():
+        d3.cleared = True
+
+    result3 = attempt_solve_cloudflare_in_session(
+        d3,
+        target_url=target,
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=3,
+        post_wait_seconds=0.0,
+        refresh=lambda: refresh_calls3.append(1),
+        refresh_wait_seconds=0.0,
+        sleeper=lambda _s: None,
+        solver=clearing_solver,
+    )
+    assert result3 is True
+    assert refresh_calls3 == [], refresh_calls3
+
+    # (4) no challenge at all -> solver and refresh never invoked.
+    d4 = _Driver()
+    d4.cleared = True
+    refresh_calls4: list[int] = []
+    solver_calls4: list[int] = []
+    result4 = attempt_solve_cloudflare_in_session(
+        d4,
+        target_url=target,
+        logger=logger,
+        service_label="carmudi",
+        max_attempts=3,
+        post_wait_seconds=0.0,
+        refresh=lambda: refresh_calls4.append(1),
+        refresh_wait_seconds=0.0,
+        sleeper=lambda _s: None,
+        solver=lambda: solver_calls4.append(1),
+    )
+    assert result4 is True
+    assert refresh_calls4 == [] and solver_calls4 == []
+
+    # (5) refresh is deadline-bound: a blocking refresh is interrupted, the wrapper
+    # still returns (bounded) and leaves no alarm behind.
+    if hasattr(signal, "SIGALRM"):
+        d5 = _Driver()
+        blocking_refresh_calls: list[int] = []
+
+        def blocking_refresh():
+            blocking_refresh_calls.append(1)
+            _time.sleep(30)  # would hang without the refresh deadline
+
+        started = _time.monotonic()
+        result5 = attempt_solve_cloudflare_in_session(
+            d5,
+            target_url=target,
+            logger=logger,
+            service_label="carmudi",
+            max_attempts=2,
+            post_wait_seconds=0.0,
+            refresh=blocking_refresh,
+            refresh_wait_seconds=0.0,
+            refresh_timeout_seconds=0.25,
+            sleeper=lambda _s: None,
+            solver=lambda: None,
+        )
+        elapsed = _time.monotonic() - started
+        assert result5 is False
+        assert blocking_refresh_calls == [1], blocking_refresh_calls  # one refresh only
+        assert elapsed < 10, elapsed
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)  # no alarm leak
+
+    # (6) the "Incompatible browser extension or network configuration" body copy
+    # is a named signal, but ordinary listing copy is not a false positive.
+    from cars_scrap_common.botasaurus_utils import (
+        _detect_cloudflare_signals,
+        is_cloudflare_challenge,
+    )
+
+    bad_cfg = _ExceptionOnlyDriver()
+    bad_cfg.page_html = (
+        "<html><body><h2>Performing security verification</h2>"
+        "<p>Incompatible browser extension or network configuration</p></body></html>"
+    )
+    assert is_cloudflare_challenge(bad_cfg) is True
+    assert "text:incompatible browser extension" in _detect_cloudflare_signals(bad_cfg)
+
+    normal = _ExceptionOnlyDriver()
+    normal.page_html = (
+        "<html><head><title>Toyota Avanza 2019</title></head>"
+        "<body>Rp 180.000.000 - browser extension included, network configuration normal</body>"
+        "</html>"
+    )
+    assert is_cloudflare_challenge(normal) is False
+    assert _detect_cloudflare_signals(normal) == ()
+
+
 def test_carlist_valid_anchors():
     svc = CarlistCarsService()
     hrefs = [
@@ -574,6 +1040,11 @@ def main() -> int:
         test_carlist_73_byte_upstream_error_classification,
         test_carlist_exhausted_empty_listing,
         test_carmudi_challenge_classification,
+        test_carmudi_cf02_detector_signals,
+        test_cf02_sanitizer_drops_url_secrets,
+        test_cf02_bounded_solver_semantics,
+        test_cf02_per_attempt_deadline,
+        test_cf04a_single_refresh_semantics,
         test_carlist_valid_anchors,
         test_carmudi_valid_anchors,
         test_carmudi_sold_markers_and_branch_contract,
