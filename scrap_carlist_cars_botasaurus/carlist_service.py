@@ -18,7 +18,7 @@ from cars_scrap_common.botasaurus_utils import (
     wait_for_xpath,
 )
 from cars_scrap_common.env_utils import env_bool
-from cars_scrap_common.logging_utils import setup_logger
+from cars_scrap_common.logging_utils import listing_log_service_name, setup_logger
 from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
 from cars_scrap_common.shared_base_service import SharedBaseService
 from scrap_carlist_cars_botasaurus.database import get_connection
@@ -75,8 +75,8 @@ def classify_listing_failure(message: object) -> str:
 
 
 class CarlistCarsService(SharedBaseService):
-    def __init__(self):
-        self.logger = setup_logger("scrape_carlist_cars")
+    def __init__(self, *, tracking: bool = False):
+        self.logger = setup_logger(listing_log_service_name("carlist", tracking))
         self.stop_flag = False
         self._logged_proxy_ip = False
         self._logged_listing_id_meta_mismatch = False

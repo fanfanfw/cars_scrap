@@ -93,7 +93,8 @@ def main() -> int:
     if args.profile:
         os.environ["BOTASAURUS_PROFILE"] = str(args.profile).strip()
 
-    scraper = CarsomeIdCarsService()
+    is_tracking = bool(args.track_last_scraped_older_than)
+    scraper = CarsomeIdCarsService(tracking=is_tracking)
     try:
         def compact_sample(items: list[dict], limit: int = 10) -> list[dict]:
             out: list[dict] = []
@@ -105,7 +106,7 @@ def main() -> int:
                 out.append(item)
             return out
 
-        if args.track_last_scraped_older_than:
+        if is_tracking:
             # CarsomeID has no ad date, so tracking is based only on last_scraped_at.
             if args.details:
                 raise ValueError("--details cannot be used with --track-last-scraped-older-than (tracking always scrapes details).")

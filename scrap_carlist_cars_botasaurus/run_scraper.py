@@ -81,7 +81,8 @@ def main() -> int:
     if args.profile:
         os.environ["BOTASAURUS_PROFILE"] = str(args.profile).strip()
 
-    scraper = CarlistCarsService()
+    is_tracking = bool(args.track_older_than)
+    scraper = CarlistCarsService(tracking=is_tracking)
     try:
         def summarize_results(results: list[dict] | None) -> dict:
             items = results or []
@@ -150,7 +151,7 @@ def main() -> int:
                 "skip_reasons": skip_reasons,
             }
 
-        if args.track_older_than:
+        if is_tracking:
             if args.details:
                 raise ValueError("--details cannot be used with --track-older-than (tracking always scrapes details).")
             if args.start_url:

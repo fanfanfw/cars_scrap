@@ -17,7 +17,7 @@ from cars_scrap_common.botasaurus_utils import (
     wait_for_xpath,
 )
 from cars_scrap_common.env_utils import env_bool
-from cars_scrap_common.logging_utils import setup_logger
+from cars_scrap_common.logging_utils import listing_log_service_name, setup_logger
 from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
 from scrap_mudahmy_cars_botasaurus.database import get_connection
 
@@ -46,8 +46,8 @@ CAR_SPECIFICATIONS_SECTION_SELECTOR = "section#ad_view_car_specifications"
 
 
 class MudahMyCarsService:
-    def __init__(self):
-        self.logger = setup_logger("scrape_mudahmy_cars")
+    def __init__(self, *, tracking: bool = False):
+        self.logger = setup_logger(listing_log_service_name("mudahmy", tracking))
         self.stop_flag = False
         self._logged_proxy_ip = False
         self.listing_url = os.getenv("MUDAHMY_CARS_LISTING_URL", "").strip()

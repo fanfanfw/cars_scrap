@@ -12,7 +12,7 @@ from psycopg2.extras import Json, execute_values
 
 from cars_scrap_common.botasaurus_utils import load_botasaurus_config, raise_if_cloudflare_challenge, wait_for_css
 from cars_scrap_common.env_utils import env_bool
-from cars_scrap_common.logging_utils import setup_logger
+from cars_scrap_common.logging_utils import listing_log_service_name, setup_logger
 from cars_scrap_common.proxy_utils import mask_proxy_url, probe_public_ip, reset_cached_proxy
 from cars_scrap_common.shared_base_service import SharedBaseService
 from scrap_olx_cars_botasaurus.database import get_connection
@@ -56,8 +56,8 @@ def olx_images_upsert_expression(*, tracking_mode: bool) -> str:
 
 
 class OlxCarsService(SharedBaseService):
-    def __init__(self):
-        self.logger = setup_logger("scrape_olx_cars")
+    def __init__(self, *, tracking: bool = False):
+        self.logger = setup_logger(listing_log_service_name("olx", tracking))
         self.stop_flag = False
         self._logged_proxy_ip = False
         self.listing_url = os.getenv("OLX_CARS_LISTING_URL", DEFAULT_LISTING_URL).strip()
