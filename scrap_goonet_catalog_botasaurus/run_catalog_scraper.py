@@ -3,7 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 
-from scrap_goonet_catalog_botasaurus.catalog_service import BASE_CATALOG_URL, GoonetCatalogService
+from scrap_goonet_catalog_botasaurus.catalog_service import (
+    BASE_CATALOG_URL,
+    SAMPLE_REFRESH_MAX_IDS,
+    GoonetCatalogService,
+    SampleRefreshRollbackError,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +29,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-specs", type=int, default=0, help="Max specs to process (0 = all)")
     parser.add_argument("--delay-seconds", type=float, default=0.0, help="Delay between requests in seconds")
     parser.add_argument("--dry-run", action="store_true", help="Print parsed data without DB writes")
+    # GNC-IMG-03: bounded sample-refresh of EXISTING specs only. Exactly 1..3
+    # explicit catalog_spec_id values must be named; there is no auto-select and
+    # no sync-all. The default is READ-ONLY; --apply gates any DB write and then
+    # requires a verified rollback snapshot first.
+    parser.add_argument(
+        "--refresh-sample-spec-id",
+        action="append",
+        default=None,
+        metavar="CATALOG_SPEC_ID",
+        help=f"Refresh media for one existing catalog spec id (repeat {1}-{SAMPLE_REFRESH_MAX_IDS} times)",
+    )
+    parser.add_argument("--apply", action="store_true", help="Actually write sample-refresh updates (default: read-only)")
+    parser.add_argument("--rollback-from", default=None, metavar="PATH", help="Restore rows from a sample-refresh snapshot artifact")
+    parser.add_argument(
+        "--rollback-apply",
+        action="store_true",
+        help="Actually perform the rollback restore (default: dry-run report)",
+    )
     return parser
 
 
@@ -41,6 +64,8 @@ def main() -> None:
         "detail_url" if args.detail_url else None,
         "model_url" if args.model_url else None,
         "make_url" if args.make_url else None,
+        "refresh_sample" if args.refresh_sample_spec_id else None,
+        "rollback" if args.rollback_from else None,
     ]
     modes = [mode for mode in modes if mode]
     if not modes:
@@ -48,8 +73,33 @@ def main() -> None:
         return
     if len(modes) > 1:
         parser.error("choose only one sync/debug mode")
+    if args.apply and modes[0] != "refresh_sample":
+        parser.error("--apply is only valid with --refresh-sample-spec-id")
+    if args.rollback_apply and modes[0] != "rollback":
+        parser.error("--rollback-apply is only valid with --rollback-from")
 
     service = GoonetCatalogService()
+    if modes[0] == "rollback":
+        try:
+            result = service.rollback_sample_refresh(args.rollback_from, apply=bool(args.rollback_apply))
+        except SampleRefreshRollbackError as exc:
+            # Fail closed: the transaction was rolled back and nothing restored.
+            parser.error(str(exc))
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return
+    if modes[0] == "refresh_sample":
+        try:
+            summary = service.refresh_sample_specs(
+                args.refresh_sample_spec_id,
+                apply=bool(args.apply),
+                delay_seconds=args.delay_seconds,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        return
     if args.resume or args.resume_run_id is not None:
         if args.dry_run:
             parser.error("--resume does not support --dry-run")

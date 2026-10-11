@@ -4,10 +4,13 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
+import tempfile
 import time
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,9 +20,94 @@ from cars_scrap_common.logging_utils import setup_logger
 
 BASE_CATALOG_URL = "https://www.goo-net-exchange.com/catalog/"
 
+# GNC-IMG-01: Goonet catalog galleries put the first photo inline as a base64
+# data URI in `.gallery-main` and only expose its URL via the matching
+# `.gallery-thumbs` entry (`/carphoto/thumb/<name>.jpg`). The non-thumb URL
+# (`/carphoto/<name>.jpg`) must be derived from a trusted source and
+# network-validated before it is persisted; base64, `/thumb/` URLs, arbitrary
+# hosts/schemes, and failed guesses are never stored.
+MEDIA_PROBE_BYTES = 65536
+IMAGE_CONTENT_TYPE_PREFIX = "image/"
+MEDIA_HOST = "catalogphoto.goo-net.com"
+MEDIA_PATH_PREFIX = "/carphoto/"
+MEDIA_THUMB_PREFIX = "/carphoto/thumb/"
+TRUSTED_MEDIA_HOSTS = ("catalogphoto.goo-net.com", "www.goo-net-exchange.com", "goo-net-exchange.com")
+ALLOWED_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif")
+# GNC-IMG-01 probe outcomes: a definitive verdict (valid/invalid) may be acted
+# on, while a transient one (429/5xx/timeout/connection error) must NOT be
+# persisted as empty media or it would erase prior media and mark the spec done.
+MEDIA_VALID = "valid"
+MEDIA_INVALID = "invalid"
+MEDIA_TRANSIENT = "transient"
+
+# GNC-IMG-03: bounded, operator-driven media sample refresh for a handful of
+# EXISTING catalog specs. There is deliberately no auto-selection, no sync-all
+# and no scheduling here: the caller must name 1..MAX explicit catalog_spec_id
+# values whose spec_url rows already exist in the DB. Source URLs always come
+# from the stored rows (never an arbitrary CLI URL), requests are serially
+# throttled, and any DB write additionally requires an explicit apply flag plus
+# a verified rollback snapshot of the exact pre-write rows.
+SAMPLE_REFRESH_MAX_IDS = 3
+SAMPLE_REFRESH_MIN_INTERVAL_SECONDS = 1.0
+SAMPLE_REFRESH_MEDIA_FIELDS = ("main_image", "thumbnails", "images")
+# A stored spec_url is only ever fetched when it is the exact canonical detail
+# URL for that catalog_spec_id on the trusted host: https, no userinfo, no
+# explicit port, no query, no fragment, exactly
+# /catalog/<MODEL_SLUG>/<id>/. This blocks SSRF / off-host or exotic URLs that
+# may have been injected into the DB by another writer.
+SPEC_REFRESH_ALLOWED_HOST = "www.goo-net-exchange.com"
+SPEC_REFRESH_PATH_RE = re.compile(r"^/catalog/(?P<model>[A-Za-z0-9_]+__[A-Za-z0-9_]+)/(?P<spec_id>\d+)/$")
+# Snapshot columns: every column the guard/merge/restore can rely on. The
+# restore writes back the full media-content subset (data/content_hash/timestamps/
+# status/spec_url) and verifies it round-trips; the immutable artifact itself
+# preserves ALL columns as the forensic record.
+SAMPLE_REFRESH_SNAPSHOT_COLUMNS = (
+    "id", "catalog_spec_id", "make_slug", "model_slug", "make_name", "model_name",
+    "variant_name", "release_month", "sale_title", "spec_url", "model_code", "engine",
+    "doors", "transmission", "drive", "dimension", "weight", "msrp", "data",
+    "raw_list_row", "content_hash", "first_seen_at", "last_seen_at", "last_changed_at", "status",
+)
+
 
 class CatalogInterrupted(KeyboardInterrupt):
     pass
+
+
+class SampleRefreshConflict(RuntimeError):
+    """A guarded sample-refresh write found a concurrent change.
+
+    Raised inside the single apply transaction so the WHOLE batch is rolled back
+    (no partial apply). This keeps the snapshot's ``applied_states`` accurate: a
+    batch either applies every changed row or none of them.
+    """
+
+    def __init__(self, catalog_spec_id: str) -> None:
+        super().__init__("concurrent change detected; sample refresh batch aborted")
+        self.catalog_spec_id = catalog_spec_id
+
+
+class SampleRefreshRollbackError(RuntimeError):
+    """A guarded rollback could not be applied to every candidate row.
+
+    Raised so the whole restore transaction is rolled back and NO row is restored
+    (fail closed), rather than committing a partial restore.
+    """
+
+
+class MediaUnresolved(RuntimeError):
+    """Gallery image resolution was indeterminate (429/5xx/timeout) or a derived
+    candidate could not be verified against the network.
+
+    Raised instead of yielding empty media so a per-spec run abstains: the
+    stored spec (and its previously populated media) is left untouched and the
+    run reports partial rather than success. A genuinely image-less page still
+    yields empty media normally. The message is a fixed string (never untrusted
+    page content); ``retryable`` marks a transient/indeterminate verdict.
+    """
+
+    def __init__(self, retryable: bool = False) -> None:
+        super().__init__("image validation pending retry" if retryable else "derived image could not be verified")
+        self.retryable = retryable
 
 
 class GoonetCatalogService:
@@ -321,15 +409,208 @@ class GoonetCatalogService:
         return rows
 
     def _parse_media(self, soup: BeautifulSoup, base_url: str) -> dict:
+        try:
+            return self._collect_media(soup, base_url)
+        except MediaUnresolved:
+            # Indeterminate validation: propagate so the caller abstains from
+            # writing (preserving any previously stored media and leaving a
+            # first-time spec pending) instead of overwriting with empty media.
+            raise
+        except Exception as exc:
+            # Unexpected parsing failure is fail-closed: abort this spec's media
+            # (do NOT return empty media, which would hash/upsert and erase any
+            # previously stored media). Log the exception type only; the message
+            # may embed huge/untrusted page content. A page with no gallery stays
+            # a definitive empty result inside _collect_media.
+            self.logger.warning("Media parse failed (%s); failing closed", type(exc).__name__)
+            raise MediaUnresolved(retryable=True) from exc
+
+    def _collect_media(self, soup: BeautifulSoup, base_url: str) -> dict:
+        slides = soup.select(".gallery-main img")
+        thumbs = soup.select(".gallery-thumbs img")
+        sources = slides
+        if not sources:
+            sources = soup.select(
+                "img[src*='carphoto'], img[data-src*='carphoto'], a[href*='carphoto'], "
+                "img[src*='catalogphoto'], img[data-src*='catalogphoto'], a[href*='catalogphoto']"
+            )
         images: list[str] = []
-        for image in soup.select(".gallery-main img, .gallery-thumbs img, img[src*='catalogphoto'], img[data-src*='catalogphoto'], a[href*='catalogphoto']"):
-            src = self.clean_text(image.get("src") or image.get("data-src") or image.get("href"))
-            if not src or src.startswith("data:"):
+        thumbnails: list[str] = []
+        unresolved_retryable = False
+        unresolved_terminal = False
+        for index, node in enumerate(sources):
+            thumb_node = thumbs[index] if sources is slides and index < len(thumbs) else None
+            thumb_url = self._absolute_media_url(thumb_node, base_url)
+            if thumb_url and self._is_thumb_url(thumb_url) and thumb_url not in thumbnails:
+                thumbnails.append(thumb_url)
+            src_url = self._absolute_media_url(node, base_url)
+            if src_url and not self._is_thumb_url(src_url):
+                # The slide itself carries a direct src.
+                if self._is_trusted_direct_url(src_url):
+                    if src_url not in images:
+                        images.append(src_url)
+                else:
+                    # Existing slide with an untrusted/nonconforming direct src
+                    # cannot yield a usable image: fail closed rather than drop
+                    # it and store empty media over previously stored images.
+                    unresolved_terminal = True
                 continue
-            url = self.absolute_url(src, base_url)
-            if url not in images:
-                images.append(url)
-        return {"main_image": images[0] if images else None, "thumbnails": images[1:], "images": images}
+            # The slide's real URL is hidden as base64 (or as its own /thumb/
+            # URL). Derive the non-thumb URL from a trusted thumb source. Only a
+            # definitive VALID probe is stored; a derivable candidate that could
+            # not be validated (404, 429, timeout, bad/unknown bytes) means the
+            # gallery could not be established, so abstain rather than store
+            # empty media (which would erase prior media and mark it complete).
+            candidate = self._thumb_to_nonthumb(thumb_url or src_url)
+            if candidate is None:
+                # Existing slide (base64/absent src) with a missing or malformed
+                # thumbnail cannot be resolved: fail closed, never empty.
+                unresolved_terminal = True
+                continue
+            if candidate in images:
+                # Duplicate of an already-stored image: harmless, never fail.
+                continue
+            verdict = self.probe_image_url(candidate)
+            if verdict == MEDIA_VALID:
+                images.append(candidate)
+            elif verdict == MEDIA_TRANSIENT:
+                unresolved_retryable = True
+            else:
+                unresolved_terminal = True
+        if unresolved_retryable or unresolved_terminal:
+            raise MediaUnresolved(retryable=unresolved_retryable)
+        return {"main_image": images[0] if images else None, "thumbnails": thumbnails, "images": images}
+
+    def _absolute_media_url(self, node, base_url: str) -> str | None:
+        src = self._media_src(node)
+        return self.absolute_url(src, base_url) if src else None
+
+    def _media_src(self, node) -> str | None:
+        if node is None:
+            return None
+        src = self.clean_text(node.get("src") or node.get("data-src") or node.get("href"))
+        if not src or src.lower().startswith("data:"):
+            return None
+        return src
+
+    def _safe_media_parts(self, url: str | None, host: str | None = None):
+        """Return parsed URL parts only for a safe https image URL, else None.
+
+        Rejects non-https schemes, unexpected hosts, userinfo, explicit ports,
+        and fragments. ``host`` restricts to a single exact host when given.
+        """
+        try:
+            parts = urlparse(url or "")
+            allowed = {host} if host else set(TRUSTED_MEDIA_HOSTS)
+            if parts.scheme != "https" or parts.hostname not in allowed:
+                return None
+            if parts.username or parts.password or parts.port or parts.fragment:
+                return None
+        except ValueError:
+            return None
+        return parts
+
+    def _allowed_image_suffix(self, path: str) -> bool:
+        return path.lower().endswith(ALLOWED_IMAGE_SUFFIXES)
+
+    def _is_thumb_url(self, url: str | None) -> bool:
+        parts = self._safe_media_parts(url)
+        return bool(parts) and parts.path.startswith(MEDIA_THUMB_PREFIX)
+
+    def _is_trusted_direct_url(self, url: str | None) -> bool:
+        parts = self._safe_media_parts(url)
+        if parts is None or parts.path.startswith(MEDIA_THUMB_PREFIX):
+            return False
+        return parts.path.startswith(MEDIA_PATH_PREFIX) and self._allowed_image_suffix(parts.path)
+
+    def _thumb_to_nonthumb(self, url: str | None) -> str | None:
+        """Derive `/carphoto/<name>.jpg` from a trusted `/carphoto/thumb/` URL."""
+        parts = self._safe_media_parts(url, host=MEDIA_HOST)
+        if parts is None or not parts.path.startswith(MEDIA_THUMB_PREFIX):
+            return None
+        name = parts.path[len(MEDIA_THUMB_PREFIX):]
+        if not name or "/" in name or not self._allowed_image_suffix(name):
+            return None
+        return urlunparse(parts._replace(path=MEDIA_PATH_PREFIX + name))
+
+    def validate_image_url(self, url: str | None) -> bool:
+        """Boolean view: True only on a definitive valid image (see probe)."""
+        return self.probe_image_url(url) == MEDIA_VALID
+
+    def probe_image_url(self, url: str | None) -> str:
+        """Classify a candidate non-thumb URL as valid / invalid / transient.
+
+        Bounded, non-redirected probe (https + exact host + `/carphoto/` +
+        image suffix). ``MEDIA_VALID`` requires HTTP 2xx, ``image/*`` content
+        type, and recognizable JPEG/PNG/GIF dimensions > 0. Definitive
+        negative answers (bad URL/shape, redirect, 4xx, wrong type, unknown
+        format) are ``MEDIA_INVALID``; 429/5xx and network errors (timeout,
+        connection) are ``MEDIA_TRANSIENT`` so callers can abstain instead of
+        persisting empty media."""
+        parts = self._safe_media_parts(url, host=MEDIA_HOST)
+        if parts is None or not parts.path.startswith(MEDIA_PATH_PREFIX):
+            return MEDIA_INVALID
+        if parts.path.startswith(MEDIA_THUMB_PREFIX) or not self._allowed_image_suffix(parts.path):
+            return MEDIA_INVALID
+        timeout = float(os.getenv("GOONET_CATALOG_TIMEOUT_SECONDS") or 15)
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+        try:
+            with requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=False) as response:
+                status = response.status_code
+                if status == 429 or status >= 500:
+                    return MEDIA_TRANSIENT
+                if not 200 <= status < 300:
+                    return MEDIA_INVALID
+                content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if not content_type.startswith(IMAGE_CONTENT_TYPE_PREFIX):
+                    return MEDIA_INVALID
+                data = b""
+                for chunk in response.iter_content(chunk_size=8192):
+                    data += chunk
+                    if len(data) >= MEDIA_PROBE_BYTES:
+                        break
+                if not data:
+                    return MEDIA_INVALID
+                dimensions = self._image_dimensions(data)
+                if bool(dimensions) and dimensions[0] > 0 and dimensions[1] > 0:
+                    return MEDIA_VALID
+                return MEDIA_INVALID
+        except requests.RequestException as exc:
+            self.logger.warning("Image validation transient for %s (%s)", url, type(exc).__name__)
+            return MEDIA_TRANSIENT
+
+    def _image_dimensions(self, data: bytes) -> tuple[int, int] | None:
+        try:
+            if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+                return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+            if data[:3] == b"GIF" and len(data) >= 10:
+                return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+            if data[:2] == b"\xff\xd8":
+                return self._jpeg_dimensions(data)
+        except (IndexError, ValueError):
+            return None
+        return None
+
+    def _jpeg_dimensions(self, data: bytes) -> tuple[int, int] | None:
+        index = 2
+        sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                index += 2
+                continue
+            if marker == 0xD9:
+                return None
+            segment_length = int.from_bytes(data[index + 2:index + 4], "big")
+            if segment_length < 2:
+                return None
+            if marker in sof_markers:
+                return int.from_bytes(data[index + 7:index + 9], "big"), int.from_bytes(data[index + 5:index + 7], "big")
+            index += 2 + segment_length
+        return None
 
     def upsert_makes(self, rows: list[dict], run_id: int | None = None) -> int:
         if not rows:
@@ -592,7 +873,7 @@ class GoonetCatalogService:
 
     def sync_pending_spec_details(self, max_specs: int = 0, delay_seconds: float | None = None) -> dict:
         pending = self.get_pending_spec_details(max_specs)
-        summary = {"status": "running", "pending": len(pending), "spec_details": 0, "details_changed": 0, "errors": []}
+        summary = {"status": "running", "pending": len(pending), "spec_details": 0, "details_changed": 0, "media_unresolved": 0, "errors": []}
         delay = self._catalog_delay(delay_seconds)
         for spec_index, spec in enumerate(pending, start=1):
             self.logger.info("Processing pending spec detail %s/%s: %s", spec_index, len(pending), spec.get("spec_url"))
@@ -603,11 +884,592 @@ class GoonetCatalogService:
                 summary["spec_details"] += 1
             except Exception as exc:
                 self.logger.warning("Failed to sync pending spec detail %s: %s", spec.get("spec_url"), exc)
-                self._record_sync_error(summary, "spec_details", spec.get("spec_url"), exc)
+                self._record_spec_detail_error(summary, "spec_details", spec.get("spec_url"), exc)
             self._sleep_between_requests(delay)
         summary["status"] = "success" if not summary["errors"] else "partial"
         self.logger.info("Finished pending spec detail sync summary=%s", json.dumps(summary, ensure_ascii=False))
         return summary
+
+    # ------------------------------------------------------------------
+    # GNC-IMG-03: bounded sample media refresh for existing catalog specs.
+    # ------------------------------------------------------------------
+    def _normalize_refresh_ids(self, catalog_spec_ids) -> list[str]:
+        """Return a de-duplicated, order-preserving list of 1..MAX explicit ids.
+
+        Rejects empty input, more than ``SAMPLE_REFRESH_MAX_IDS`` entries and any
+        non-numeric id. This is the single choke point that guarantees the tool
+        can never widen into a bulk/auto-selected scrape.
+        """
+        raw = list(catalog_spec_ids or [])
+        # Bound the RAW argument length BEFORE de-duplication so a caller cannot
+        # smuggle a bulk list past the cap by repeating ids (e.g. 4 copies of one
+        # id must be rejected, not collapsed to a single accepted id).
+        if len(raw) > SAMPLE_REFRESH_MAX_IDS:
+            raise ValueError(
+                f"at most {SAMPLE_REFRESH_MAX_IDS} catalog_spec_id values may be supplied "
+                f"(got {len(raw)})"
+            )
+        normalized: list[str] = []
+        for value in raw:
+            text = str(value).strip()
+            if not text:
+                raise ValueError("catalog_spec_id must be a non-empty integer string")
+            if not re.fullmatch(r"\d+", text):
+                raise ValueError(f"catalog_spec_id must be numeric: {text!r}")
+            if text not in normalized:
+                normalized.append(text)
+        if not normalized:
+            raise ValueError("at least one explicit catalog_spec_id is required")
+        return normalized
+
+    def _load_spec_rows(self, catalog_spec_ids: list[str]) -> dict[str, dict]:
+        """Fetch the exact stored rows (all snapshot columns) for the requested ids.
+
+        ``spec_url`` is the ONLY source of the page to fetch; an operator cannot
+        inject an arbitrary URL, and the URL is separately validated against the
+        exact canonical detail-URL shape before any request is made.
+        """
+        from psycopg2.extras import RealDictCursor
+
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        conn = get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                columns = ", ".join(SAMPLE_REFRESH_SNAPSHOT_COLUMNS)
+                cursor.execute(
+                    f"SELECT {columns} FROM cars_scrap_goonet_catalog_specs WHERE catalog_spec_id = ANY(%s)",
+                    (list(catalog_spec_ids),),
+                )
+                return {str(row["catalog_spec_id"]): dict(row) for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def _validated_spec_url(self, spec_url: str | None, catalog_spec_id: str) -> str | None:
+        """Return the stored URL only if it is the exact canonical detail URL.
+
+        Enforced shape: ``https://www.goo-net-exchange.com/catalog/<MODEL__SLUG>/<id>/``
+        with no userinfo, no explicit port, no query, no fragment and exactly one
+        model path segment. Anything else (off-host, http, port, query, fragment,
+        path traversal, id mismatch) is rejected so a poisoned DB row cannot turn
+        this tool into an SSRF primitive.
+        """
+        try:
+            parts = urlparse(str(spec_url or ""))
+        except ValueError:
+            return None
+        if parts.scheme != "https" or parts.hostname != SPEC_REFRESH_ALLOWED_HOST:
+            return None
+        if parts.username or parts.password or parts.port or parts.query or parts.fragment:
+            return None
+        match = SPEC_REFRESH_PATH_RE.match(parts.path)
+        if not match or match.group("spec_id") != str(catalog_spec_id):
+            return None
+        return f"https://{SPEC_REFRESH_ALLOWED_HOST}{parts.path}"
+
+    def _snapshot_dir(self) -> Path:
+        return Path.home() / ".local" / "state" / "cars_scrap_goonet_catalog_sample_refresh"
+
+    def _ensure_secure_dir(self, directory: Path) -> None:
+        """Create ``directory`` as a real dir (never through a symlink), mode 0700."""
+        if directory.exists() and directory.is_symlink():
+            raise RuntimeError(f"refusing to use symlinked snapshot directory: {directory}")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if directory.is_symlink():
+            raise RuntimeError(f"refusing to use symlinked snapshot directory: {directory}")
+        try:
+            os.chmod(directory, 0o700)
+        except OSError as exc:  # noqa: BLE001 - chmod failure must fail closed
+            raise RuntimeError(f"could not set snapshot directory mode 0700: {exc}") from exc
+
+    @staticmethod
+    def _json_default(value):
+        if isinstance(value, (datetime,)):
+            return value.isoformat()
+        return str(value)
+
+    def _json_normalize(self, value):
+        """Round-trip a value through JSON so on-disk and in-memory forms match."""
+        return json.loads(json.dumps(value, default=self._json_default, ensure_ascii=False))
+
+    @staticmethod
+    def _canonical_timestamp(value) -> str | None:
+        """Canonical UTC ISO-8601 for a datetime or ISO string, else None.
+
+        Used for the rollback post-state guard so a DB-returned ``timestamptz``
+        (datetime) and the artifact's stored ISO string compare on equal terms
+        regardless of timezone rendering or sub-second formatting.
+        """
+        if value is None:
+            return None
+        try:
+            if isinstance(value, str):
+                moment = datetime.fromisoformat(value)
+            elif isinstance(value, datetime):
+                moment = value
+            else:
+                return None
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.astimezone(timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            return None
+
+    def _write_rollback_backup(
+        self,
+        rows: list[dict],
+        *,
+        applied_states: dict[str, dict] | None = None,
+        created_at: str | None = None,
+    ) -> str:
+        """Persist an immutable, integrity-checked rollback artifact of pre-write rows.
+
+        The file lives OUTSIDE the repository in a real (never symlinked)
+        directory with mode 0700, is created with mode 0600, written atomically
+        (``O_EXCL`` temp in the same dir + ``os.replace``) and then re-read and
+        validated (artifact tag, unique ids, per-row post-write state) before the
+        path is returned. Any failure raises so the caller fails closed BEFORE
+        writing. The artifact is the immortal forensic record: it is never
+        modified or deleted by this tool.
+        """
+        if not rows:
+            raise RuntimeError("refusing to write an empty rollback snapshot")
+        applied_states = applied_states or {}
+        normalized_rows = self._json_normalize(rows)
+        expected_post = self._json_normalize(applied_states)
+        payload = {
+            "artifact": "gnc-img-03-sample-refresh-snapshot",
+            "version": 1,
+            "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+            "columns": list(SAMPLE_REFRESH_SNAPSHOT_COLUMNS),
+            "rows": normalized_rows,
+            "applied_states": expected_post,
+        }
+        ids = [str(row.get("catalog_spec_id")) for row in normalized_rows]
+        if len(set(ids)) != len(ids):
+            raise RuntimeError("snapshot rows contain duplicate catalog_spec_id values")
+        snapshot_dir = self._snapshot_dir()
+        self._ensure_secure_dir(snapshot_dir)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        final_path = snapshot_dir / f"sample_refresh_{stamp}_{secrets.token_hex(6)}.json"
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=".sample_refresh_", suffix=".tmp", dir=str(snapshot_dir))
+        try:
+            os.fchmod(tmp_fd, 0o600)
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False, default=self._json_default)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, str(final_path))
+            os.chmod(final_path, 0o600)
+        except Exception:
+            try:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        # Fail closed unless the artifact on disk is readable, complete and matches
+        # the exact rows/expected post-state we are about to write.
+        try:
+            with open(final_path, "r", encoding="utf-8") as handle:
+                written = json.load(handle)
+        except Exception as exc:  # noqa: BLE001 - any failure means no safe rollback
+            raise RuntimeError(f"rollback snapshot could not be verified: {type(exc).__name__}") from exc
+        if (
+            written.get("artifact") != payload["artifact"]
+            or written.get("columns") != list(SAMPLE_REFRESH_SNAPSHOT_COLUMNS)
+            or written.get("rows") != normalized_rows
+            or written.get("applied_states") != expected_post
+        ):
+            raise RuntimeError("rollback snapshot verification mismatch")
+        return str(final_path)
+
+    def _load_backup(self, backup_path: str) -> dict:
+        """Load and integrity-check a snapshot artifact; returns the full payload."""
+        path = Path(str(backup_path))
+        if path.is_symlink():
+            raise ValueError("refusing to load a symlinked snapshot artifact")
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("artifact") != "gnc-img-03-sample-refresh-snapshot":
+            raise ValueError("not a GNC-IMG-03 sample refresh snapshot artifact")
+        rows = payload.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("snapshot artifact contains no rows")
+        ids = [str(row.get("catalog_spec_id")) for row in rows]
+        if any(not re.fullmatch(r"\d+", i) for i in ids):
+            raise ValueError("snapshot artifact contains a non-numeric catalog_spec_id")
+        if len(set(ids)) != len(ids):
+            raise ValueError("snapshot artifact contains duplicate catalog_spec_id values")
+        applied_states = payload.get("applied_states")
+        if not isinstance(applied_states, dict):
+            raise ValueError("snapshot artifact is missing per-row applied state")
+        # Every applied row MUST carry the concrete post-write content_hash and
+        # timestamp that the rollback guard compares against. Without them the
+        # guard could compare against None and clobber a row whose live values are
+        # NULL, so a malformed/tampered artifact is rejected outright.
+        for spec_id, state in applied_states.items():
+            if not re.fullmatch(r"\d+", str(spec_id)):
+                raise ValueError("snapshot artifact has a non-numeric applied row id")
+            if not isinstance(state, dict) or not isinstance(state.get("content_hash"), str) or not state["content_hash"]:
+                raise ValueError("snapshot artifact applied row is missing its post-write content_hash")
+            if self._canonical_timestamp(state.get("last_changed_at")) is None:
+                raise ValueError("snapshot artifact applied row is missing a valid post-write last_changed_at")
+        return payload
+
+    def _merge_media_only(self, stored_data: dict, fresh_data: dict) -> dict:
+        """Return ``stored_data`` with ONLY the media block replaced.
+
+        Non-media fields (general_specification, specifications, identity and any
+        other key already stored) are preserved byte-for-byte; a media subset that
+        is missing from ``fresh_data`` is rejected so a partial parse cannot erase
+        stored media.
+        """
+        if not isinstance(stored_data, dict):
+            stored_data = {}
+        media = fresh_data.get("media") if isinstance(fresh_data, dict) else None
+        if not isinstance(media, dict):
+            raise MediaUnresolved(retryable=False)
+        for field in SAMPLE_REFRESH_MEDIA_FIELDS:
+            if field not in media:
+                raise MediaUnresolved(retryable=False)
+        merged = dict(stored_data)
+        merged["media"] = {field: media.get(field) for field in SAMPLE_REFRESH_MEDIA_FIELDS}
+        return merged
+
+    def _current_identity_guard(self, stored: dict) -> dict:
+        """The compare-and-set identity asserted at write time (optimistic guard)."""
+        return {
+            "content_hash": stored.get("content_hash"),
+            "last_changed_at": stored.get("last_changed_at"),
+            "spec_url": stored.get("spec_url"),
+        }
+
+    def refresh_sample_specs(
+        self,
+        catalog_spec_ids,
+        *,
+        apply: bool = False,
+        delay_seconds: float | None = None,
+        min_interval_seconds: float = SAMPLE_REFRESH_MIN_INTERVAL_SECONDS,
+        sleep_func=None,
+    ) -> dict:
+        """Bounded media-only refresh for existing specs; read-only unless apply.
+
+        * ``catalog_spec_ids`` must name 1..3 explicit existing ids (raw argument
+          length is capped before de-duplication).
+        * The page URL is read from the stored row's ``spec_url`` only, and only
+          after it validates as the exact canonical https detail URL for that id.
+        * With ``apply=False`` (default) nothing is written: the plan is returned.
+        * With ``apply=True`` a verified immutable snapshot of the exact pre-write
+          rows is required first; any snapshot failure aborts BEFORE any write.
+        * A spec whose media is unchanged does ZERO writes (no last_seen_at bump).
+        * The changed rows are written in ONE guarded transaction (content_hash +
+          last_changed_at + spec_url). A concurrent change on any row aborts the
+          whole batch: NO row is written, so the snapshot's candidate set always
+          equals the applied set (never a partial apply).
+        * MediaUnresolved / 429 / 404 / any per-spec error leaves the row
+          untouched and is reported; no bulk marks, run rows or missing flips.
+        """
+        ids = self._normalize_refresh_ids(catalog_spec_ids)
+        min_interval = max(float(min_interval_seconds), 0.0)
+        delay_from_cli = 0.0 if delay_seconds is None else float(delay_seconds)
+        throttle = max(delay_from_cli, min_interval)
+        sleeper = sleep_func or time.sleep
+
+        stored_rows = self._load_spec_rows(ids)
+        summary: dict = {
+            "mode": "apply" if apply else "dry_run",
+            "applied": bool(apply),
+            "requested": ids,
+            "found": [spec_id for spec_id in ids if spec_id in stored_rows],
+            "missing": [spec_id for spec_id in ids if spec_id not in stored_rows],
+            "refreshed": 0,
+            "changed": 0,
+            "unchanged": 0,
+            "errors": [],
+            "results": [],
+            "snapshot_path": None,
+        }
+
+        plans: list[dict] = []
+        for index, spec_id in enumerate(ids):
+            stored = stored_rows.get(spec_id)
+            if stored is None:
+                summary["results"].append({"catalog_spec_id": spec_id, "status": "missing"})
+                continue
+            spec_url = self._validated_spec_url(stored.get("spec_url"), spec_id)
+            if spec_url is None:
+                summary["results"].append({"catalog_spec_id": spec_id, "status": "rejected_url"})
+                self._record_sync_error(
+                    summary, "refresh", None,
+                    ValueError("stored spec_url is not the canonical detail URL for this id"),
+                )
+                continue
+            # Throttle between distinct network fetches (not before the first).
+            if index > 0:
+                sleeper(throttle)
+            try:
+                fresh = self.parse_spec_detail(self.fetch_html(spec_url), dict(stored))
+                merged = self._merge_media_only(stored.get("data") or {}, fresh)
+            except MediaUnresolved as exc:
+                summary["results"].append({"catalog_spec_id": spec_id, "status": "media_unresolved"})
+                self._record_spec_detail_error(summary, "refresh", spec_url, exc)
+                continue
+            except Exception as exc:  # noqa: BLE001 - per-spec isolation
+                summary["results"].append({"catalog_spec_id": spec_id, "status": "error"})
+                # Untrusted page content / request detail must never reach the
+                # error record: log the exception TYPE only.
+                self._record_sync_error(
+                    summary, "refresh", spec_url,
+                    RuntimeError(f"refresh failed ({type(exc).__name__})"),
+                )
+                continue
+            new_hash = self.stable_spec_detail_hash(merged)
+            changed = new_hash != stored.get("content_hash")
+            plan = {
+                "catalog_spec_id": spec_id,
+                "spec_url": spec_url,
+                "stored": stored,
+                "merged": merged,
+                "new_hash": new_hash,
+                "changed": changed,
+            }
+            plans.append(plan)
+            summary["results"].append(
+                {
+                    "catalog_spec_id": spec_id,
+                    "status": "planned",
+                    "changed": changed,
+                    # Dry-run may echo the resolved media; apply never logs URLs.
+                    "media": merged.get("media") if not apply else None,
+                }
+            )
+
+        if not apply:
+            summary["planned"] = len(plans)
+            summary["planned_changed"] = sum(1 for plan in plans if plan["changed"])
+            summary["status"] = "ok" if not summary["errors"] else "partial"
+            return summary
+
+        # ---- apply path: snapshot exact pre-write rows, then one atomic write ----
+        written_plans = [plan for plan in plans if plan["changed"]]
+        write_timestamp = datetime.now(timezone.utc)
+        if written_plans:
+            # ``applied_states`` names EXACTLY the rows this batch will write. The
+            # batch runs as a single transaction that aborts on any guard failure,
+            # so on success the applied set equals this candidate set and on
+            # failure NOTHING is applied (never a partial/ambiguous apply). That is
+            # what keeps the snapshot's recorded ids accurate without rewriting it.
+            applied_states = {
+                plan["catalog_spec_id"]: {
+                    "content_hash": plan["new_hash"],
+                    "last_changed_at": write_timestamp.isoformat(),
+                }
+                for plan in written_plans
+            }
+            summary["snapshot_path"] = self._write_rollback_backup(
+                [dict(plan["stored"]) for plan in written_plans],
+                applied_states=applied_states,
+            )
+        results_by_id = {item.get("catalog_spec_id"): item for item in summary["results"]}
+        for plan in plans:
+            if plan["changed"]:
+                continue
+            # Media identical to stored: make ZERO writes, not even last_seen_at.
+            summary["unchanged"] += 1
+            item = results_by_id.get(plan["catalog_spec_id"])
+            if item is not None:
+                item["status"] = "unchanged"
+                item["applied"] = "unchanged"
+        if written_plans:
+            try:
+                written = self._apply_sample_refresh_batch(written_plans, write_timestamp)
+            except SampleRefreshConflict as exc:
+                # The single transaction aborted: NO row in the batch was written.
+                item = results_by_id.get(exc.catalog_spec_id)
+                if item is not None:
+                    item["status"] = "conflict"
+                # Nothing was applied, so there is nothing to roll back; the
+                # pre-write artifact is still retained on disk as a forensic record.
+                summary["snapshot_path"] = None
+                self._record_sync_error(
+                    summary, "refresh_conflict", None,
+                    RuntimeError("concurrent change detected; batch aborted, no rows written"),
+                )
+            except Exception as exc:  # noqa: BLE001 - a half-applied batch must be impossible
+                summary["snapshot_path"] = None
+                self._record_sync_error(
+                    summary, "refresh", None,
+                    RuntimeError(f"refresh batch failed ({type(exc).__name__}); no rows written"),
+                )
+            else:
+                for spec_id in written:
+                    item = results_by_id.get(spec_id)
+                    if item is not None:
+                        item["applied"] = "changed"
+                summary["changed"] = len(written)
+                summary["refreshed"] = len(written)
+        applied = summary["changed"] + summary["unchanged"] + len(summary["errors"])
+        summary["status"] = "partial" if summary["errors"] else ("success" if applied else "ok")
+        return summary
+
+    def _apply_sample_refresh_batch(self, plans: list[dict], write_timestamp: datetime) -> list[str]:
+        """Apply every guarded media write in ONE all-or-nothing transaction.
+
+        Returns the ids actually written (equal to ``plans`` on success). If any
+        row is missing or fails the optimistic guard (content_hash +
+        last_changed_at + spec_url) a ``SampleRefreshConflict`` is raised, which
+        rolls the ENTIRE batch back: no row is partially applied, so the
+        snapshot's recorded candidate set stays exactly equal to the applied set.
+        ``write_timestamp`` is written verbatim (not ``NOW()``) so the rollback
+        guard can compare it deterministically.
+        """
+        from psycopg2.extras import Json
+
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        written: list[str] = []
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    for plan in plans:
+                        spec_id = plan["catalog_spec_id"]
+                        expected = self._current_identity_guard(plan["stored"])
+                        cursor.execute(
+                            """SELECT content_hash, last_changed_at, spec_url
+                               FROM cars_scrap_goonet_catalog_specs
+                               WHERE catalog_spec_id = %s FOR UPDATE""",
+                            (spec_id,),
+                        )
+                        current = cursor.fetchone()
+                        if current is None:
+                            raise SampleRefreshConflict(spec_id)
+                        current_hash, current_changed, current_url = current[0], current[1], current[2]
+                        if (
+                            current_hash != expected["content_hash"]
+                            or current_url != expected["spec_url"]
+                            or current_changed != expected["last_changed_at"]
+                        ):
+                            # A concurrent writer changed this row since the read;
+                            # abort the whole batch rather than write a subset.
+                            raise SampleRefreshConflict(spec_id)
+                        # Guard passed and plan is "changed", so stored hash !=
+                        # new_hash; this row is always written here.
+                        cursor.execute(
+                            """UPDATE cars_scrap_goonet_catalog_specs
+                               SET data = %(data)s,
+                                   content_hash = %(content_hash)s,
+                                   last_changed_at = %(last_changed_at)s,
+                                   last_seen_at = NOW(),
+                                   status = 'active'
+                               WHERE catalog_spec_id = %(catalog_spec_id)s""",
+                            {
+                                "data": Json(plan["merged"]),
+                                "content_hash": plan["new_hash"],
+                                "last_changed_at": write_timestamp,
+                                "catalog_spec_id": spec_id,
+                            },
+                        )
+                        written.append(spec_id)
+        finally:
+            conn.close()
+        return written
+
+    def rollback_sample_refresh(self, snapshot_path: str, *, apply: bool = False) -> dict:
+        """Guarded, all-or-nothing restore of the pre-write rows from a snapshot.
+
+        Read-only unless ``apply=True``. Every candidate row recorded in the
+        snapshot is checked under ``FOR UPDATE`` against its post-write
+        ``content_hash`` + ``last_changed_at``. If ANY candidate is missing or no
+        longer matches (a concurrent edit), the WHOLE restore is aborted: the
+        transaction is rolled back and ``SampleRefreshRollbackError`` is raised,
+        so no row is partially restored. On success every candidate is restored
+        in one transaction. Because the apply path is itself all-or-nothing, the
+        snapshot's candidate set is exactly the set of rows that were applied.
+        """
+        payload = self._load_backup(snapshot_path)
+        rows_by_id = {str(row["catalog_spec_id"]): row for row in payload["rows"]}
+        applied_states = payload["applied_states"]
+        if not isinstance(applied_states, dict) or not applied_states:
+            raise ValueError("snapshot artifact has no applied rows to restore")
+
+        plan = {
+            "mode": "rollback_apply" if apply else "rollback_dry_run",
+            "applied": bool(apply),
+            "snapshot_path": str(snapshot_path),
+            "candidates": sorted(applied_states),
+            "restored": 0,
+        }
+        if not apply:
+            plan["status"] = "ok"
+            return plan
+
+        from psycopg2.extras import Json
+
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        conn = get_connection()
+        try:
+            with conn:  # one transaction: any failure rolls the WHOLE batch back
+                with conn.cursor() as cursor:
+                    for spec_id in sorted(applied_states):
+                        row = rows_by_id.get(spec_id)
+                        expected_post = applied_states.get(spec_id) or {}
+                        if row is None:
+                            # A candidate not present in the snapshot's own rows is
+                            # corrupt/ambiguous -> never restore a partial batch.
+                            raise SampleRefreshRollbackError(
+                                f"rollback aborted: snapshot row missing for {spec_id}"
+                            )
+                        cursor.execute(
+                            "SELECT content_hash, last_changed_at FROM cars_scrap_goonet_catalog_specs WHERE catalog_spec_id = %s FOR UPDATE",
+                            (spec_id,),
+                        )
+                        current = cursor.fetchone()
+                        if current is None:
+                            raise SampleRefreshRollbackError(
+                                f"rollback aborted: target row missing for {spec_id}"
+                            )
+                        current_hash = current[0]
+                        current_changed = self._canonical_timestamp(current[1])
+                        if (
+                            current_hash != expected_post.get("content_hash")
+                            or current_changed != self._canonical_timestamp(expected_post.get("last_changed_at"))
+                        ):
+                            # Someone else changed the row after our refresh (or the
+                            # artifact does not describe our write): fail closed and
+                            # never clobber; the whole restore is aborted.
+                            raise SampleRefreshRollbackError(
+                                f"rollback aborted: concurrent change on {spec_id}"
+                            )
+                        cursor.execute(
+                            """UPDATE cars_scrap_goonet_catalog_specs
+                               SET data = %(data)s,
+                                   content_hash = %(content_hash)s,
+                                   first_seen_at = %(first_seen_at)s,
+                                   last_seen_at = %(last_seen_at)s,
+                                   last_changed_at = %(last_changed_at)s,
+                                   status = %(status)s,
+                                   spec_url = %(spec_url)s
+                               WHERE catalog_spec_id = %(catalog_spec_id)s""",
+                            {
+                                "data": Json(row.get("data") or {}),
+                                "content_hash": row.get("content_hash"),
+                                "first_seen_at": row.get("first_seen_at"),
+                                "last_seen_at": row.get("last_seen_at"),
+                                "last_changed_at": row.get("last_changed_at"),
+                                "status": row.get("status"),
+                                "spec_url": row.get("spec_url"),
+                                "catalog_spec_id": spec_id,
+                            },
+                        )
+                        plan["restored"] += cursor.rowcount
+        finally:
+            conn.close()
+        plan["status"] = "success"
+        return plan
 
     def mark_missing_makes(self, run_started_at) -> int:
         return self._mark_missing("cars_scrap_goonet_catalog_makes", run_started_at)
@@ -711,11 +1573,31 @@ class GoonetCatalogService:
     def _completed_spec_ids(self, model_slug: str) -> set[str]:
         from scrap_goonet_cars_botasaurus.database import get_connection
 
+        # GNC-IMG-12B: a stored spec whose data.media.images still carries a
+        # `/thumb/` URL is NOT considered complete, even when data/content_hash
+        # are otherwise complete (main_image already a non-thumb). sync_all then
+        # re-visits it so the GNC-IMG-01 resolver can replace those thumb URLs
+        # with validated non-thumb originals. The jsonb_typeof CASE guard keeps
+        # jsonb_array_elements_text from raising on a malformed (non-array)
+        # media.images: such rows have no `images` array, so they carry no thumb
+        # and are treated exactly like the previous "no thumbs" complete rows.
         conn = get_connection()
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT catalog_spec_id FROM cars_scrap_goonet_catalog_specs WHERE model_slug=%s AND data <> '{}'::jsonb AND content_hash IS NOT NULL",
+                    """SELECT catalog_spec_id FROM cars_scrap_goonet_catalog_specs
+                       WHERE model_slug=%s
+                         AND data <> '{}'::jsonb
+                         AND content_hash IS NOT NULL
+                         AND NOT EXISTS (
+                           SELECT 1
+                           FROM jsonb_array_elements_text(
+                             CASE WHEN jsonb_typeof(data->'media'->'images') = 'array'
+                                  THEN data->'media'->'images'
+                                  ELSE '[]'::jsonb END
+                           ) AS img(url)
+                           WHERE strpos(img.url, '/thumb/') > 0
+                         )""",
                     (model_slug,),
                 )
                 return {row[0] for row in cursor.fetchall()}
@@ -745,6 +1627,21 @@ class GoonetCatalogService:
     def _record_sync_error(self, summary: dict, stage: str, url: str | None, error: Exception) -> None:
         summary["errors"].append({"stage": stage, "url": url, "error": str(error)})
 
+    def _record_spec_detail_error(self, summary: dict, stage: str, url: str | None, error: Exception) -> None:
+        """Record a per-spec failure, distinguishing indeterminate media.
+
+        ``MediaUnresolved`` means image resolution could not be established, so
+        the spec was intentionally NOT written (its previously stored media is
+        preserved and a first-time spec stays pending). It is reported under a
+        distinct ``*_media`` stage with a sanitized message; the run stays
+        ``partial`` rather than ``success`` so the monthly contract sees it.
+        """
+        if isinstance(error, MediaUnresolved):
+            summary["media_unresolved"] = summary.get("media_unresolved", 0) + 1
+            self._record_sync_error(summary, f"{stage}_media", url, error)
+        else:
+            self._record_sync_error(summary, stage, url, error)
+
     def _backfill_pending(self, summary: dict, run_id: int, max_specs: int, delay: float, attempted: set[str]) -> None:
         pending = self.get_pending_spec_details()
         self.logger.info("Pending detail backfill run_id=%s count=%s attempted=%s budget=%s", run_id, len(pending), len(attempted), max_specs or "unlimited")
@@ -764,7 +1661,7 @@ class GoonetCatalogService:
                 summary["spec_details"] += 1
             except Exception as exc:
                 self.logger.warning("Failed pending detail %s: %s", spec.get("spec_url"), exc)
-                self._record_sync_error(summary, "pending_details", spec.get("spec_url"), exc)
+                self._record_spec_detail_error(summary, "pending_details", spec.get("spec_url"), exc)
             self._sleep_between_requests(delay)
 
     def resume(self, run_id: int | None = None, **limits) -> dict:
@@ -788,7 +1685,7 @@ class GoonetCatalogService:
         summary = {"run_id": None, "resumed_from_run_id": resume_from and resume_from["id"], "status": "running", "makes": 0,
                    "models": 0, "spec_summaries": 0, "spec_details": 0, "detail_attempts": 0, "details_changed": 0,
                    "details_skipped": 0, "pending_details": 0, "missing_makes": 0, "missing_models": 0,
-                   "missing_specs": 0, "errors": []}
+                   "missing_specs": 0, "media_unresolved": 0, "errors": []}
         run_id = None
         lock_conn = None
         previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -895,7 +1792,7 @@ class GoonetCatalogService:
                                 summary["details_changed"] += 1
                             summary["spec_details"] += 1
                         except Exception as exc:
-                            self._record_sync_error(summary, "spec_details", spec.get("spec_url"), exc)
+                            self._record_spec_detail_error(summary, "spec_details", spec.get("spec_url"), exc)
                             self.logger.warning("Failed spec detail %s: %s", spec.get("spec_url"), exc)
                         self._sleep_between_requests(delay)
                     if model_complete:
