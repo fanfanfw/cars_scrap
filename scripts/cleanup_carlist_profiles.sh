@@ -10,6 +10,7 @@ PROFILES_DIR="${PROFILES_DIR:-${REPO_ROOT}/profiles}"
 dry_run="false"
 force="false"
 prefix_override=""
+older_than_days=""
 
 read_env_value() {
   local key="$1"
@@ -32,10 +33,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix)
       if [[ $# -lt 2 ]]; then
-        echo "Usage: $0 [--prefix PREFIX] [--dry-run] [--force]" >&2
+        echo "Usage: $0 [--prefix PREFIX] [--older-than-days DAYS] [--dry-run] [--force]" >&2
         exit 1
       fi
       prefix_override="$2"
+      shift 2
+      ;;
+    --older-than-days)
+      if [[ $# -lt 2 ]]; then
+        echo "Usage: $0 [--prefix PREFIX] [--older-than-days DAYS] [--dry-run] [--force]" >&2
+        exit 1
+      fi
+      older_than_days="$2"
       shift 2
       ;;
     --dry-run)
@@ -48,11 +57,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown argument: $1" >&2
-      echo "Usage: $0 [--prefix PREFIX] [--dry-run] [--force]" >&2
+      echo "Usage: $0 [--prefix PREFIX] [--older-than-days DAYS] [--dry-run] [--force]" >&2
       exit 1
       ;;
   esac
 done
+
+if [[ -n "${older_than_days}" ]]; then
+  if [[ ! "${older_than_days}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid --older-than-days value: '${older_than_days}' (expected a non-negative integer)" >&2
+    exit 1
+  fi
+fi
 
 cleanup_prefix="${prefix_override}"
 if [[ -z "${cleanup_prefix}" ]]; then
@@ -84,6 +100,27 @@ for path in "${matches[@]}"; do
     existing+=("${path}")
   fi
 done
+
+if [[ -n "${older_than_days}" ]]; then
+  cutoff_epoch=$(( $(date +%s) - older_than_days * 86400 ))
+  aged=()
+  for path in "${existing[@]}"; do
+    # Symlinks are never eligible (protect linked targets).
+    if [[ -L "${path}" ]]; then
+      continue
+    fi
+    mtime_epoch="$(stat -c %Y -- "${path}" 2>/dev/null || true)"
+    if [[ -z "${mtime_epoch}" ]]; then
+      continue
+    fi
+    # Strictly older than DAYS*24h: exact N days and newer are retained.
+    if [[ "${mtime_epoch}" -lt "${cutoff_epoch}" ]]; then
+      aged+=("${path}")
+    fi
+  done
+  existing=("${aged[@]}")
+  echo "Retaining directories newer than or equal to ${older_than_days} day(s); ${#existing[@]} eligible to remove."
+fi
 
 if [[ ${#existing[@]} -eq 0 ]]; then
   echo "No profiles matched prefix '${cleanup_prefix}' in ${PROFILES_DIR}"
