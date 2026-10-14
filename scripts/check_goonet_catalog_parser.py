@@ -562,9 +562,38 @@ class _FakeCursor:
         normalized = " ".join(statement.split()).lower()
         self._result = None
         self.rowcount = 0
+        if normalized.startswith("select") and "for update" in normalized and "status, data" in normalized:
+            # GNC-FULL-03E-2a: the proven-gallery apply locks status + data too so
+            # it can assert the row is still active and media-empty at write time.
+            row = self._table.get(params[0])
+            self._result = None if row is None else (
+                row["content_hash"], row["last_changed_at"], row["spec_url"], row["status"], row["data"],
+            )
+            return
+        if normalized.startswith("select") and "for update" in normalized and "content_hash, last_changed_at, spec_url, status" in normalized:
+            # GNC-DETAIL-01: the detail write locks the row's identity + status +
+            # model_slug so it can assert the row is unchanged at write time
+            # (status/model_slug are read but never written).
+            row = self._table.get(params[0])
+            self._result = None if row is None else (
+                row["content_hash"], row["last_changed_at"], row["spec_url"], row["status"], row["model_slug"],
+            )
+            return
         if normalized.startswith("select") and "for update" in normalized and "content_hash, last_changed_at, spec_url" in normalized:
             row = self._table.get(params[0])
             self._result = None if row is None else (row["content_hash"], row["last_changed_at"], row["spec_url"])
+            return
+        if normalized.startswith("update cars_scrap_goonet_catalog_specs set content_hash = %(content_hash)s"):
+            # GNC-DETAIL-01 guarded single-row detail write. It deliberately OMITS
+            # BOTH `status` and `last_seen_at`, so both must survive verbatim.
+            spec_id = params["catalog_spec_id"]
+            row = self._table.get(spec_id)
+            if row is None:
+                return
+            row["data"] = self._unwrap(params["data"])
+            row["content_hash"] = params["content_hash"]
+            row["last_changed_at"] = params["last_changed_at"]
+            self.rowcount = 1
             return
         if normalized.startswith("select") and "for update" in normalized and normalized.startswith("select content_hash, last_changed_at from"):
             row = self._table.get(params[0])
@@ -1248,6 +1277,574 @@ def test_refresh_throttles_between_requests(service: GoonetCatalogService) -> No
     assert sleeps == [2.5, 2.5], sleeps
 
 
+# ---------------------------------------------------------------------------
+# GNC-FULL-03E-2a offline deterministic checks: the OPT-IN proven-gallery apply
+# gate. A real inventory snapshot + checkpoint (written by the real runner into a
+# temp state dir) is the only thing that can arm the gate; every adversarial case
+# must refuse the write. No network, no real DB (fake connection above).
+# ---------------------------------------------------------------------------
+
+_PROVEN_ID = "10163593"
+_NOGALLERY_ID = "10163594"
+
+
+def _proven_page(spec_id: str, *, declared: str | None = None, gallery: bool = True) -> str:
+    declared = spec_id if declared is None else declared
+    head = ""
+    if declared:
+        head = f"<link rel='canonical' href='https://www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/{declared}/'>"
+    body = "<div class='detail-right'><h1 class='name-car'>TOYOTA ALPHARD Z</h1></div>"
+    if gallery:
+        body += (
+            "<div class='gallery-main'><img src='data:image/jpeg;base64,AAAA'></div>"
+            f"<div class='gallery-thumbs'><img src='{THUMB}'></div>"
+        )
+    return f"<html><head>{head}<title>DETAIL</title></head><body>{body}</body></html>"
+
+
+def _empty_media_row(spec_id: str):
+    """A stored row whose data block exists but has NO media (inventory candidate)."""
+    return _stored_row(
+        spec_id,
+        content_hash="hash-empty",
+        data={"identity": {"catalog_spec_id": spec_id}, "general_specification": {"Model": "KEEP-ME"}},
+    )
+
+
+def _write_inventory(state_dir: Path, entries) -> None:
+    """Write a REAL inventory snapshot + checkpoint for ``(id, category)`` entries."""
+    from scrap_goonet_catalog_botasaurus.image_inventory import ImageInventoryRunner
+
+    runner = ImageInventoryRunner(state_dir=state_dir)
+    runner._write_snapshot(
+        [{"catalog_spec_id": spec_id, "spec_url": _stored_row(spec_id)["spec_url"]} for spec_id, _ in entries]
+    )
+    for spec_id, category in entries:
+        runner._append_checkpoint(
+            {"catalog_spec_id": spec_id, "category": category, "reason": "test", "images_count": 1}
+        )
+
+
+def _run_gated(service, table, executed, html, state_dir, *, ids, probe_ok=True):
+    """Run a proven-gallery apply against the fake DB with the gate armed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with _patch_refresh_env(service, table, executed, html, probe_ok=probe_ok, tmp_root=tmp):
+            with unittest.mock.patch.object(service, "_inventory_state_dir", lambda: Path(state_dir)):
+                return service.refresh_sample_specs(
+                    ids, apply=True, sleep_func=lambda *_: None, min_interval_seconds=0.0,
+                    require_proven_gallery=True,
+                )
+
+
+def test_refresh_proven_gallery_gate_adversarial(service: GoonetCatalogService) -> None:
+    """The OPT-IN gate writes ONLY a proven, active, still-empty gallery row."""
+    from scrap_goonet_catalog_botasaurus.image_inventory import CATEGORY_GALLERY, CATEGORY_NO_GALLERY
+
+    # (1) HAPPY PATH: proven gallery + active empty row + strongly self-declaring
+    # page + proven embedded thumb => media-only, non-thumb write.
+    table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+    executed: list = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_PROVEN_ID), state, ids=[_PROVEN_ID])
+    assert summary["status"] == "success", summary
+    assert summary["changed"] == 1 and summary["rejected"] == [], summary
+    updated = table[_PROVEN_ID]
+    assert updated["data"]["media"]["images"] == [NONTHUMB], updated["data"]["media"]
+    assert not any("/thumb/" in url for url in updated["data"]["media"]["images"])
+    # Media-only: the unrelated stored field survives byte-for-byte.
+    assert updated["data"]["general_specification"] == {"Model": "KEEP-ME"}
+    assert summary["results"][0]["media"] is None  # apply never echoes media
+
+    # (2) SOURCE CHANGED TO NO-GALLERY: the row is proven, but the current page now
+    # resolves empty media. The gate must refuse (this is the exact hole the gate
+    # exists for), leaving the row untouched.
+    table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+    executed: list = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_PROVEN_ID, gallery=False), state, ids=[_PROVEN_ID])
+    assert summary["status"] == "partial", summary
+    assert summary["changed"] == 0 and _writes(executed) == [], (summary, _writes(executed))
+    assert summary["rejected"] == [{"catalog_spec_id": _PROVEN_ID, "status": "media_empty"}], summary
+    assert table[_PROVEN_ID]["data"] == _empty_media_row(_PROVEN_ID)["data"]
+
+    # (2b) A direct (non-embedded) or thumb-only "gallery" is never proven.
+    direct = f"<div class='gallery-main'><img src='{NONTHUMB}'></div><div class='gallery-thumbs'><img src='{THUMB}'></div>"
+    table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_PROVEN_ID, gallery=False).replace(
+            "</body>", direct + "</body>"), state, ids=[_PROVEN_ID])
+    assert _writes(executed) == [], (summary, _writes(executed))
+    assert summary["rejected"][0]["status"] in ("gallery_unproven", "media_empty"), summary
+
+    # (3) NO-GALLERY ID (checkpointed confirmed_no_gallery): never written even
+    # with a gallery page now.
+    table = {_NOGALLERY_ID: _empty_media_row(_NOGALLERY_ID)}
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY), (_NOGALLERY_ID, CATEGORY_NO_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_NOGALLERY_ID), state, ids=[_NOGALLERY_ID])
+    assert _writes(executed) == [], (summary, _writes(executed))
+    assert summary["rejected"] == [{"catalog_spec_id": _NOGALLERY_ID, "status": "not_proven_gallery"}], summary
+
+    # (3b) An id NOT in the inventory snapshot at all is refused.
+    table = {"10163599": _empty_media_row("10163599")}
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page("10163599"), state, ids=["10163599"])
+    assert _writes(executed) == [] and summary["rejected"][0]["status"] == "not_proven_gallery", summary
+
+    # (4) WRONG PAGE: the proven id now serves a distinctly-different spec's page.
+    table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_PROVEN_ID, declared="99999999"), state, ids=[_PROVEN_ID])
+    assert _writes(executed) == [], (summary, _writes(executed))
+    assert summary["rejected"] == [{"catalog_spec_id": _PROVEN_ID, "status": "page_identity_mismatch"}], summary
+    # (4b) An id-less page is equally unproven.
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_PROVEN_ID, declared=""), state, ids=[_PROVEN_ID])
+    assert _writes(executed) == [] and summary["rejected"][0]["status"].startswith("page_identity"), summary
+
+    # (5) STALE RAW: the row already regained media between inventory and apply.
+    table = {_PROVEN_ID: _stored_row(_PROVEN_ID, content_hash="hash-media", data=_clean_media_data(_PROVEN_ID))}
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_PROVEN_ID), state, ids=[_PROVEN_ID])
+    assert _writes(executed) == [], (summary, _writes(executed))
+    assert summary["rejected"] == [{"catalog_spec_id": _PROVEN_ID, "status": "media_not_empty"}], summary
+
+    # (5b) STALE RAW: the row is no longer active.
+    table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+    table[_PROVEN_ID]["status"] = "missing"
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        summary = _run_gated(service, table, executed, _proven_page(_PROVEN_ID), state, ids=[_PROVEN_ID])
+    assert _writes(executed) == [] and summary["rejected"][0]["status"] == "row_not_active", summary
+
+    # (5c) MISSING/POISONED inventory state fails the WHOLE invocation closed
+    # before any row read or request.
+    table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+    executed = []
+    with tempfile.TemporaryDirectory() as state:
+        try:
+            _run_gated(service, table, executed, _proven_page(_PROVEN_ID), state, ids=[_PROVEN_ID])
+        except catalog_service.ProvenGalleryRejected as exc:
+            assert exc.status.startswith("inventory_snapshot_invalid"), exc.status
+        else:
+            raise AssertionError("a missing inventory snapshot must fail closed")
+    assert executed == [] and _writes(executed) == [], executed
+    with tempfile.TemporaryDirectory() as state:
+        _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+        snap = Path(state) / "snapshot.json"
+        payload = json.loads(snap.read_text())
+        payload["rows"].append({"catalog_spec_id": "10000004", "spec_url": _stored_row("10000004")["spec_url"]})
+        snap.write_text(json.dumps(payload))  # digest no longer matches
+        try:
+            _run_gated(service, table, executed, _proven_page(_PROVEN_ID), state, ids=[_PROVEN_ID])
+        except catalog_service.ProvenGalleryRejected as exc:
+            assert exc.status.startswith("inventory_snapshot_invalid"), exc.status
+        else:
+            raise AssertionError("a tampered inventory snapshot must fail closed")
+
+    # (6) CONCURRENCY: the row flips status/empty-media after the read, under lock.
+    for mutate, label in (
+        (lambda row: row.update({"status": "missing"}), "row_not_active_at_write"),
+        (lambda row: row.update({"data": _clean_media_data(_PROVEN_ID)}), "media_not_empty_at_write"),
+    ):
+        table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+        executed = []
+        real_batch = service._apply_sample_refresh_batch
+
+        def racing(plans, write_timestamp, *, require_active_empty_media=False):
+            mutate(table[_PROVEN_ID])
+            return real_batch(plans, write_timestamp, require_active_empty_media=require_active_empty_media)
+
+        with tempfile.TemporaryDirectory() as state:
+            _write_inventory(Path(state), [(_PROVEN_ID, CATEGORY_GALLERY)])
+            with _patch_refresh_env(service, table, executed, _proven_page(_PROVEN_ID), tmp_root=state):
+                with unittest.mock.patch.object(service, "_inventory_state_dir", lambda: Path(state)):
+                    with unittest.mock.patch.object(service, "_apply_sample_refresh_batch", racing):
+                        summary = service.refresh_sample_specs(
+                            [_PROVEN_ID], apply=True, sleep_func=lambda *_: None,
+                            min_interval_seconds=0.0, require_proven_gallery=True,
+                        )
+        assert summary["status"] == "partial" and summary["changed"] == 0, (label, summary)
+        assert any(e["stage"] == "refresh_conflict" for e in summary["errors"]), (label, summary)
+
+    # (7) DEFAULT (gate unset) is byte-for-byte unchanged: the same changed row is
+    # written with no inventory state present at all.
+    table = {_PROVEN_ID: _empty_media_row(_PROVEN_ID)}
+    executed = []
+    with tempfile.TemporaryDirectory() as tmp:
+        with _patch_refresh_env(service, table, executed, _proven_page(_PROVEN_ID), tmp_root=tmp):
+            summary = service.refresh_sample_specs([_PROVEN_ID], apply=True, sleep_func=lambda *_: None)
+    assert summary["changed"] == 1 and summary["rejected"] == [], summary
+    assert summary["require_proven_gallery"] is False, summary
+
+
+
+# ---------------------------------------------------------------------------
+# GNC-DETAIL-01 offline deterministic checks: the OPT-IN `--detail-url`
+# write. `fetch_html`/`parse_spec_detail` are faked and the DB is the fake
+# in-memory connection above, so no network/DB write occurs. Every claim the
+# contract makes is asserted from real call logs: default read-only, explicit
+# write, canonical URL + strong page identity required, existing `missing` row
+# stays `missing`, no insert for an unknown id, pre-write snapshot + optimistic
+# guard, and no broader status alteration.
+# ---------------------------------------------------------------------------
+
+_DETAIL_ID = "10163593"
+
+
+def _detail_identity_page(spec_id: str, *, declared: str | None = None, slug: str = "TOYOTA__ALPHARD") -> str:
+    """A page that self-declares its canonical URL (strong identity)."""
+    declared = spec_id if declared is None else declared
+    head = ""
+    if declared:
+        head = f"<link rel='canonical' href='https://www.goo-net-exchange.com/catalog/{slug}/{declared}/'>"
+    return (
+        f"<html><head>{head}<title>DETAIL</title></head><body>"
+        "<div class='detail-right'><span class='type-car'>TOYOTA</span>"
+        "<h1 class='name-car'>TOYOTA ALPHARD Z</h1></div>"
+        "<div class='general-box'><p><strong>Model</strong><span>3BA-AGH40W</span></p></div>"
+        "<div class='gallery-main'><img src='data:image/jpeg;base64,AAAA'></div>"
+        f"<div class='gallery-thumbs'><img src='{THUMB}'></div>"
+        "</body></html>"
+    )
+
+
+def _detail_url(spec_id: str, slug: str = "TOYOTA__ALPHARD") -> str:
+    return f"https://www.goo-net-exchange.com/catalog/{slug}/{spec_id}/"
+
+
+def _run_detail_write(service, table, executed, html, *, url, apply, tmp_root, probe_ok=True):
+    with _patch_refresh_env(service, table, executed, html, probe_ok=probe_ok, tmp_root=tmp_root):
+        return service.write_detail_url(url, apply=apply)
+
+
+def test_detail_url_default_is_read_only(service: GoonetCatalogService) -> None:
+    """Without apply, NO write happens and NO snapshot is produced."""
+    table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=_detail_url(_DETAIL_ID))}
+    executed: list = []
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = _run_detail_write(
+            service, table, executed, _detail_identity_page(_DETAIL_ID),
+            url=_detail_url(_DETAIL_ID), apply=False, tmp_root=tmp,
+        )
+        snapshot_files = list(Path(tmp).iterdir())
+    assert _writes(executed) == [], _writes(executed)
+    assert summary["mode"] == "dry_run" and summary["applied"] is False
+    assert summary["result"] == "planned" and summary["changed"] == 1
+    assert summary["snapshot_path"] is None and snapshot_files == [], snapshot_files
+    assert table[_DETAIL_ID]["data"]["media"]["main_image"] == "old.jpg"
+
+
+def test_detail_url_rejects_non_canonical_url(service: GoonetCatalogService) -> None:
+    """A non-canonical / off-shape URL is refused BEFORE any DB read or request."""
+    table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=_detail_url(_DETAIL_ID))}
+    bad_urls = [
+        "https://evil.example.com/catalog/TOYOTA__ALPHARD/10163593/",   # untrusted host
+        "http://www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/10163593/",  # non-https
+        "https://www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/10163593/?x=1",  # query
+        "https://www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/10163593/#f",  # fragment
+        "https://user:pw@www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/10163593/",  # userinfo
+        "https://www.goo-net-exchange.com/catalog/TOYOTA__ALPHARD/",  # no id
+    ]
+    for url in bad_urls:
+        executed: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                _run_detail_write(service, table, executed, _detail_identity_page(_DETAIL_ID), url=url, apply=True, tmp_root=tmp)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"expected ValueError for {url!r}")
+        assert executed == [], (url, executed)
+
+
+def test_detail_url_write_preserves_missing_status(service: GoonetCatalogService) -> None:
+    """The CORE invariant: an existing `missing` row stays `missing` after a write."""
+    table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=_detail_url(_DETAIL_ID))}
+    table[_DETAIL_ID]["status"] = "missing"
+    original_last_seen = table[_DETAIL_ID]["last_seen_at"]
+    executed: list = []
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = _run_detail_write(
+            service, table, executed, _detail_identity_page(_DETAIL_ID),
+            url=_detail_url(_DETAIL_ID), apply=True, tmp_root=tmp,
+        )
+        snap = json.loads(Path(summary["snapshot_path"]).read_text())
+        snap_mode = oct(Path(summary["snapshot_path"]).stat().st_mode & 0o777)
+    assert summary["result"] == "changed" and summary["changed"] == 1, summary
+    assert summary["status_preserved"] == "missing", summary
+    assert table[_DETAIL_ID]["status"] == "missing", "detail write must NOT flip missing -> active"
+    # The UPDATE names neither `status` NOR `last_seen_at`.
+    updates = [s for s, _ in executed if s.strip().lower().startswith("update ")]
+    assert updates and all("status" not in s.lower().split("set", 1)[1] for s in updates), updates
+    assert all("last_seen_at" not in s.lower().split("set", 1)[1] for s in updates), updates
+    # Listing membership timestamp is IDENTITY, never advanced by a detail write.
+    assert table[_DETAIL_ID]["last_seen_at"] == original_last_seen, "last_seen_at must be untouched"
+    # Data was refreshed (media + non-media), snapshot records pre + post state.
+    assert table[_DETAIL_ID]["data"]["media"]["main_image"] == NONTHUMB
+    assert table[_DETAIL_ID]["content_hash"] != "hash-old"
+    assert snap["artifact"] == "gnc-img-03-sample-refresh-snapshot"
+    assert snap["rows"][0]["status"] == "missing"
+    assert snap["applied_states"][_DETAIL_ID]["content_hash"] == table[_DETAIL_ID]["content_hash"]
+    assert snap_mode == "0o600", snap_mode
+
+
+def test_detail_url_missing_row_not_inserted(service: GoonetCatalogService) -> None:
+    """An unknown id is reported missing; NEVER inserted and NO request sent."""
+    table: dict = {}
+    executed: list = []
+    fetched: list = []
+
+    def fake_fetch(url):
+        fetched.append(url)
+        return _detail_identity_page(_DETAIL_ID)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with _patch_refresh_env(service, table, executed, _detail_identity_page(_DETAIL_ID), tmp_root=tmp):
+            with unittest.mock.patch.object(service, "fetch_html", fake_fetch):
+                summary = service.write_detail_url(_detail_url(_DETAIL_ID), apply=True)
+    assert summary["result"] == "missing", summary
+    assert summary["snapshot_path"] is None
+    assert fetched == [], "a missing row must not trigger a network fetch"
+    assert _writes(executed) == [], _writes(executed)
+    assert len(executed) == 1 and executed[0][0].strip().lower().startswith("select")
+
+
+def test_detail_url_requires_strong_identity(service: GoonetCatalogService) -> None:
+    """A wrong-spec or id-less page is refused; the row is untouched."""
+    for declared, label in (("99999999", "identity_mismatch"), ("", "identity_unverified")):
+        table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=_detail_url(_DETAIL_ID))}
+        table[_DETAIL_ID]["status"] = "missing"
+        executed: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = _run_detail_write(
+                service, table, executed, _detail_identity_page(_DETAIL_ID, declared=declared),
+                url=_detail_url(_DETAIL_ID), apply=True, tmp_root=tmp,
+            )
+        assert summary["result"].startswith("page_"), (label, summary)
+        assert _writes(executed) == [], (label, _writes(executed))
+        assert table[_DETAIL_ID]["status"] == "missing"
+        assert table[_DETAIL_ID]["data"]["media"]["main_image"] == "old.jpg"
+
+
+def test_detail_url_transient_media_preserves_row(service: GoonetCatalogService) -> None:
+    """A transient gallery abstains: no write, no snapshot, row untouched."""
+    table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=_detail_url(_DETAIL_ID))}
+    table[_DETAIL_ID]["status"] = "missing"
+    executed: list = []
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = _run_detail_write(
+            service, table, executed, _detail_identity_page(_DETAIL_ID),
+            url=_detail_url(_DETAIL_ID), apply=True, tmp_root=tmp, probe_ok=False,
+        )
+    assert summary["result"] == "media_unresolved", summary
+    assert summary["snapshot_path"] is None
+    assert _writes(executed) == [], _writes(executed)
+    assert table[_DETAIL_ID]["data"]["media"]["main_image"] == "old.jpg"
+
+
+def test_detail_url_unchanged_does_zero_writes(service: GoonetCatalogService) -> None:
+    """Detail identical to stored: NO write at all (not even last_seen_at)."""
+    page = _detail_identity_page(_DETAIL_ID)
+    with unittest.mock.patch.object(service, "probe_image_url", lambda url: catalog_service.MEDIA_VALID):
+        parsed = service.parse_spec_detail(
+            page, {"catalog_spec_id": _DETAIL_ID, "spec_url": _detail_url(_DETAIL_ID)}
+        )
+    table = {
+        _DETAIL_ID: _stored_row(
+            _DETAIL_ID,
+            data=parsed,
+            spec_url=_detail_url(_DETAIL_ID),
+            content_hash=service.stable_spec_detail_hash(parsed),
+        )
+    }
+    table[_DETAIL_ID]["status"] = "missing"
+    executed: list = []
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = _run_detail_write(
+            service, table, executed, page,
+            url=_detail_url(_DETAIL_ID), apply=True, tmp_root=tmp,
+        )
+    assert summary["result"] == "unchanged" and summary["changed"] == 0, summary
+    assert summary["snapshot_path"] is None
+    assert _writes(executed) == [], _writes(executed)
+    assert table[_DETAIL_ID]["last_seen_at"] == "2020-01-02T00:00:00+00:00"
+    assert table[_DETAIL_ID]["status"] == "missing"
+
+
+def test_detail_url_concurrency_guard_and_backup(service: GoonetCatalogService) -> None:
+    """A concurrent change aborts the write; a backup failure prevents it.
+
+    The lock-time guard must reject ANY change since the read — including a
+    ``missing``→``active``/``active``→``missing`` status flip or a model change —
+    so a stale listing interpretation is never committed.
+    """
+    real_apply = service._apply_detail_write
+
+    # (a) Concurrent changes between read and write => conflict, nothing written.
+    for label, mutate in (
+        ("content_hash", lambda row: row.update({"content_hash": "changed-by-someone-else"})),
+        ("status_flip", lambda row: row.update({"status": "active"})),
+        ("model_slug", lambda row: row.update({"model_slug": "TOYOTA__OTHER"})),
+        ("spec_url", lambda row: row.update({"spec_url": _detail_url(_DETAIL_ID, "TOYOTA__OTHER")})),
+    ):
+        table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=_detail_url(_DETAIL_ID))}
+        table[_DETAIL_ID]["status"] = "missing"
+        executed: list = []
+
+        def racing(spec_id, data, new_hash, write_timestamp, stored, _mutate=mutate):
+            _mutate(table[spec_id])
+            return real_apply(spec_id, data, new_hash, write_timestamp, stored)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with _patch_refresh_env(service, table, executed, _detail_identity_page(_DETAIL_ID), tmp_root=tmp):
+                with unittest.mock.patch.object(service, "_apply_detail_write", racing):
+                    summary = service.write_detail_url(_detail_url(_DETAIL_ID), apply=True)
+        assert summary["result"] == "conflict", (label, summary)
+        assert summary["snapshot_path"] is None, label
+        assert _writes(executed) == [] or all(
+            s.lower().startswith("update cars_scrap_goonet_catalog_specs") for s, _ in _writes(executed)
+        ), (label, _writes(executed))
+        # The guarded write is inside ONE transaction that raised, so the fake
+        # connection rolls it back; assert the row's data is untouched by the
+        # write (status may equal the injected flip, never our new media).
+        assert table[_DETAIL_ID]["data"]["media"]["main_image"] == "old.jpg", label
+
+    # (b) Snapshot failure prevents the write entirely.
+    table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=_detail_url(_DETAIL_ID))}
+    table[_DETAIL_ID]["status"] = "missing"
+    executed = []
+    with tempfile.TemporaryDirectory() as tmp:
+        with _patch_refresh_env(service, table, executed, _detail_identity_page(_DETAIL_ID), tmp_root=tmp):
+            with unittest.mock.patch.object(service, "_write_rollback_backup", side_effect=RuntimeError("disk full")):
+                try:
+                    service.write_detail_url(_detail_url(_DETAIL_ID), apply=True)
+                except RuntimeError as exc:
+                    assert "disk full" in str(exc)
+                else:
+                    raise AssertionError("expected backup failure to propagate")
+    assert _writes(executed) == []
+    assert table[_DETAIL_ID]["data"]["media"]["main_image"] == "old.jpg"
+    assert table[_DETAIL_ID]["status"] == "missing"
+
+
+def test_detail_url_stored_row_url_mismatch_refused(service: GoonetCatalogService) -> None:
+    """A stored row whose OWN spec_url is not this id's canonical URL is refused.
+
+    A poisoned/foreign stored row (different model or a non-canonical URL) must
+    never redirect the fetch, and must never be written.
+    """
+    cases = {
+        "foreign_model": _detail_url(_DETAIL_ID, "TOYOTA__OTHER"),
+        "non_canonical": "https://evil.example.com/catalog/TOYOTA__ALPHARD/10163593/",
+        "query": _detail_url(_DETAIL_ID) + "?x=1",
+    }
+    for label, stored_url in cases.items():
+        table = {_DETAIL_ID: _stored_row(_DETAIL_ID, spec_url=stored_url)}
+        table[_DETAIL_ID]["status"] = "missing"
+        executed: list = []
+        fetched: list = []
+
+        def fake_fetch(url):
+            fetched.append(url)
+            return _detail_identity_page(_DETAIL_ID)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with _patch_refresh_env(service, table, executed, _detail_identity_page(_DETAIL_ID), tmp_root=tmp):
+                with unittest.mock.patch.object(service, "fetch_html", fake_fetch):
+                    summary = service.write_detail_url(_detail_url(_DETAIL_ID), apply=True)
+        assert summary["result"] == "row_url_mismatch", (label, summary)
+        assert fetched == [], (label, "must refuse before any fetch")
+        assert _writes(executed) == [], (label, _writes(executed))
+        assert table[_DETAIL_ID]["data"]["media"]["main_image"] == "old.jpg", label
+
+
+def test_detail_url_cli_exit_codes_and_no_leak() -> None:
+    """A failed/blocked CLI apply MUST exit nonzero, disclosing no URL/secret.
+
+    ``main()`` is driven directly with a scripted service so NO real DB/service
+    or network is touched; every non-success result must map to a nonzero exit
+    and neither stdout nor stderr may echo the canonical URL.
+    """
+    import contextlib
+    import io
+
+    from scrap_goonet_catalog_botasaurus import run_catalog_scraper
+
+    canonical = _detail_url(_DETAIL_ID)
+
+    def run_cli(summary, argv=None):
+        real = GoonetCatalogService()  # safe: constructor only builds a logger
+
+        class _FakeService:
+            def write_detail_url(self, url, apply=False):
+                # Mirror the REAL canonical-URL validation (pure, no DB/network);
+                # an invalid URL must raise ValueError, which the CLI turns into a
+                # non-leaky argparse error (exit 2).
+                if real._canonical_detail_url(url) is None:
+                    raise ValueError("--detail-url must be a canonical catalog detail URL")
+                return dict(summary)
+
+        argv = argv or ["--detail-url", canonical, "--write-detail"]
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(run_catalog_scraper, "GoonetCatalogService", _FakeService):
+            with unittest.mock.patch.object(sys, "argv", ["run_catalog_scraper", *argv]):
+                try:
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        run_catalog_scraper.main()
+                except SystemExit as exc:
+                    return exc.code, out.getvalue(), err.getvalue()
+        return 0, out.getvalue(), err.getvalue()
+
+    def summary(result, run_status="partial"):
+        return {"mode": "apply", "applied": True, "catalog_spec_id": _DETAIL_ID,
+                "result": result, "run_status": run_status, "changed": 0,
+                "status_preserved": None, "snapshot_path": None, "media": None}
+
+    # Success paths exit 0.
+    for result, rs in (("changed", "success"), ("unchanged", "ok")):
+        code, out, err = run_cli(summary(result, rs))
+        assert code == 0, (result, code, err)
+        assert canonical not in out and canonical not in err
+
+    # Failure/blocked paths MUST exit nonzero (never silently "success").
+    for result, rs in (
+        ("missing", "ok"),
+        ("media_unresolved", "partial"),
+        ("error", "partial"),
+        ("conflict", "partial"),
+        ("page_identity_mismatch", "partial"),
+        ("row_url_mismatch", "partial"),
+    ):
+        code, out, err = run_cli(summary(result, rs))
+        assert code != 0, (result, code, out)
+        # Bounded labels only: no canonical URL (or any URL/secret) disclosed.
+        assert canonical not in out and canonical not in err, (result, out, err)
+        assert "goo-net-exchange" not in out and "goo-net-exchange" not in err, (result, out, err)
+
+    # An invalid (non-canonical) URL is rejected by argparse with exit 2, and the
+    # offending URL is never echoed back.
+    code, out, err = run_cli(
+        summary("missing", "ok"),
+        argv=["--detail-url", "https://evil.example.com/catalog/TOYOTA__ALPHARD/10163593/", "--write-detail"],
+    )
+    assert code == 2, (code, out, err)
+    assert "evil.example.com" not in out and "evil.example.com" not in err, (out, err)
+
 
 # ---------------------------------------------------------------------------
 # GNC-IMG-12B offline deterministic checks: sync_all re-visits existing spec
@@ -1355,7 +1952,7 @@ def _sync_spec(spec_id: str) -> dict:
     }
 
 
-def _patch_sync_env(service, table, executed, specs, detail_factory):
+def _patch_sync_env(service, table, executed, specs, detail_factory, *, state_root=None, run_ids=None):
     import contextlib
 
     db_mod = __import__("scrap_goonet_cars_botasaurus.database", fromlist=["get_connection"])
@@ -1374,6 +1971,17 @@ def _patch_sync_env(service, table, executed, specs, detail_factory):
     stack.enter_context(unittest.mock.patch.object(service, "mark_missing_models", lambda *a, **k: 0))
     stack.enter_context(unittest.mock.patch.object(service, "mark_missing_specs", lambda *a, **k: 0))
     stack.enter_context(unittest.mock.patch.object(service, "_sleep_between_requests", lambda *a, **k: None))
+    if state_root is not None:
+        # GNC-FULL-02: keep the durable full-refresh markers off the real home dir.
+        stack.enter_context(unittest.mock.patch.object(service, "_full_refresh_state_dir", lambda: Path(state_root)))
+    if run_ids is not None:
+        # Deterministic, distinct catalog run ids per _sync invocation.
+        pending = list(run_ids)
+
+        def fake_create_run(resumed_from_run_id=None):
+            return (pending.pop(0) if pending else max(run_ids) + 1), "2026-01-01T00:00:00+00:00"
+
+        stack.enter_context(unittest.mock.patch.object(service, "_create_catalog_run", fake_create_run))
     return stack
 
 
@@ -1432,6 +2040,116 @@ def test_sync_all_media_failure_no_upsert_and_partial(service: GoonetCatalogServ
     assert summary["status"] == "partial", summary
     assert summary["media_unresolved"] == 1, summary
     assert any(error["stage"] == "spec_details_media" for error in summary["errors"]), summary["errors"]
+
+
+def test_sync_all_full_refresh_opt_in_and_resume(service: GoonetCatalogService) -> None:
+    """GNC-FULL-02: opt-in full-detail refresh + safe interrupt/resume.
+
+    Asserts, using the REAL `_sync` path against the fake in-memory DB and a
+    scripted `parse_spec_detail` (no network, no real DB):
+
+    1. Default (flag off) still SKIPS complete non-thumb rows and re-visits only
+       thumb rows -- behaviour unchanged.
+    2. Flagged (`refresh_all_spec_details=True`) revisits EVERY enumerated spec,
+       including the already complete non-thumb row, and reports accurate
+       `detail_attempts`.
+    3. A capped (`--max-specs`) flagged run is still a hard bound.
+    4. An interrupted/partial flagged run writes a durable run-scoped marker; a
+       later flagged `resume` does NOT re-fetch those specs and does NOT skip the
+       ones that were never processed.
+    """
+    clean = _clean_media_data("10000001")
+    # Row 1 is COMPLETE non-thumb, row 2 is a thumb row, row 3 is pending.
+    table = {
+        "10000001": _stored_row("10000001", data=clean),
+        "10000002": _stored_row("10000002", data=_thumb_media_data("10000002", thumbs=1)),
+        "10000003": _stored_row("10000003", data={}, content_hash=None),
+    }
+    specs = [_sync_spec("10000001"), _sync_spec("10000002"), _sync_spec("10000003")]
+
+    def _run(*, refresh_all, run_ids, state_root, max_specs=0, resume_from=None, visit_sink):
+        executed: list = []
+
+        def detail_factory(html, spec):
+            visit_sink.append(spec["catalog_spec_id"])
+            return _fresh_detail(spec)
+
+        with _patch_sync_env(service, table, executed, specs, detail_factory,
+                             state_root=state_root, run_ids=run_ids):
+            kwargs = {"max_specs": max_specs}
+            if resume_from is not None:
+                kwargs["resume_from"] = resume_from
+            return service._sync(refresh_all_spec_details=refresh_all, **kwargs)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # (1) DEFAULT: complete non-thumb row 1 is skipped; thumb 2 and pending 3
+        # are visited.
+        visit: list = []
+        summary = _run(refresh_all=False, run_ids=[101], state_root=tmp, visit_sink=visit)
+        assert visit == ["10000002", "10000003"], visit
+        assert summary["details_skipped"] == 1, summary
+        assert summary["detail_attempts"] == 2, summary
+        assert summary["status"] == "success", summary
+        assert summary["refresh_all_spec_details"] is False
+
+        # (2) FLAGGED: every spec revisited, including the complete non-thumb row.
+        visit = []
+        summary = _run(refresh_all=True, run_ids=[102], state_root=tmp, visit_sink=visit)
+        assert visit == ["10000001", "10000002", "10000003"], visit
+        assert summary["details_skipped"] == 0, summary
+        assert summary["detail_attempts"] == 3, summary
+        assert summary["spec_details"] == 3, summary
+        assert summary["status"] == "success", summary
+        assert summary["refresh_all_spec_details"] is True
+        # Durable marker for run 102 records all three processed ids.
+        marker = Path(tmp) / "run-102.jsonl"
+        assert sorted(marker.read_text().splitlines()) == ["10000001", "10000002", "10000003"]
+
+        # (3) CAPPED FLAGGED: --max-specs remains a hard bound over the union of
+        # model-page specs and pending backfill.
+        visit = []
+        summary = _run(refresh_all=True, run_ids=[103], state_root=tmp, max_specs=2, visit_sink=visit)
+        assert summary["detail_attempts"] == 2, summary
+        assert len(visit) == 2, visit
+        assert summary["status"] == "partial", summary
+
+        # (4) INTERRUPT + RESUME: run 104 is interrupted after its first spec
+        # (details 001, 002 already complete). A flagged resume of run 104 must
+        # re-fetch ONLY the not-yet-processed specs (003) and must not repeat 001.
+        visit = []
+
+        def interrupted_detail(html, spec):
+            visit.append(spec["catalog_spec_id"])
+            if spec["catalog_spec_id"] == "10000002":
+                raise KeyboardInterrupt()
+            return _fresh_detail(spec)
+
+        executed: list = []
+        try:
+            with _patch_sync_env(service, table, executed, specs, interrupted_detail,
+                                 state_root=tmp, run_ids=[104]):
+                service._sync(refresh_all_spec_details=True)
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("expected KeyboardInterrupt to propagate")
+        assert visit == ["10000001", "10000002"], visit
+        # Only successfully-upserted spec 001 is durably recorded.
+        marker = Path(tmp) / "run-104.jsonl"
+        assert marker.read_text().splitlines() == ["10000001"], marker.read_text()
+
+        # Resume run 104 as run 105. The completed-nonthumb 001 must NOT be
+        # re-fetched; the thumb row 002 (never completed) and pending 003 are.
+        visit = []
+        summary = _run(refresh_all=True, run_ids=[105], state_root=tmp, visit_sink=visit,
+                       resume_from={"id": 104, "current_make_slug": "TOYOTA",
+                                    "current_model_slug": "TOYOTA__ALPHARD",
+                                    "status": "interrupted"})
+        assert visit == ["10000002", "10000003"], visit
+        assert summary["detail_attempts"] == 2, summary
+        assert summary["resumed_from_run_id"] == 104, summary
+        marker = Path(tmp) / "run-105.jsonl"
+        assert sorted(marker.read_text().splitlines()) == ["10000001", "10000002", "10000003"]
 
 
 def test_completed_sql_predicate_readonly_on_postgres(service: GoonetCatalogService) -> None:
@@ -1548,9 +2266,21 @@ def main() -> None:
     test_refresh_rollback_is_atomic_on_midbatch_failure(service)
     test_refresh_unexpected_error_does_not_leak(service)
     test_refresh_throttles_between_requests(service)
+    test_refresh_proven_gallery_gate_adversarial(service)
+    test_detail_url_default_is_read_only(service)
+    test_detail_url_rejects_non_canonical_url(service)
+    test_detail_url_write_preserves_missing_status(service)
+    test_detail_url_missing_row_not_inserted(service)
+    test_detail_url_requires_strong_identity(service)
+    test_detail_url_transient_media_preserves_row(service)
+    test_detail_url_unchanged_does_zero_writes(service)
+    test_detail_url_concurrency_guard_and_backup(service)
+    test_detail_url_stored_row_url_mismatch_refused(service)
+    test_detail_url_cli_exit_codes_and_no_leak()
     test_completed_spec_ids_thumb_aware_selection(service)
     test_sync_all_revisits_thumb_specs_replaces_images(service)
     test_sync_all_media_failure_no_upsert_and_partial(service)
+    test_sync_all_full_refresh_opt_in_and_resume(service)
     test_completed_sql_predicate_readonly_on_postgres(service)
     print("goonet catalog parser checks passed")
     print("network_access: never_performed; db_access: faked; writes: asserted_absent_by_default")

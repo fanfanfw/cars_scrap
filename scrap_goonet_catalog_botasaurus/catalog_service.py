@@ -50,6 +50,23 @@ MEDIA_TRANSIENT = "transient"
 SAMPLE_REFRESH_MAX_IDS = 3
 SAMPLE_REFRESH_MIN_INTERVAL_SECONDS = 1.0
 SAMPLE_REFRESH_MEDIA_FIELDS = ("main_image", "thumbnails", "images")
+# GNC-FULL-03E-2a: opt-in ``require_proven_gallery`` gate for the sample refresh.
+# When set, an id may be written ONLY if it is proven, by an earlier READ-ONLY
+# inventory run, to be BOTH (a) present in a hash-verified private candidate
+# snapshot AND (b) checkpointed under the ``gallery_has_image`` category for that
+# exact snapshot. The gate is fail-closed: a missing/corrupt/poisoned inventory
+# state, an id absent from the snapshot, or an id classified as no-gallery or
+# ambiguous all refuse the write. The inventory's own state directory name is
+# duplicated here (it must not import the inventory module at import time).
+PROVEN_GALLERY_INVENTORY_STATE_DIRNAME = "cars_scrap_goonet_catalog_image_inventory"
+# GNC-FULL-02: explicit opt-in full-spec detail refresh. When enabled with
+# --sync-all/--resume, EVERY spec enumerated on a model page is re-fetched and
+# upserted (including rows already complete with non-thumb media), instead of
+# the default that skips complete rows. An interrupted/partial flagged run keeps
+# a small durable, run-scoped marker of the specs already refreshed in its
+# lineage under this state dir, so a resume does NOT silently skip or re-fetch
+# them. Default behaviour (flag unset) is unchanged.
+FULL_REFRESH_STATE_DIRNAME = "cars_scrap_goonet_catalog_full_refresh"
 # A stored spec_url is only ever fetched when it is the exact canonical detail
 # URL for that catalog_spec_id on the trusted host: https, no userinfo, no
 # explicit port, no query, no fragment, exactly
@@ -92,6 +109,116 @@ class SampleRefreshRollbackError(RuntimeError):
     Raised so the whole restore transaction is rolled back and NO row is restored
     (fail closed), rather than committing a partial restore.
     """
+
+
+class ProvenGalleryRejected(RuntimeError):
+    """An opt-in ``require_proven_gallery`` refresh refused to write one id.
+
+    The single attribute ``status`` is a FIXED machine label (never page
+    content) recorded in the run summary, e.g. ``not_proven_gallery``,
+    ``media_not_empty`` or ``page_identity_mismatch``. Raising it skips the id
+    (no plan, no write); it never aborts the other requested ids.
+    """
+
+    def __init__(self, status: str) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+class DetailWriteConflict(RuntimeError):
+    """GNC-DETAIL-01: a guarded ``--detail-url`` write found a concurrent change.
+
+    Raised inside the single write transaction so the whole write is rolled back
+    (nothing written) rather than clobbering a row another writer changed between
+    our read and our UPDATE. Only the ONE named row is ever addressed.
+    """
+
+    def __init__(self, catalog_spec_id: str) -> None:
+        super().__init__("concurrent change detected; detail write aborted")
+        self.catalog_spec_id = catalog_spec_id
+
+
+def _media_is_empty(data) -> bool:
+    """Mirror the inventory candidate predicate on an in-memory ``data`` block.
+
+    True only for the exact empty-image symptom the inventory targets: no
+    ``main_image`` (absent or JSON null) AND no ``images`` entries (absent or an
+    empty array). A non-empty/non-list media value is never "empty".
+    """
+    if not isinstance(data, dict):
+        return False
+    media = data.get("media")
+    if not isinstance(media, dict):
+        media = {}
+    if media.get("main_image") is not None:
+        return False
+    images = media.get("images")
+    return images is None or (isinstance(images, list) and not images)
+
+
+class _ProvenGalleryGate:
+    """GNC-FULL-03E-2a fail-closed gate for an opt-in proven-gallery apply.
+
+    Built only when ``refresh_sample_specs(require_proven_gallery=True)``; the
+    caller resolves the proven id set first, which itself fails closed on any
+    missing/corrupt/poisoned inventory artifact. Each check raises
+    ``ProvenGalleryRejected(<fixed label>)`` so the id is skipped and no write can
+    happen. Every label is composed of fixed tokens only (never page content).
+    """
+
+    def __init__(self, service, proven_ids) -> None:
+        self.service = service
+        self.proven = {str(spec_id) for spec_id in proven_ids}
+
+    def check_stored(self, stored: dict) -> None:
+        """Read-time gate: the id must be proven, active and still media-empty."""
+        spec_id = str(stored.get("catalog_spec_id") or "")
+        if spec_id not in self.proven:
+            raise ProvenGalleryRejected("not_proven_gallery")
+        if str(stored.get("status") or "") != "active":
+            raise ProvenGalleryRejected("row_not_active")
+        if not _media_is_empty(stored.get("data")):
+            raise ProvenGalleryRejected("media_not_empty")
+
+    def check_result(self, merged: dict, html: str, spec_url: str) -> None:
+        """Post-fetch gate: strong page identity + proven embedded gallery + output.
+
+        The page must STRONGLY self-declare this exact spec id and model (the same
+        evidence the inventory checkpoint requires), an EMBEDDED slide's own paired
+        thumb must have derived the resolved non-thumb image, and the merged output
+        must be media-only and entirely non-thumb. Anything less refuses the write.
+        """
+        from bs4 import BeautifulSoup
+
+        from scrap_goonet_catalog_botasaurus.image_inventory import ImageInventoryClassifier
+
+        expected_id = self.service.extract_catalog_spec_id(spec_url)
+        parts = self.service._catalog_path_parts(spec_url)
+        model_slug = parts[0] if len(parts) == 2 and "__" in parts[0] else None
+        soup = BeautifulSoup(html or "", "html.parser")
+        classifier = ImageInventoryClassifier(self.service)
+        strong_identity, identity_reason = classifier._verify_identity(soup, expected_id, model_slug)
+        if not strong_identity:
+            raise ProvenGalleryRejected(f"page_{identity_reason}")
+
+        media = merged.get("media") if isinstance(merged, dict) else None
+        images = media.get("images") if isinstance(media, dict) else None
+        if not isinstance(images, list) or not images:
+            raise ProvenGalleryRejected("media_empty")
+        if media.get("main_image") is None:
+            raise ProvenGalleryRejected("media_empty")
+        slides = soup.select(".gallery-main img")
+        thumbs = soup.select(".gallery-thumbs img")
+        proven, _ = classifier._embedded_gallery_proven(slides, thumbs, images, spec_url)
+        if not proven:
+            raise ProvenGalleryRejected("gallery_unproven")
+        # Output must be media-only (non-media fields untouched) and wholly
+        # non-thumb; a thumb or an erased/empty media never reaches the DB.
+        for url in images:
+            if self.service._is_thumb_url(url):
+                raise ProvenGalleryRejected("media_thumb")
+        if self.service._is_thumb_url(media.get("main_image")):
+            raise ProvenGalleryRejected("media_thumb")
 
 
 class MediaUnresolved(RuntimeError):
@@ -922,6 +1049,41 @@ class GoonetCatalogService:
             raise ValueError("at least one explicit catalog_spec_id is required")
         return normalized
 
+    def _inventory_state_dir(self):
+        return Path.home() / ".local" / "state" / PROVEN_GALLERY_INVENTORY_STATE_DIRNAME
+
+    def _proven_gallery_ids(self) -> frozenset:
+        """Return the ids an inventory run PROVED to have a gallery, else fail closed.
+
+        Reuses the GNC-FULL-03E-1 read-only inventory implementation (its
+        integrity-checked ``load_snapshot`` + append-only ``load_checkpoint``) so
+        this gate trusts exactly the artifacts that runner produced. An id counts
+        only when it is present in the hash-verified candidate snapshot AND its
+        LATEST checkpoint record carries the ``gallery_has_image`` category. Any
+        missing/symlinked/corrupt artifact raises ``ProvenGalleryRejected``, so a
+        tampered or absent state can never silently widen the write set.
+        """
+        from scrap_goonet_catalog_botasaurus.image_inventory import (
+            CATEGORY_GALLERY,
+            ImageInventoryRunner,
+            SnapshotIntegrityError,
+        )
+
+        runner = ImageInventoryRunner(state_dir=self._inventory_state_dir())
+        try:
+            candidates = runner.load_snapshot()
+        except SnapshotIntegrityError as exc:
+            raise ProvenGalleryRejected(f"inventory_snapshot_invalid_{type(exc).__name__}") from exc
+        except Exception as exc:  # noqa: BLE001 - any unreadable state must fail closed
+            raise ProvenGalleryRejected(f"inventory_unreadable_{type(exc).__name__}") from exc
+        snapshot_ids = {str(row.get("catalog_spec_id") or "") for row in candidates}
+        checkpoint = runner.load_checkpoint()
+        return frozenset(
+            spec_id
+            for spec_id, record in checkpoint.items()
+            if spec_id in snapshot_ids and record.get("category") == CATEGORY_GALLERY
+        )
+
     def _load_spec_rows(self, catalog_spec_ids: list[str]) -> dict[str, dict]:
         """Fetch the exact stored rows (all snapshot columns) for the requested ids.
 
@@ -969,6 +1131,52 @@ class GoonetCatalogService:
 
     def _snapshot_dir(self) -> Path:
         return Path.home() / ".local" / "state" / "cars_scrap_goonet_catalog_sample_refresh"
+
+    def _full_refresh_state_dir(self) -> Path:
+        return Path.home() / ".local" / "state" / FULL_REFRESH_STATE_DIRNAME
+
+    def _full_refresh_marker_path(self, run_id: int) -> Path:
+        return self._full_refresh_state_dir() / f"run-{run_id}.jsonl"
+
+    def _load_full_refresh_progress(self, run_id: int) -> set[str]:
+        """Read the run-scoped ``{"catalog_spec_id"}`` already refreshed set.
+
+        Only complete newline-terminated lines are accepted, so a truncated
+        trailing line from a crash mid-append can never be mistaken for a
+        processed id (which would silently skip that spec on resume).
+        """
+        path = self._full_refresh_marker_path(run_id)
+        if not path.exists():
+            return set()
+        processed: set[str] = set()
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.endswith("\n"):
+                    break
+                spec_id = line.rstrip("\n")
+                if spec_id:
+                    processed.add(spec_id)
+        return processed
+
+    def _write_full_refresh_progress(self, run_id: int, spec_ids) -> None:
+        path = self._full_refresh_marker_path(run_id)
+        self._ensure_secure_dir(path.parent)
+        with path.open("w", encoding="utf-8") as handle:
+            for spec_id in spec_ids:
+                handle.write(f"{spec_id}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o600)
+
+    def _append_full_refresh_progress(self, run_id: int, spec_id: str) -> None:
+        path = self._full_refresh_marker_path(run_id)
+        self._ensure_secure_dir(path.parent)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{spec_id}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if (path.stat().st_mode & 0o777) != 0o600:
+            os.chmod(path, 0o600)
 
     def _ensure_secure_dir(self, directory: Path) -> None:
         """Create ``directory`` as a real dir (never through a symlink), mode 0700."""
@@ -1153,6 +1361,7 @@ class GoonetCatalogService:
         delay_seconds: float | None = None,
         min_interval_seconds: float = SAMPLE_REFRESH_MIN_INTERVAL_SECONDS,
         sleep_func=None,
+        require_proven_gallery: bool = False,
     ) -> dict:
         """Bounded media-only refresh for existing specs; read-only unless apply.
 
@@ -1161,6 +1370,14 @@ class GoonetCatalogService:
         * The page URL is read from the stored row's ``spec_url`` only, and only
           after it validates as the exact canonical https detail URL for that id.
         * With ``apply=False`` (default) nothing is written: the plan is returned.
+        * ``require_proven_gallery=True`` is the GNC-FULL-03E-2a opt-in that closes
+          the "source changed and now yields empty media" hole: an id may only be
+          written if a prior READ-ONLY inventory run proved it has a gallery (id
+          present in the hash-verified candidate snapshot AND checkpointed as
+          ``gallery_has_image``), the live row is still active, the current page
+          STRONGLY self-declares this exact id/model, and the resolved media is
+          non-empty and non-thumb. Anything else refuses the write for that id.
+          Default ``False`` leaves every other refresh invocation unchanged.
         * With ``apply=True`` a verified immutable snapshot of the exact pre-write
           rows is required first; any snapshot failure aborts BEFORE any write.
         * A spec whose media is unchanged does ZERO writes (no last_seen_at bump).
@@ -1177,16 +1394,24 @@ class GoonetCatalogService:
         throttle = max(delay_from_cli, min_interval)
         sleeper = sleep_func or time.sleep
 
+        # Resolve the proven-gallery gate BEFORE any row read or network request so
+        # a bad inventory state aborts the whole invocation up front (fail closed).
+        gate = None
+        if require_proven_gallery:
+            gate = _ProvenGalleryGate(self, self._proven_gallery_ids())
+
         stored_rows = self._load_spec_rows(ids)
         summary: dict = {
             "mode": "apply" if apply else "dry_run",
             "applied": bool(apply),
             "requested": ids,
+            "require_proven_gallery": bool(require_proven_gallery),
             "found": [spec_id for spec_id in ids if spec_id in stored_rows],
             "missing": [spec_id for spec_id in ids if spec_id not in stored_rows],
             "refreshed": 0,
             "changed": 0,
             "unchanged": 0,
+            "rejected": [],
             "errors": [],
             "results": [],
             "snapshot_path": None,
@@ -1198,6 +1423,12 @@ class GoonetCatalogService:
             if stored is None:
                 summary["results"].append({"catalog_spec_id": spec_id, "status": "missing"})
                 continue
+            if gate is not None:
+                try:
+                    gate.check_stored(stored)
+                except ProvenGalleryRejected as exc:
+                    self._record_rejection(summary, spec_id, exc.status)
+                    continue
             spec_url = self._validated_spec_url(stored.get("spec_url"), spec_id)
             if spec_url is None:
                 summary["results"].append({"catalog_spec_id": spec_id, "status": "rejected_url"})
@@ -1209,9 +1440,18 @@ class GoonetCatalogService:
             # Throttle between distinct network fetches (not before the first).
             if index > 0:
                 sleeper(throttle)
+            html = None
             try:
-                fresh = self.parse_spec_detail(self.fetch_html(spec_url), dict(stored))
+                html = self.fetch_html(spec_url)
+                fresh = self.parse_spec_detail(html, dict(stored))
                 merged = self._merge_media_only(stored.get("data") or {}, fresh)
+                if gate is not None:
+                    gate.check_result(merged, html, spec_url)
+            except ProvenGalleryRejected as exc:
+                # A gate refusal is a definitive "this id is not proven": the row
+                # stays untouched and the run is reported, never written.
+                self._record_rejection(summary, spec_id, exc.status)
+                continue
             except MediaUnresolved as exc:
                 summary["results"].append({"catalog_spec_id": spec_id, "status": "media_unresolved"})
                 self._record_spec_detail_error(summary, "refresh", spec_url, exc)
@@ -1249,8 +1489,16 @@ class GoonetCatalogService:
         if not apply:
             summary["planned"] = len(plans)
             summary["planned_changed"] = sum(1 for plan in plans if plan["changed"])
-            summary["status"] = "ok" if not summary["errors"] else "partial"
+            summary["status"] = "partial" if (summary["errors"] or summary["rejected"]) else "ok"
             return summary
+
+        # GNC-FULL-03E-2a: with the proven-gallery gate armed, the ONLY rows this
+        # invocation may write are the gate-approved gallery rows. Refuse any plan
+        # whose id is not gate-approved (defence in depth; the per-id checks above
+        # already reject them) so a future edit cannot widen the write set.
+        if gate is not None:
+            for plan in plans:
+                gate.check_stored(plan["stored"])
 
         # ---- apply path: snapshot exact pre-write rows, then one atomic write ----
         written_plans = [plan for plan in plans if plan["changed"]]
@@ -1284,7 +1532,12 @@ class GoonetCatalogService:
                 item["applied"] = "unchanged"
         if written_plans:
             try:
-                written = self._apply_sample_refresh_batch(written_plans, write_timestamp)
+                if gate is not None:
+                    written = self._apply_sample_refresh_batch(
+                        written_plans, write_timestamp, require_active_empty_media=True
+                    )
+                else:
+                    written = self._apply_sample_refresh_batch(written_plans, write_timestamp)
             except SampleRefreshConflict as exc:
                 # The single transaction aborted: NO row in the batch was written.
                 item = results_by_id.get(exc.catalog_spec_id)
@@ -1311,10 +1564,12 @@ class GoonetCatalogService:
                 summary["changed"] = len(written)
                 summary["refreshed"] = len(written)
         applied = summary["changed"] + summary["unchanged"] + len(summary["errors"])
-        summary["status"] = "partial" if summary["errors"] else ("success" if applied else "ok")
+        summary["status"] = "partial" if (summary["errors"] or summary["rejected"]) else ("success" if applied else "ok")
         return summary
 
-    def _apply_sample_refresh_batch(self, plans: list[dict], write_timestamp: datetime) -> list[str]:
+    def _apply_sample_refresh_batch(
+        self, plans: list[dict], write_timestamp: datetime, *, require_active_empty_media: bool = False
+    ) -> list[str]:
         """Apply every guarded media write in ONE all-or-nothing transaction.
 
         Returns the ids actually written (equal to ``plans`` on success). If any
@@ -1324,6 +1579,11 @@ class GoonetCatalogService:
         snapshot's recorded candidate set stays exactly equal to the applied set.
         ``write_timestamp`` is written verbatim (not ``NOW()``) so the rollback
         guard can compare it deterministically.
+
+        With ``require_active_empty_media=True`` (GNC-FULL-03E-2a proven-gallery
+        apply) the locked row MUST still be ``active`` and still media-empty at
+        write time; a concurrent status flip or a row that regained media aborts
+        the whole batch (``SampleRefreshConflict``) instead of being overwritten.
         """
         from psycopg2.extras import Json
 
@@ -1337,12 +1597,20 @@ class GoonetCatalogService:
                     for plan in plans:
                         spec_id = plan["catalog_spec_id"]
                         expected = self._current_identity_guard(plan["stored"])
-                        cursor.execute(
-                            """SELECT content_hash, last_changed_at, spec_url
-                               FROM cars_scrap_goonet_catalog_specs
-                               WHERE catalog_spec_id = %s FOR UPDATE""",
-                            (spec_id,),
-                        )
+                        if require_active_empty_media:
+                            cursor.execute(
+                                """SELECT content_hash, last_changed_at, spec_url, status, data
+                                   FROM cars_scrap_goonet_catalog_specs
+                                   WHERE catalog_spec_id = %s FOR UPDATE""",
+                                (spec_id,),
+                            )
+                        else:
+                            cursor.execute(
+                                """SELECT content_hash, last_changed_at, spec_url
+                                   FROM cars_scrap_goonet_catalog_specs
+                                   WHERE catalog_spec_id = %s FOR UPDATE""",
+                                (spec_id,),
+                            )
                         current = cursor.fetchone()
                         if current is None:
                             raise SampleRefreshConflict(spec_id)
@@ -1355,6 +1623,12 @@ class GoonetCatalogService:
                             # A concurrent writer changed this row since the read;
                             # abort the whole batch rather than write a subset.
                             raise SampleRefreshConflict(spec_id)
+                        if require_active_empty_media:
+                            current_status, current_data = current[3], current[4]
+                            if str(current_status or "") != "active" or not _media_is_empty(current_data):
+                                # The row is no longer an active empty-media spec:
+                                # fail closed (nothing written) rather than apply.
+                                raise SampleRefreshConflict(spec_id)
                         # Guard passed and plan is "changed", so stored hash !=
                         # new_hash; this row is always written here.
                         cursor.execute(
@@ -1470,6 +1744,218 @@ class GoonetCatalogService:
             conn.close()
         plan["status"] = "success"
         return plan
+
+    # ------------------------------------------------------------------
+    # GNC-DETAIL-01: explicit opt-in write of ONE scraped detail row.
+    # ------------------------------------------------------------------
+    def _canonical_detail_url(self, detail_url: str | None) -> tuple[str, str] | None:
+        """Return ``(catalog_spec_id, canonical_url)`` for a canonical detail URL.
+
+        Same exact-shape guard as the sample refresh (https, exact host, no
+        userinfo/port/query/fragment, exactly ``/catalog/<MODEL__SLUG>/<id>/``),
+        but the URL is the operator's explicit CLI argument rather than a stored
+        row value. Anything else returns ``None``.
+        """
+        catalog_spec_id = self.extract_catalog_spec_id(detail_url)
+        if not catalog_spec_id:
+            return None
+        canonical = self._validated_spec_url(detail_url, catalog_spec_id)
+        if canonical is None:
+            return None
+        return catalog_spec_id, canonical
+
+    def write_detail_url(self, detail_url: str, *, apply: bool = False) -> dict:
+        """Write ONE scraped detail for an EXISTING row; read-only unless ``apply``.
+
+        The operator names a single canonical detail URL. The derived
+        ``catalog_spec_id`` must ALREADY exist in the DB: there is deliberately no
+        insert, so reaching a detail page can never fabricate or reactivate a
+        listing. Before any write the page must STRONGLY self-declare this exact
+        spec id and model (the page's own canonical / ``og:url`` locator), the
+        stored row's ``status`` is preserved VERBATIM (an existing ``missing`` row
+        stays ``missing``; the UPDATE deliberately omits ``status``), and a
+        verified immutable pre-write rollback snapshot is required. Only
+        ``data``/``content_hash``/``last_changed_at`` are written; ``status`` and
+        ``last_seen_at`` are deliberately untouched, so a detail-only write can
+        never alter LISTING membership (``mark_missing_specs`` decides that from
+        ``last_seen_at``). A concurrent change on the row aborts the write
+        (nothing written).
+
+        Media is never inferred from availability: ``parse_spec_detail`` already
+        abstains (``MediaUnresolved``) on a transient gallery, and a parse failure
+        leaves the row untouched.
+        """
+        resolved = self._canonical_detail_url(detail_url)
+        if resolved is None:
+            raise ValueError("--detail-url must be a canonical catalog detail URL")
+        catalog_spec_id, spec_url = resolved
+
+        summary: dict = {
+            "mode": "apply" if apply else "dry_run",
+            "applied": bool(apply),
+            "catalog_spec_id": catalog_spec_id,
+            "result": None,
+            "run_status": None,
+            "changed": 0,
+            "status_preserved": None,
+            "snapshot_path": None,
+            "media": None,
+        }
+
+        stored = self._load_spec_rows([catalog_spec_id]).get(catalog_spec_id)
+        if stored is None:
+            # No insert and no implicit activation: the detail write only ever
+            # updates a row that already exists as a catalog listing.
+            summary["result"] = "missing"
+            summary["run_status"] = "ok"
+            return summary
+
+        # The stored row's OWN spec_url must be the canonical detail URL for this
+        # id AND match the supplied URL (host/path/model), so a poisoned/foreign
+        # stored row can never redirect the fetch to a different spec's page.
+        stored_spec_url = self._validated_spec_url(stored.get("spec_url"), catalog_spec_id)
+        if stored_spec_url is None or stored_spec_url != spec_url:
+            summary["result"] = "row_url_mismatch"
+            summary["run_status"] = "partial"
+            return summary
+
+        try:
+            html = self.fetch_html(spec_url)
+            fresh = self.parse_spec_detail(html, dict(stored))
+        except MediaUnresolved as exc:
+            summary["result"] = "media_unresolved"
+            summary["run_status"] = "partial"
+            summary["error_type"] = type(exc).__name__
+            return summary
+        except Exception as exc:  # noqa: BLE001 - never leak page/request detail
+            summary["result"] = "error"
+            summary["run_status"] = "partial"
+            summary["error_type"] = type(exc).__name__
+            return summary
+
+        # Strong page identity: the page's OWN canonical/og:url/twitter:url must
+        # declare exactly this id AND model slug. A wrong-spec, id-less or
+        # unverifiable page is refused (no write).
+        from scrap_goonet_catalog_botasaurus.image_inventory import ImageInventoryClassifier
+
+        soup = BeautifulSoup(html or "", "html.parser")
+        parts = self._catalog_path_parts(spec_url)
+        model_slug = parts[0] if len(parts) == 2 and "__" in parts[0] else None
+        strong_identity, identity_reason = ImageInventoryClassifier(self)._verify_identity(
+            soup, catalog_spec_id, model_slug
+        )
+        if not strong_identity:
+            summary["result"] = f"page_{identity_reason}"
+            summary["run_status"] = "partial"
+            return summary
+
+        new_hash = self.stable_spec_detail_hash(fresh)
+        changed = new_hash != stored.get("content_hash")
+        summary["changed"] = 1 if changed else 0
+        if not apply:
+            summary["result"] = "planned"
+            summary["run_status"] = "ok"
+            summary["media"] = fresh.get("media")
+            return summary
+        if not changed:
+            summary["result"] = "unchanged"
+            summary["run_status"] = "ok"
+            return summary
+
+        write_timestamp = datetime.now(timezone.utc)
+        # Snapshot the exact pre-write row BEFORE any write; failure aborts.
+        summary["snapshot_path"] = self._write_rollback_backup(
+            [dict(stored)],
+            applied_states={
+                catalog_spec_id: {
+                    "content_hash": new_hash,
+                    "last_changed_at": write_timestamp.isoformat(),
+                }
+            },
+        )
+        try:
+            preserved_status = self._apply_detail_write(
+                catalog_spec_id, fresh, new_hash, write_timestamp, stored
+            )
+        except DetailWriteConflict:
+            summary["snapshot_path"] = None
+            summary["result"] = "conflict"
+            summary["run_status"] = "partial"
+            return summary
+        except Exception as exc:  # noqa: BLE001 - a partial write must be impossible
+            summary["snapshot_path"] = None
+            summary["result"] = "error"
+            summary["run_status"] = "partial"
+            summary["error_type"] = type(exc).__name__
+            return summary
+        summary["result"] = "changed"
+        summary["run_status"] = "success"
+        summary["status_preserved"] = preserved_status
+        return summary
+
+    def _apply_detail_write(
+        self, catalog_spec_id: str, data: dict, new_hash: str, write_timestamp: datetime, stored: dict
+    ):
+        """Guarded single-row detail write that NEVER touches ``status``.
+
+        The locked row is compared against the exact read-time identity
+        (``content_hash`` + ``last_changed_at`` + ``spec_url`` + ``status`` +
+        ``model_slug``); any concurrent change — including a ``missing``→``active``
+        or ``active``→``missing`` flip by another writer between our read and our
+        UPDATE — aborts with ``DetailWriteConflict`` (nothing written), so the
+        write can never commit a stale listing interpretation. Only the ONE named
+        row is addressed and the UPDATE omits ``status`` AND ``last_seen_at``
+        entirely, so neither an existing ``missing`` row is silently reactivated
+        nor its listing-membership timestamp is advanced merely because its detail
+        page is available. Returns the (unchanged) stored status.
+        """
+        from psycopg2.extras import Json
+
+        from scrap_goonet_cars_botasaurus.database import get_connection
+
+        expected = self._current_identity_guard(stored)
+        expected_status = stored.get("status")
+        expected_model_slug = stored.get("model_slug")
+        conn = get_connection()
+        try:
+            with conn:  # one transaction: any guard failure rolls back the write
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """SELECT content_hash, last_changed_at, spec_url, status, model_slug
+                           FROM cars_scrap_goonet_catalog_specs
+                           WHERE catalog_spec_id = %s FOR UPDATE""",
+                        (catalog_spec_id,),
+                    )
+                    current = cursor.fetchone()
+                    if current is None:
+                        raise DetailWriteConflict(catalog_spec_id)
+                    if (
+                        current[0] != expected["content_hash"]
+                        or current[2] != expected["spec_url"]
+                        or current[1] != expected["last_changed_at"]
+                        or current[3] != expected_status
+                        or current[4] != expected_model_slug
+                    ):
+                        # A concurrent writer changed this row since the read
+                        # (or flipped its status/model): abort rather than write
+                        # over a row we no longer understand.
+                        raise DetailWriteConflict(catalog_spec_id)
+                    cursor.execute(
+                        """UPDATE cars_scrap_goonet_catalog_specs
+                           SET content_hash = %(content_hash)s,
+                               data = %(data)s,
+                               last_changed_at = %(last_changed_at)s
+                           WHERE catalog_spec_id = %(catalog_spec_id)s""",
+                        {
+                            "data": Json(data),
+                            "content_hash": new_hash,
+                            "last_changed_at": write_timestamp,
+                            "catalog_spec_id": catalog_spec_id,
+                        },
+                    )
+                    return current[3]
+        finally:
+            conn.close()
 
     def mark_missing_makes(self, run_started_at) -> int:
         return self._mark_missing("cars_scrap_goonet_catalog_makes", run_started_at)
@@ -1627,6 +2113,11 @@ class GoonetCatalogService:
     def _record_sync_error(self, summary: dict, stage: str, url: str | None, error: Exception) -> None:
         summary["errors"].append({"stage": stage, "url": url, "error": str(error)})
 
+    def _record_rejection(self, summary: dict, spec_id: str, status: str) -> None:
+        """Record a proven-gallery refusal; the row is left completely untouched."""
+        summary["rejected"].append({"catalog_spec_id": spec_id, "status": status})
+        summary["results"].append({"catalog_spec_id": spec_id, "status": status})
+
     def _record_spec_detail_error(self, summary: dict, stage: str, url: str | None, error: Exception) -> None:
         """Record a per-spec failure, distinguishing indeterminate media.
 
@@ -1642,7 +2133,7 @@ class GoonetCatalogService:
         else:
             self._record_sync_error(summary, stage, url, error)
 
-    def _backfill_pending(self, summary: dict, run_id: int, max_specs: int, delay: float, attempted: set[str]) -> None:
+    def _backfill_pending(self, summary: dict, run_id: int, max_specs: int, delay: float, attempted: set[str], refresh_all_spec_details: bool = False) -> None:
         pending = self.get_pending_spec_details()
         self.logger.info("Pending detail backfill run_id=%s count=%s attempted=%s budget=%s", run_id, len(pending), len(attempted), max_specs or "unlimited")
         for spec in pending:
@@ -1659,17 +2150,21 @@ class GoonetCatalogService:
                 if self.upsert_spec_detail({"data": detail}, run_id):
                     summary["details_changed"] += 1
                 summary["spec_details"] += 1
+                if refresh_all_spec_details:
+                    # GNC-FULL-02: record durable progress only AFTER a successful
+                    # upsert so a failed spec is retried on resume.
+                    self._append_full_refresh_progress(run_id, spec_id)
             except Exception as exc:
                 self.logger.warning("Failed pending detail %s: %s", spec.get("spec_url"), exc)
                 self._record_spec_detail_error(summary, "pending_details", spec.get("spec_url"), exc)
             self._sleep_between_requests(delay)
 
-    def resume(self, run_id: int | None = None, **limits) -> dict:
+    def resume(self, run_id: int | None = None, *, refresh_all_spec_details: bool = False, **limits) -> dict:
         source = self._resumable_run(run_id)
-        return self._sync(resume_from=source, **limits)
+        return self._sync(resume_from=source, refresh_all_spec_details=refresh_all_spec_details, **limits)
 
-    def sync_all(self, *, max_makes: int = 0, max_models: int = 0, max_specs: int = 0, delay_seconds: float | None = None) -> dict:
-        return self._sync(max_makes=max_makes, max_models=max_models, max_specs=max_specs, delay_seconds=delay_seconds)
+    def sync_all(self, *, max_makes: int = 0, max_models: int = 0, max_specs: int = 0, delay_seconds: float | None = None, refresh_all_spec_details: bool = False) -> dict:
+        return self._sync(max_makes=max_makes, max_models=max_models, max_specs=max_specs, delay_seconds=delay_seconds, refresh_all_spec_details=refresh_all_spec_details)
 
     def _sync(
         self,
@@ -1679,13 +2174,14 @@ class GoonetCatalogService:
         max_specs: int = 0,
         delay_seconds: float | None = None,
         resume_from: dict | None = None,
+        refresh_all_spec_details: bool = False,
     ) -> dict:
         from scrap_goonet_cars_botasaurus.database import get_connection
 
         summary = {"run_id": None, "resumed_from_run_id": resume_from and resume_from["id"], "status": "running", "makes": 0,
                    "models": 0, "spec_summaries": 0, "spec_details": 0, "detail_attempts": 0, "details_changed": 0,
                    "details_skipped": 0, "pending_details": 0, "missing_makes": 0, "missing_models": 0,
-                   "missing_specs": 0, "media_unresolved": 0, "errors": []}
+                   "missing_specs": 0, "media_unresolved": 0, "refresh_all_spec_details": bool(refresh_all_spec_details), "errors": []}
         run_id = None
         lock_conn = None
         previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -1713,12 +2209,27 @@ class GoonetCatalogService:
             delay = self._catalog_delay(delay_seconds)
             checkpoint_make = resume_from and resume_from.get("current_make_slug")
             checkpoint_model = resume_from and resume_from.get("current_model_slug")
+            # GNC-FULL-02 durable progress. A flagged full refresh must visit
+            # EVERY spec, so its only source of truth for "already done" is the
+            # run-scoped marker (successful upsert ids). A flagged run therefore
+            # inherits the marker of the flagged run it resumes from and IGNORES
+            # the make/model checkpoint: the default checkpoint skips whole
+            # pre-checkpoint models, which could omit a spec the default mode had
+            # skipped as complete or one whose detail fetch failed. Re-enumerating
+            # discovery is idempotent and negligible next to the detail fetches,
+            # and the marker guarantees no double-fetch of a processed spec.
+            attempted: set[str] = set()
+            if refresh_all_spec_details:
+                attempted |= self._load_full_refresh_progress(resume_from["id"]) if resume_from else set()
+                checkpoint_make = None
+                checkpoint_model = None
+                self._write_full_refresh_progress(run_id, sorted(attempted))
             if checkpoint_make or checkpoint_model:
                 self._update_run(run_id, "resuming", checkpoint_make, checkpoint_model, checkpoint=True)
-            self.logger.info("Starting catalog run_id=%s resume_source=%s checkpoint=%s/%s limits=%s/%s/%s",
-                             run_id, summary["resumed_from_run_id"], checkpoint_make, checkpoint_model, max_makes, max_models, max_specs)
-            attempted: set[str] = set()
-            self._backfill_pending(summary, run_id, max_specs, delay, attempted)
+            self.logger.info("Starting catalog run_id=%s resume_source=%s checkpoint=%s/%s limits=%s/%s/%s refresh_all=%s inherited=%s",
+                             run_id, summary["resumed_from_run_id"], checkpoint_make, checkpoint_model, max_makes, max_models, max_specs,
+                             refresh_all_spec_details, len(attempted))
+            self._backfill_pending(summary, run_id, max_specs, delay, attempted, refresh_all_spec_details)
             if max_specs > 0 and summary["detail_attempts"] >= max_specs:
                 summary["pending_details"] = self._pending_count()
                 summary["status"] = "partial"
@@ -1771,7 +2282,10 @@ class GoonetCatalogService:
                         continue
                     # A checkpoint means every link on this model page was discovered and durably upserted.
                     summary["spec_summaries"] += self.upsert_spec_summaries(specs, run_id)
-                    completed = self._completed_spec_ids(model["model_slug"])
+                    # GNC-FULL-02: in a flagged full refresh EVERY enumerated spec
+                    # (including already-complete non-thumb rows) must be fetched,
+                    # so the completion predicate is not consulted at all.
+                    completed = set() if refresh_all_spec_details else self._completed_spec_ids(model["model_slug"])
                     model_complete = True
                     for spec in specs:
                         spec_id = spec["catalog_spec_id"]
@@ -1791,6 +2305,10 @@ class GoonetCatalogService:
                             if self.upsert_spec_detail({"data": detail}, run_id):
                                 summary["details_changed"] += 1
                             summary["spec_details"] += 1
+                            if refresh_all_spec_details:
+                                # Persist durable progress only AFTER a successful
+                                # upsert so a failed spec is retried on resume.
+                                self._append_full_refresh_progress(run_id, spec_id)
                         except Exception as exc:
                             self._record_spec_detail_error(summary, "spec_details", spec.get("spec_url"), exc)
                             self.logger.warning("Failed spec detail %s: %s", spec.get("spec_url"), exc)
@@ -1812,7 +2330,7 @@ class GoonetCatalogService:
                 if not any(error["stage"] == "spec_summaries" for error in summary["errors"]):
                     summary["missing_specs"] = self.mark_missing_specs(run_started_at)
             if max_specs <= 0 or summary["detail_attempts"] < max_specs:
-                self._backfill_pending(summary, run_id, max_specs, delay, attempted)
+                self._backfill_pending(summary, run_id, max_specs, delay, attempted, refresh_all_spec_details)
             summary["pending_details"] = self._pending_count()
             limited = max_makes > 0 or max_models > 0 or max_specs > 0
             summary["status"] = "partial" if limited or summary["errors"] or summary["pending_details"] else "success"
